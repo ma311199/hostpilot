@@ -14,7 +14,13 @@ from hostpilot.contracts import (
     ToolType,
     TrustLevel,
 )
-from hostpilot.observability import AuditEvent, AuditOutcome
+from hostpilot.observability import (
+    AuditEvent,
+    AuditOutcome,
+    TraceContext,
+    TraceEvent,
+    trace_context_scope,
+)
 from hostpilot.policy import PolicyEngine
 from hostpilot.policy.confirmation import ConfirmationDecision, ConfirmationRequest
 from hostpilot.tools import (
@@ -101,6 +107,56 @@ def test_policy_denial_has_no_tool_side_effect() -> None:
     asyncio.run(scenario())
 
 
+def test_tool_and_confirmation_spans_share_a_parent_without_storing_arguments() -> None:
+    async def scenario() -> None:
+        trace_events: list[TraceEvent] = []
+        audit_events: list[AuditEvent] = []
+
+        class TraceRecorder:
+            def record(self, event: TraceEvent) -> None:
+                trace_events.append(event)
+
+        confirmation = FakeConfirmation(ConfirmationDecision.APPROVED)
+
+        async def handler(arguments: Mapping[str, Any]) -> str:
+            return str(arguments["value"])
+
+        registry = ToolRegistry()
+        registry.register(
+            _registration(handler, high_impact=True, capabilities=frozenset({"write"}))
+        )
+        executor = ToolExecutor(
+            registry,
+            PolicyEngine(),
+            audit=audit_events.append,
+            trace_sink=TraceRecorder(),
+        )
+        request_context = TraceContext()
+
+        with trace_context_scope(request_context):
+            await executor.execute(
+                "sample",
+                {"value": "private argument"},
+                budget=_budget(),
+                granted_capabilities=frozenset({"write"}),
+                confirmation_provider=confirmation,
+            )
+
+        confirmation_event = next(
+            event for event in trace_events if event.name == "tool.confirmation"
+        )
+        tool_event = next(event for event in trace_events if event.name == "tool.execute")
+        assert tool_event.context.parent_span_id == request_context.span_id
+        assert confirmation_event.context.parent_span_id == tool_event.context.span_id
+        assert confirmation_event.attributes["tool_id"] == "sample"
+        assert "private argument" not in str(trace_events)
+        assert audit_events
+        assert {event.trace_id for event in audit_events} == {request_context.trace_id}
+        assert "private argument" not in str(audit_events)
+
+    asyncio.run(scenario())
+
+
 def test_unregistered_tool_is_denied_and_audited() -> None:
     async def scenario() -> None:
         audit: list[AuditEvent] = []
@@ -129,6 +185,26 @@ def test_third_party_host_tool_requires_an_execution_boundary() -> None:
 
     assert not decision.allowed
     assert decision.reason_code == "third_party_tool_requires_boundary"
+
+
+def test_untrusted_native_sandbox_tool_requires_an_available_sandbox_backend() -> None:
+    descriptor = ToolDescriptor(
+        name="run_python_code",
+        description="Run isolated Python code.",
+        tool_type=ToolType.CODE,
+        trust_level=TrustLevel.UNTRUSTED,
+        execution_env=ExecutionEnvironment.NATIVE_SANDBOX,
+        timeout_profile=TimeoutProfile(timeout_seconds=5),
+    )
+
+    unavailable = PolicyEngine().authorize(descriptor, {})
+    available = PolicyEngine(
+        sandboxed_environments=frozenset({ExecutionEnvironment.NATIVE_SANDBOX})
+    ).authorize(descriptor, {})
+
+    assert not unavailable.allowed
+    assert unavailable.reason_code == "execution_environment_unavailable"
+    assert available.allowed
 
 
 def test_high_impact_operation_requires_explicit_confirmation() -> None:

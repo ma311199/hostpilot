@@ -21,3 +21,7 @@ HostPilot 后端已有 FastAPI 健康检查、聊天和会话 API，但没有项
 - Node 版本需满足 Vite 8 和 Vitest 5 支持矩阵（Node 22.12+ 或 24+）；依赖解析提交到 pnpm-lock.yaml。
 - 看板上的阶段状态是仓库随版本发布的数据，不代表从运行中的后端动态查询。
 - /api/v1/ws/chat 承载完整消息请求和回复；当前不提供逐 Token 流式传输。
+
+## 新架构对本决策的影响
+
+本 ADR 描述的本地浏览器 Vue Web 前端仍是目标形态，不转为 Electron/Tauri 桌面壳。新架构目标在此基础上增加 Harness 配置、MCP 连接、Skill 库和 Trace 面板。

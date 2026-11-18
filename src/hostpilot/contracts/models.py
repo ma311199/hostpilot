@@ -34,6 +34,23 @@ class MessageRole(StrEnum):
     TOOL = "tool"
 
 
+class SandboxMode(StrEnum):
+    """Monotonic, conversation-scoped local filesystem access level."""
+
+    READ_ONLY = "read-only"
+    WORKSPACE_WRITE = "workspace-write"
+    DANGER_FULL_ACCESS = "danger-full-access"
+
+    @property
+    def rank(self) -> int:
+        """Return the immutable privilege ordering for this mode."""
+        return {
+            SandboxMode.READ_ONLY: 0,
+            SandboxMode.WORKSPACE_WRITE: 1,
+            SandboxMode.DANGER_FULL_ACCESS: 2,
+        }[self]
+
+
 class ConversationMessage(ContractModel):
     """One message included in the context required for a request."""
 
@@ -48,6 +65,7 @@ class ConversationSummary(ContractModel):
     title: NonEmptyString
     created_at: datetime
     updated_at: datetime
+    sandbox_mode: SandboxMode = SandboxMode.READ_ONLY
 
     @field_validator("created_at", "updated_at")
     @classmethod
@@ -83,18 +101,34 @@ class MemoryScope(StrEnum):
     LONG_TERM = "long_term"
 
 
+class MemoryImportanceTier(StrEnum):
+    """Local admission tier assigned to a memory write proposal."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
 class MemoryWriteProposal(ContractModel):
     """Complete replacement content awaiting explicit user approval."""
 
     proposal_id: NonEmptyString = Field(default_factory=lambda: str(uuid4()), max_length=64)
     scope: MemoryScope
     conversation_id: NonEmptyString | None = None
+    source_skill_id: NonEmptyString | None = None
     content: str = Field(min_length=1, max_length=262_144)
+    importance_score: int | None = Field(default=None, ge=0, le=100)
+    importance_tier: MemoryImportanceTier | None = None
+    importance_reasons: tuple[str, ...] = ()
+    summary_content: str | None = Field(default=None, max_length=8_000)
+    discarded: bool = False
 
     @model_validator(mode="after")
     def validate_target_and_content(self) -> Self:
         if not self.content.strip():
             raise ValueError("Memory proposal content cannot be blank.")
+        if self.summary_content is not None and not self.summary_content.strip():
+            raise ValueError("Memory proposal summary cannot be blank.")
         if self.scope is MemoryScope.SESSION_SUMMARY:
             if self.conversation_id is None:
                 raise ValueError("Session summary proposals require conversation_id.")
@@ -108,6 +142,26 @@ class MemoryWriteProposal(ContractModel):
         return self
 
 
+class MemoryRawArchive(ContractModel):
+    """Original content retained with a medium-tier memory summary."""
+
+    archive_id: UUID
+    proposal_id: NonEmptyString = Field(max_length=64)
+    scope: MemoryScope
+    conversation_id: NonEmptyString | None = None
+    importance_score: int = Field(ge=0, le=100)
+    content: str = Field(min_length=1, max_length=262_144)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @model_validator(mode="after")
+    def validate_scope_target(self) -> Self:
+        if self.scope is MemoryScope.SESSION_SUMMARY and self.conversation_id is None:
+            raise ValueError("Session memory archives require conversation_id.")
+        if self.scope is MemoryScope.LONG_TERM and self.conversation_id is not None:
+            raise ValueError("Long-term memory archives cannot target a conversation.")
+        return self
+
+
 class Route(StrEnum):
     """Supported top-level execution decisions."""
 
@@ -115,6 +169,7 @@ class Route(StrEnum):
     CLARIFY = "clarify"
     TOOL_CALL = "tool_call"
     PLAN_EXECUTE = "plan_execute"
+    SKILL_EXECUTE = "skill_execute"
 
 
 class ModelTokenUsage(ContractModel):
@@ -222,6 +277,14 @@ class ExecutionEnvironment(StrEnum):
     REMOTE = "remote"
 
 
+class ToolConnectionTransport(StrEnum):
+    """Transport used by one Harness-owned tool connection."""
+
+    IN_PROCESS = "in_process"
+    STREAMABLE_HTTP = "streamable_http"
+    STDIO = "stdio"
+
+
 class TimeoutProfile(ContractModel):
     """Per-call timeout bounds."""
 
@@ -237,8 +300,30 @@ class ToolDescriptor(ContractModel):
     trust_level: TrustLevel
     execution_env: ExecutionEnvironment
     timeout_profile: TimeoutProfile
+    transport: ToolConnectionTransport = ToolConnectionTransport.IN_PROCESS
+    access_summary: NonEmptyString = "由工具实现限制，具体范围未声明。"
+    input_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
     capabilities: frozenset[NonEmptyString] = frozenset()
     high_impact: bool = False
+
+
+class ToolConnectionState(StrEnum):
+    """Lifecycle state for a configured tool connection."""
+
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    FAILED = "failed"
+
+
+class ToolConnectionStatus(ContractModel):
+    """Safe connection diagnostics; endpoint URLs and credentials are excluded."""
+
+    connection_id: NonEmptyString
+    transport: ToolConnectionTransport
+    state: ToolConnectionState
+    discovered_tool_count: int = Field(ge=0)
+    error_code: NonEmptyString | None = None
 
 
 class RetrievalToolRequest(ContractModel):
@@ -312,11 +397,14 @@ __all__ = [
     "EvidenceSet",
     "ExecutionEnvironment",
     "MessageRole",
+    "MemoryImportanceTier",
+    "MemoryRawArchive",
     "MemoryScope",
     "MemoryWriteProposal",
     "RetrievalToolRequest",
     "Route",
     "RouteDecision",
+    "SandboxMode",
     "SandboxPolicy",
     "SandboxResourceLimits",
     "TimeoutProfile",

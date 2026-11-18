@@ -2,6 +2,12 @@ export interface ToolCatalogItem {
   name: string
   description: string
   tool_type: 'retrieval' | 'action' | 'code'
+  transport: 'in_process' | 'stdio' | 'streamable_http'
+  trust_level: 'host' | 'third_party' | 'untrusted'
+  execution_env: 'host' | 'service' | 'wasm' | 'native_sandbox' | 'remote'
+  execution_location: string
+  access_summary: string
+  sandbox_status: string
   configured: boolean
   high_impact: boolean
   confirmation_required: boolean

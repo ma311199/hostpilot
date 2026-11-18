@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
-from hostpilot.observability.events import AuditEvent, CostEvent
+from hostpilot.observability.events import AuditEvent, CostEvent, TraceEvent
 
 if TYPE_CHECKING:
     from hostpilot.config.settings import Settings
@@ -56,6 +56,17 @@ class StructuredCostSink:
         self.logger.info("cost_event", **event.model_dump(mode="json"))
 
 
+class StructuredTraceSink:
+    """Write approved trace metadata without prompts, memory text, or credentials."""
+
+    def __init__(self) -> None:
+        self.logger = get_logger("hostpilot.trace")
+
+    def record(self, event: TraceEvent) -> None:
+        """Export one typed trace event containing only explicitly selected metadata."""
+        self.logger.info("trace_event", **event.model_dump(mode="json"))
+
+
 class StructuredAuditSink:
     """Write approved audit metadata as structured logs without payload contents."""
 
@@ -67,4 +78,10 @@ class StructuredAuditSink:
         self.logger.info("audit_event", **event.model_dump(mode="json"))
 
 
-__all__ = ["StructuredAuditSink", "StructuredCostSink", "configure_logging", "get_logger"]
+__all__ = [
+    "StructuredAuditSink",
+    "StructuredCostSink",
+    "StructuredTraceSink",
+    "configure_logging",
+    "get_logger",
+]

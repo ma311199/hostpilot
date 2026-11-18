@@ -6,23 +6,39 @@ from hostpilot.tools.executor import (
     ToolExecutionError,
     ToolExecutor,
 )
-from hostpilot.tools.filesystem import WorkspaceFileError, WorkspaceFiles
+from hostpilot.tools.facade import ToolFacade
+from hostpilot.tools.filesystem import WorkspaceFileError, WorkspaceFiles, WorkspaceReadOnlyError
+from hostpilot.tools.governance import (
+    DefaultToolExecutorFactory,
+    ToolExecutionScope,
+    ToolExecutorFactory,
+    ToolInvocationCoordinator,
+)
 from hostpilot.tools.registry import (
     ConfirmationSummaryBuilder,
     ToolRegistration,
     ToolRegistrationError,
     ToolRegistry,
 )
+from hostpilot.tools.routing import MCPToolRoutingTable, RemoteToolRouteTable
 
 __all__ = [
     "AsyncConfirmationProvider",
     "ConfirmationSummaryBuilder",
     "ToolDeniedError",
     "ToolExecutionError",
+    "ToolFacade",
+    "DefaultToolExecutorFactory",
+    "ToolExecutionScope",
+    "ToolExecutorFactory",
+    "ToolInvocationCoordinator",
     "WorkspaceFileError",
     "WorkspaceFiles",
+    "WorkspaceReadOnlyError",
     "ToolExecutor",
     "ToolRegistration",
     "ToolRegistrationError",
     "ToolRegistry",
+    "MCPToolRoutingTable",
+    "RemoteToolRouteTable",
 ]

@@ -3,11 +3,15 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import {
   createConversation,
+  deleteConversation,
   getConversationMessages,
   listConversations,
+  upgradeConversationSandbox,
   type ConversationMessage,
   type ConversationSummary,
+  type SandboxMode,
 } from './api/chat'
+import { getWorkspace, selectWorkspace, type WorkspaceStatus } from './api/workspace'
 import { ChatSocketClient, type ToolConfirmationMessage } from './api/chatSocket'
 
 const conversations = ref<ConversationSummary[]>([])
@@ -16,20 +20,65 @@ const messages = ref<ConversationMessage[]>([])
 const draft = ref('')
 const loading = ref(false)
 const sending = ref(false)
+const deletingConversationId = ref<string | null>(null)
+const upgradingSandbox = ref(false)
+const selectingWorkspace = ref(false)
 const errorMessage = ref('')
+const workspaceError = ref('')
+const workspace = ref<WorkspaceStatus | null>(null)
 const messageList = ref<HTMLElement | null>(null)
 const composerInput = ref<HTMLTextAreaElement | null>(null)
 const chatSocket = new ChatSocketClient()
 const pendingApproval = ref<ToolConfirmationMessage | null>(null)
+interface ConversationPreference {
+  title?: string
+  pinned?: boolean
+}
+
+const conversationPreferenceKey = 'hostpilot.conversation-preferences.v1'
+const conversationPreferences = ref<Record<string, ConversationPreference>>(loadConversationPreferences())
+const openConversationMenuId = ref<string | null>(null)
+const renamingConversationId = ref<string | null>(null)
+const conversationNameDraft = ref('')
+const conversationNameInput = ref<HTMLInputElement[]>([])
 const visibleMessages = computed(() =>
   messages.value.filter(
     (message) =>
       (message.role === 'user' || message.role === 'assistant') && message.content.trim().length > 0,
   ),
 )
+const displayConversations = computed(() => conversations.value.map((conversation) => {
+  const preference = conversationPreferences.value[conversation.conversation_id]
+  return {
+    ...conversation,
+    title: preference?.title || conversation.title,
+    pinned: preference?.pinned || false,
+  }
+}))
 const activeConversation = computed(() =>
-  conversations.value.find((conversation) => conversation.conversation_id === activeConversationId.value),
+  displayConversations.value.find((conversation) => conversation.conversation_id === activeConversationId.value),
 )
+const conversationQuery = ref('')
+const filteredConversations = computed(() => {
+  const query = conversationQuery.value.trim().toLocaleLowerCase()
+  return displayConversations.value.filter((conversation) => !query || conversation.title.toLocaleLowerCase().includes(query))
+})
+const conversationGroups = computed(() => {
+  const today = new Date()
+  const yesterday = new Date(today)
+  yesterday.setDate(today.getDate() - 1)
+  const sameDay = (value: string, target: Date) => {
+    const date = new Date(value)
+    return !Number.isNaN(date.getTime()) && date.toDateString() === target.toDateString()
+  }
+  const unpinned = filteredConversations.value.filter((item) => !item.pinned)
+  return [
+    { label: '置顶', items: filteredConversations.value.filter((item) => item.pinned) },
+    { label: '今天', items: unpinned.filter((item) => sameDay(item.updated_at, today)) },
+    { label: '昨天', items: unpinned.filter((item) => sameDay(item.updated_at, yesterday)) },
+    { label: '更早', items: unpinned.filter((item) => !sameDay(item.updated_at, today) && !sameDay(item.updated_at, yesterday)) },
+  ].filter((group) => group.items.length)
+})
 const suggestions = [
   '帮我梳理一下今天的工作计划',
   '解释一下 Agent 的工具调用流程',
@@ -46,13 +95,84 @@ async function refreshConversations(): Promise<void> {
   conversations.value = await listConversations()
 }
 
+function loadConversationPreferences(): Record<string, ConversationPreference> {
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(conversationPreferenceKey) || '{}')
+    if (!isRecord(parsed)) return {}
+    return Object.fromEntries(Object.entries(parsed).filter(([, preference]) => (
+      isRecord(preference)
+      && (typeof preference.title === 'string' || typeof preference.pinned === 'boolean')
+    ))) as Record<string, ConversationPreference>
+  } catch {
+    return {}
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function persistConversationPreferences(): void {
+  try {
+    window.localStorage.setItem(conversationPreferenceKey, JSON.stringify(conversationPreferences.value))
+  } catch {
+    // Keep the in-memory preferences when browser storage is unavailable.
+  }
+}
+
+function toggleConversationMenu(conversationId: string): void {
+  openConversationMenuId.value = openConversationMenuId.value === conversationId ? null : conversationId
+  renamingConversationId.value = null
+}
+
+async function beginRenameConversation(conversation: ConversationSummary): Promise<void> {
+  renamingConversationId.value = conversation.conversation_id
+  conversationNameDraft.value = conversation.title
+  await nextTick()
+  conversationNameInput.value[0]?.focus()
+}
+
+function saveConversationName(conversationId: string): void {
+  const title = conversationNameDraft.value.trim().slice(0, 200)
+  if (!title) return
+  conversationPreferences.value = {
+    ...conversationPreferences.value,
+    [conversationId]: { ...conversationPreferences.value[conversationId], title },
+  }
+  persistConversationPreferences()
+  renamingConversationId.value = null
+  openConversationMenuId.value = null
+}
+
+function cancelRenameConversation(): void {
+  renamingConversationId.value = null
+  conversationNameDraft.value = ''
+}
+
+function toggleConversationPinned(conversationId: string): void {
+  const previous = conversationPreferences.value[conversationId] || {}
+  const next: ConversationPreference = { ...previous }
+  if (previous.pinned) delete next.pinned
+  else next.pinned = true
+  if (!next.title) delete next.title
+  const preferences = { ...conversationPreferences.value }
+  if (Object.keys(next).length) preferences[conversationId] = next
+  else delete preferences[conversationId]
+  conversationPreferences.value = preferences
+  persistConversationPreferences()
+  openConversationMenuId.value = null
+}
+
 async function openConversation(conversationId: string): Promise<void> {
   if (sending.value) return
+  openConversationMenuId.value = null
+  renamingConversationId.value = null
+  activeConversationId.value = conversationId
+  messages.value = []
   loading.value = true
   errorMessage.value = ''
   try {
     const history = await getConversationMessages(conversationId)
-    activeConversationId.value = conversationId
     messages.value = history.messages
     await scrollToLatest()
   } catch (error) {
@@ -72,6 +192,86 @@ async function startConversation(): Promise<void> {
     messages.value = []
   } catch (error) {
     errorMessage.value = messageFor(error)
+  }
+}
+
+async function removeConversation(conversation: ConversationSummary): Promise<void> {
+  if (sending.value || deletingConversationId.value) return
+  const confirmed = window.confirm(
+    `确定删除会话“${conversation.title}”吗？会话消息、检查点、摘要和待审批记忆提案都会删除。`,
+  )
+  if (!confirmed) return
+
+  deletingConversationId.value = conversation.conversation_id
+  errorMessage.value = ''
+  try {
+    await deleteConversation(conversation.conversation_id)
+    conversations.value = conversations.value.filter(
+      (item) => item.conversation_id !== conversation.conversation_id,
+    )
+    const preferences = { ...conversationPreferences.value }
+    delete preferences[conversation.conversation_id]
+    conversationPreferences.value = preferences
+    persistConversationPreferences()
+    openConversationMenuId.value = null
+    if (activeConversationId.value === conversation.conversation_id) {
+      activeConversationId.value = null
+      messages.value = []
+      const latest = conversations.value[0]
+      if (latest) await openConversation(latest.conversation_id)
+    }
+  } catch (error) {
+    errorMessage.value = messageFor(error)
+  } finally {
+    deletingConversationId.value = null
+  }
+}
+
+async function upgradeSandbox(targetMode: SandboxMode): Promise<void> {
+  const conversation = activeConversation.value
+  if (!conversation || upgradingSandbox.value || sending.value) return
+  const targetLabel = sandboxModeLabel(targetMode)
+  const detail =
+    targetMode === 'danger-full-access'
+      ? '升级后，本会话的内置文件工具可访问当前操作系统用户有权限访问的任意路径。'
+      : '升级后，本会话的内置文件工具可以在当前工作区内写入文件。'
+  const confirmed = window.confirm(
+    `${detail}\n\n权限只会向上升级，不能在本会话中撤销。确认升级到“${targetLabel}”吗？`,
+  )
+  if (!confirmed) return
+
+  upgradingSandbox.value = true
+  errorMessage.value = ''
+  try {
+    const upgraded = await upgradeConversationSandbox(conversation.conversation_id, targetMode)
+    conversations.value = conversations.value.map((item) =>
+      item.conversation_id === upgraded.conversation_id ? upgraded : item,
+    )
+  } catch (error) {
+    errorMessage.value = messageFor(error)
+  } finally {
+    upgradingSandbox.value = false
+  }
+}
+
+function sandboxModeLabel(mode: SandboxMode): string {
+  if (mode === 'workspace-write') return '工作区可写'
+  if (mode === 'danger-full-access') return '危险：完全访问'
+  return '只读'
+}
+
+async function chooseWorkspace(): Promise<void> {
+  if (selectingWorkspace.value || sending.value) return
+  selectingWorkspace.value = true
+  workspaceError.value = ''
+  try {
+    const selected = await selectWorkspace()
+    workspace.value = selected
+    if (selected.message) workspaceError.value = selected.message
+  } catch (error) {
+    workspaceError.value = messageFor(error)
+  } finally {
+    selectingWorkspace.value = false
   }
 }
 
@@ -163,6 +363,12 @@ onMounted(async () => {
   loading.value = true
   try {
     await refreshConversations()
+    try {
+      workspace.value = await getWorkspace()
+      if (workspace.value.message) workspaceError.value = workspace.value.message
+    } catch (error) {
+      workspaceError.value = messageFor(error)
+    }
     const latest = conversations.value[0]
     if (latest) await openConversation(latest.conversation_id)
   } catch (error) {
@@ -185,16 +391,75 @@ onUnmounted(() => chatSocket.close())
         <div>
           <span class="chat-kicker">HOSTPILOT</span>
           <h1>工作区</h1>
+          <div
+            v-if="activeConversation"
+            class="sandbox-controls"
+            :data-mode="activeConversation.sandbox_mode"
+          >
+            <span class="sandbox-mode-label">
+              本会话：{{ sandboxModeLabel(activeConversation.sandbox_mode) }}
+            </span>
+            <button
+              v-if="activeConversation.sandbox_mode === 'read-only'"
+              type="button"
+              :disabled="upgradingSandbox || sending"
+              @click="upgradeSandbox('workspace-write')"
+            >
+              升级到工作区可写
+            </button>
+            <button
+              v-if="activeConversation.sandbox_mode !== 'danger-full-access'"
+              class="sandbox-danger-upgrade"
+              type="button"
+              :disabled="upgradingSandbox || sending"
+              @click="upgradeSandbox('danger-full-access')"
+            >
+              升级到完全访问
+            </button>
+          </div>
         </div>
-        <button
-          class="new-chat-button"
-          type="button"
-          :disabled="sending"
-          @click="startConversation"
-        >
-          <span aria-hidden="true">＋</span>新建
-        </button>
+        <div class="chat-sidebar-actions">
+          <button
+            class="workspace-select-button"
+            type="button"
+            :disabled="selectingWorkspace || sending"
+            @click="chooseWorkspace"
+          >
+            {{ selectingWorkspace ? '正在选择…' : '选择目录' }}
+          </button>
+          <button
+            class="new-chat-button"
+            type="button"
+            :disabled="sending"
+            @click="startConversation"
+          >
+            <span aria-hidden="true">＋</span>新建
+          </button>
+        </div>
       </div>
+      <div
+        v-if="workspace"
+        class="workspace-summary"
+        aria-label="当前工作目录"
+      >
+        <span class="workspace-summary-label">当前目录</span>
+        <p
+          class="workspace-path"
+          :title="workspace.path"
+        >
+          {{ workspace.path }}
+        </p>
+        <span :class="['workspace-access', workspace.read_only ? 'workspace-access-readonly' : '']">
+          {{ workspace.read_only ? '只读访问' : '可写访问' }}
+        </span>
+      </div>
+      <p
+        v-if="workspaceError"
+        class="workspace-error"
+        role="alert"
+      >
+        {{ workspaceError }}
+      </p>
       <div
         class="conversation-list"
         aria-label="会话列表"
@@ -202,41 +467,134 @@ onUnmounted(() => chatSocket.close())
         <p class="conversation-list-label">
           最近对话
         </p>
-        <button
-          v-for="conversation in conversations"
-          :key="conversation.conversation_id"
-          class="conversation-item"
-          :class="{ 'conversation-item-active': activeConversationId === conversation.conversation_id }"
-          type="button"
-          @click="openConversation(conversation.conversation_id)"
+        <input
+          v-model="conversationQuery"
+          class="conversation-search"
+          type="search"
+          aria-label="搜索会话"
+          placeholder="搜索会话标题"
         >
-          <span
-            class="conversation-icon"
-            aria-hidden="true"
+        <section
+          v-for="group in conversationGroups"
+          :key="group.label"
+          class="conversation-date-group"
+        >
+          <h2>{{ group.label }}</h2>
+          <div
+            v-for="conversation in group.items"
+            :key="conversation.conversation_id"
+            class="conversation-row"
           >
-            <svg
-              viewBox="0 0 20 20"
-              fill="none"
+            <button
+              class="conversation-item"
+              :class="{ 'conversation-item-active': activeConversationId === conversation.conversation_id }"
+              type="button"
+              @click="openConversation(conversation.conversation_id)"
             >
-              <path
-                d="M4 4.75h12M4 8.5h12M4 12.25h7"
-                stroke="currentColor"
-                stroke-width="1.4"
-                stroke-linecap="round"
-              />
-              <path
-                d="M3 2.75h14a1 1 0 0 1 1 1v10.5a1 1 0 0 1-1 1h-8l-4.5 2v-2H3a1 1 0 0 1-1-1V3.75a1 1 0 0 1 1-1Z"
-                stroke="currentColor"
-                stroke-width="1.3"
-                stroke-linejoin="round"
-              />
-            </svg>
-          </span>
-          <span class="conversation-copy">
-            <span class="conversation-title">{{ conversation.title }}</span>
-            <small>{{ conversationTime(conversation.updated_at) }}</small>
-          </span>
-        </button>
+              <span
+                class="conversation-icon"
+                aria-hidden="true"
+              >
+                <svg
+                  viewBox="0 0 20 20"
+                  fill="none"
+                >
+                  <path
+                    d="M4 4.75h12M4 8.5h12M4 12.25h7"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                  />
+                  <path
+                    d="M3 2.75h14a1 1 0 0 1 1 1v10.5a1 1 0 0 1-1 1h-8l-4.5 2v-2H3a1 1 0 0 1-1-1V3.75a1 1 0 0 1 1-1Z"
+                    stroke="currentColor"
+                    stroke-width="1.3"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </span>
+              <span class="conversation-copy">
+                <span class="conversation-title">{{ conversation.title }}</span>
+                <small>{{ conversationTime(conversation.updated_at) }} · {{ sandboxModeLabel(conversation.sandbox_mode) }}</small>
+              </span>
+            </button>
+            <button
+              class="conversation-more-button"
+              type="button"
+              :aria-label="`会话操作 ${conversation.title}`"
+              :aria-expanded="openConversationMenuId === conversation.conversation_id"
+              title="会话操作"
+              @click.stop="toggleConversationMenu(conversation.conversation_id)"
+            >
+              <span aria-hidden="true">⋯</span>
+            </button>
+            <div
+              v-if="openConversationMenuId === conversation.conversation_id"
+              class="conversation-actions-menu"
+              role="group"
+              :aria-label="`${conversation.title} 的操作`"
+              @keydown.esc.stop.prevent="openConversationMenuId = null"
+            >
+              <form
+                v-if="renamingConversationId === conversation.conversation_id"
+                class="conversation-rename-form"
+                @submit.prevent="saveConversationName(conversation.conversation_id)"
+              >
+                <label :for="`conversation-name-${conversation.conversation_id}`">会话名称</label>
+                <input
+                  :id="`conversation-name-${conversation.conversation_id}`"
+                  ref="conversationNameInput"
+                  v-model="conversationNameDraft"
+                  aria-label="会话名称"
+                  maxlength="200"
+                  required
+                >
+                <div>
+                  <button type="submit">
+                    保存名称
+                  </button>
+                  <button
+                    type="button"
+                    @click="cancelRenameConversation"
+                  >
+                    取消
+                  </button>
+                </div>
+              </form>
+              <template v-else>
+                <button
+                  type="button"
+                  aria-label="重命名会话"
+                  @click="beginRenameConversation(conversation)"
+                >
+                  重命名
+                </button>
+                <button
+                  type="button"
+                  :aria-label="conversation.pinned ? '取消置顶会话' : '置顶会话'"
+                  @click="toggleConversationPinned(conversation.conversation_id)"
+                >
+                  {{ conversation.pinned ? '取消置顶' : '置顶' }}
+                </button>
+                <button
+                  type="button"
+                  class="conversation-action-delete"
+                  :disabled="sending || deletingConversationId !== null"
+                  :aria-label="`删除会话 ${conversation.title}`"
+                  @click="removeConversation(conversation)"
+                >
+                  删除
+                </button>
+              </template>
+            </div>
+          </div>
+        </section>
+        <p
+          v-if="conversations.length && !filteredConversations.length"
+          class="conversation-empty"
+        >
+          没有匹配的会话。
+        </p>
         <p
           v-if="!conversations.length && !loading"
           class="conversation-empty"

@@ -21,3 +21,7 @@ HostPilot 是面向个人客户端的 Agent 项目，需要确定模型/工具�
 - 三个框架的具体 API 与版本兼容性需通过小型集成验证确认；核心业务 DTO 不依赖其专有类型。
 - LangChain、LangGraph、DeepAgents 与 Gradio 使用独立依赖组，基础安装不下载可选框架。
 - 原型 UI 调用 HostPilot 应用服务，不直接实现策略、预算或工具执行逻辑。
+
+## 新架构对本决策的影响
+
+本 ADR 描述当前代码的框架选型，不直接约束新架构的 Skill Runtime。新 Runtime 是否继续复用 DeepAgents、LangGraph 和 LangChain，需在迁移设计中明确；模型 Provider 与 Tool Facade 应先依赖 HostPilot 自身接口。

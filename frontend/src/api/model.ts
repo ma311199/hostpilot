@@ -1,13 +1,34 @@
 export interface ModelConfigurationStatus {
   configured: boolean
+  saved: boolean
+  api_key_required: boolean
   model_name: string | null
   base_url: string | null
+  streaming: boolean
 }
 
 export interface ModelConfigurationInput {
+  model_name?: string | null
+  api_key?: string
+  base_url?: string | null
+  streaming?: boolean
+}
+
+export type ModelRole = 'llm' | 'judge' | 'embedding' | 'reranker'
+
+export interface ModelConnectionTestResult {
+  role: ModelRole
+  success: boolean
+  message: string
+  error_code: string | null
+}
+
+export interface ModelConnectionTestInput {
+  role: ModelRole
   model_name: string
-  api_key: string
-  base_url: string | null
+  api_key?: string
+  base_url?: string | null
+  streaming?: boolean
 }
 
 const defaultApiBaseUrl = 'http://127.0.0.1:8000/api/v1'
@@ -51,6 +72,15 @@ export function saveModelConfiguration(
 ): Promise<ModelConfigurationStatus> {
   return request<ModelConfigurationStatus>('/model/configuration', {
     method: 'PUT',
+    body: JSON.stringify(configuration),
+  })
+}
+
+export function testModelConnection(
+  configuration: ModelConnectionTestInput,
+): Promise<ModelConnectionTestResult> {
+  return request<ModelConnectionTestResult>('/model/configuration/test', {
+    method: 'POST',
     body: JSON.stringify(configuration),
   })
 }

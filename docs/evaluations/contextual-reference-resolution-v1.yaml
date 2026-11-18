@@ -1,0 +1,76 @@
+dataset_id: contextual-reference-resolution
+version: 1
+description: >-
+  Synthetic selector-only cases for resolving references against bounded conversation
+  and memory context. No Skill or tool execution is performed.
+cases:
+  - case_id: reference-memory-release-checklist
+    prompt: 请把上线前那段关于回归检查的记录整理成清单。
+    evaluation_context:
+      long_term_memory: |-
+        # Travel preferences
+        出行优先选择火车，并提前确认酒店是否允许延迟入住。
+
+        # Release checklist
+        发布前必须完成回归测试，并确认数据库迁移脚本已通过检查。
+    expected_candidate_id: context-2
+    expected_resolution: matched
+
+  - case_id: reference-memory-database-migration
+    prompt: 把刚才提到的数据升级准备工作列出来。
+    evaluation_context:
+      long_term_memory: |-
+        # On-call handoff
+        值班交接必须记录告警渠道和负责人。
+
+        # Database migration
+        执行数据库迁移之前，先备份当前数据并在预发布环境验证回滚脚本。
+    expected_candidate_id: context-2
+    expected_resolution: matched
+
+  - case_id: reference-memory-unrelated
+    prompt: 把这段内容整理一下。
+    evaluation_context:
+      long_term_memory: |-
+        # Gardening note
+        阳台植物每周浇水两次，春季修剪枯叶。
+    expected_candidate_id: null
+    expected_resolution: clarify
+
+  - case_id: reference-memory-ambiguous
+    prompt: 把刚才提到的方案整理一下。
+    evaluation_context:
+      long_term_memory: |-
+        # Quarterly budget proposal
+        第一份预算方案按季度分配市场活动经费。
+
+        # Annual budget proposal
+        第二份预算方案按年度分配市场活动经费。
+    expected_candidate_id: null
+    expected_resolution: clarify
+
+  - case_id: reference-session-history
+    prompt: 把上面提到的发布检查内容列成清单。
+    evaluation_context:
+      messages:
+        - role: user
+          content: 我们要准备下周发布，先讨论检查项。
+        - role: assistant
+          content: 发布前需要跑冒烟测试，并确认迁移方案和回滚步骤。
+      long_term_memory: |-
+        # Unrelated preference
+        文档示例优先使用中文，并保持标题简短。
+    expected_candidate_id: context-1
+    expected_resolution: matched
+
+  - case_id: reference-memory-synonym-match
+    prompt: 把刚才提到的上线前验证步骤改写成待办项。
+    evaluation_context:
+      long_term_memory: |-
+        # Team meeting location
+        每周例会在周三下午召开，主持人提前发送议程。
+
+        # Quality gate
+        交付前执行完整回归，并由值班人员确认监控和回退方案可用。
+    expected_candidate_id: context-2
+    expected_resolution: matched

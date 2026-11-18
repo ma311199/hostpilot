@@ -40,6 +40,9 @@ def test_request_budget_rejects_token_overrun_and_expired_deadline() -> None:
     budget = RequestBudget.start(BudgetContext(limits=_limits(tokens=2)))
     with pytest.raises(BudgetExceededError, match="total_tokens"):
         budget.consume_tokens(3)
+    assert budget.remaining_tokens == 0
+    with pytest.raises(BudgetExceededError, match="total_tokens"):
+        budget.ensure_available()
 
     expired = RequestBudget(
         context=BudgetContext(limits=_limits(timeout=0.001)),

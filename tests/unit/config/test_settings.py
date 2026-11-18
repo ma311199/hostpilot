@@ -28,6 +28,59 @@ def test_settings_have_safe_non_secret_defaults(monkeypatch) -> None:
     assert settings.environment is Environment.DEVELOPMENT
     assert settings.log_level == "INFO"
     assert settings.skills_dir is None
+    assert settings.model_streaming is True
+    assert settings.chat_runtime_plugin == "builtin.deepagents"
+    assert settings.model_provider_plugin == "builtin.openai-compatible"
+    assert settings.plan_planner_plugin == "builtin.llm"
+    assert settings.plan_validator_plugin == "builtin.runtime"
+    assert settings.plan_task_executor_plugin == "builtin.governed"
+    assert settings.plan_verifier_plugin == "builtin.llm"
+    assert settings.plan_replanner_plugin == "builtin.llm"
+
+
+def test_plan_component_implementations_are_configurable_and_validated() -> None:
+    settings = Settings(
+        plan_planner_plugin="custom.planner",
+        plan_validator_plugin="custom.validator",
+        plan_task_executor_plugin="custom.executor",
+        plan_verifier_plugin="custom.verifier",
+        plan_replanner_plugin="custom.replanner",
+    )
+
+    assert settings.plan_planner_plugin == "custom.planner"
+    assert settings.plan_validator_plugin == "custom.validator"
+    assert settings.plan_task_executor_plugin == "custom.executor"
+    assert settings.plan_verifier_plugin == "custom.verifier"
+    assert settings.plan_replanner_plugin == "custom.replanner"
+    with pytest.raises(ValidationError):
+        Settings(plan_planner_plugin="../untrusted_module")
+
+
+def test_chat_runtime_implementation_can_be_configured() -> None:
+    assert Settings(chat_runtime_plugin="project.runtime.v1").chat_runtime_plugin == (
+        "project.runtime.v1"
+    )
+    with pytest.raises(ValidationError):
+        Settings(chat_runtime_plugin="/tmp/runtime.py")
+
+
+def test_model_provider_implementation_can_be_configured() -> None:
+    settings = Settings(model_provider_plugin="project.provider.v1")
+    assert settings.model_provider_plugin == "project.provider.v1"
+    with pytest.raises(ValidationError):
+        Settings(model_provider_plugin="/tmp/provider.py")
+
+
+def test_settings_ignore_empty_optional_model_environment_values(monkeypatch) -> None:
+    monkeypatch.setenv("HOSTPILOT_MODEL_NAME", "")
+    monkeypatch.setenv("HOSTPILOT_MODEL_BASE_URL", "")
+    monkeypatch.setenv("HOSTPILOT_MODEL_API_KEY", "")
+
+    settings = Settings()
+
+    assert settings.model_name is None
+    assert settings.model_base_url is None
+    assert settings.model_api_key is None
 
 
 def test_api_settings_allow_only_loopback_and_parse_web_origins(monkeypatch) -> None:
@@ -109,3 +162,22 @@ def test_remote_mcp_server_configuration_uses_secret_headers_and_unique_names(mo
 def test_remote_mcp_server_rejects_unsafe_endpoint_urls(url: str) -> None:
     with pytest.raises(ValidationError):
         RemoteMCPServerSettings(name="knowledge", url=url)
+
+
+def test_stdio_mcp_settings_accept_direct_command_and_reject_unapproved_executable() -> None:
+    stdio = RemoteMCPServerSettings(
+        name="filesystem",
+        transport="stdio",
+        command="npx",
+        args=("-y", "@modelcontextprotocol/server-filesystem", "/tmp/project"),
+    )
+    assert stdio.url is None
+    assert stdio.command == "npx"
+
+    with pytest.raises(ValidationError):
+        RemoteMCPServerSettings(
+            name="filesystem",
+            transport="stdio",
+            command="sh",
+            args=("-c", "echo unsafe"),
+        )

@@ -5,6 +5,8 @@ import pytest
 
 from hostpilot.context import ContextBuilder, ConversationNotFoundError
 from hostpilot.contracts import ConversationMessage, MessageRole
+from hostpilot.memory import MemoryController, MemoryWriteService
+from hostpilot.memory.review import MemoryProposalReview
 from hostpilot.persistence import MarkdownMemoryStore, SQLiteConversationStore
 
 
@@ -25,6 +27,11 @@ def test_context_builder_loads_one_session_and_bounds_context(tmp_path: Path) ->
         memory = MarkdownMemoryStore(tmp_path / "memory")
         memory.write_session_summary(conversation.conversation_id, "session summary")
         memory.write_long_term_memory("shared memory")
+        controller = MemoryController(
+            memory,
+            conversations,
+            MemoryProposalReview(MemoryWriteService(memory, conversations)),
+        )
         messages = tuple(
             ConversationMessage(role=MessageRole.USER, content=f"message {index}")
             for index in range(4)
@@ -32,7 +39,7 @@ def test_context_builder_loads_one_session_and_bounds_context(tmp_path: Path) ->
         reader = FakeStateReader(messages)
         builder = ContextBuilder(
             conversations,
-            memory,
+            controller,
             reader,
             max_messages=2,
             max_memory_chars=100,
@@ -51,9 +58,15 @@ def test_context_builder_loads_one_session_and_bounds_context(tmp_path: Path) ->
 
 def test_context_builder_rejects_unknown_conversations(tmp_path: Path) -> None:
     async def scenario() -> None:
+        conversations = SQLiteConversationStore(tmp_path / "hostpilot.sqlite3")
+        memory = MarkdownMemoryStore(tmp_path / "memory")
         builder = ContextBuilder(
-            SQLiteConversationStore(tmp_path / "hostpilot.sqlite3"),
-            MarkdownMemoryStore(tmp_path / "memory"),
+            conversations,
+            MemoryController(
+                memory,
+                conversations,
+                MemoryProposalReview(MemoryWriteService(memory, conversations)),
+            ),
             FakeStateReader(()),
         )
         with pytest.raises(ConversationNotFoundError):

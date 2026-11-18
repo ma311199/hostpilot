@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from time import perf_counter
 from typing import Any, Protocol
 from uuid import uuid4
 
 from hostpilot.budget import BudgetExceededError, RequestBudget
 from hostpilot.contracts import ToolType
-from hostpilot.observability import AuditEvent, AuditOutcome
+from hostpilot.observability import (
+    AuditEvent,
+    AuditOutcome,
+    TraceContext,
+    TraceEvent,
+    TraceSink,
+    child_trace_context,
+    current_trace_context,
+    trace_context_scope,
+)
 from hostpilot.policy import PolicyEngine
 from hostpilot.policy.confirmation import ConfirmationDecision, ConfirmationRequest
 from hostpilot.tools.registry import ToolRegistration, ToolRegistrationError, ToolRegistry
@@ -24,6 +34,14 @@ class AsyncConfirmationProvider(Protocol):
 
 class ToolExecutionError(RuntimeError):
     """Raised when a tool cannot be safely executed or verified."""
+
+
+class ToolExecutionTimeoutError(ToolExecutionError):
+    """Raised when a governed tool call exceeds its execution time limit."""
+
+
+class RemoteToolOutcomeUnknownError(ToolExecutionTimeoutError):
+    """Raised when a timed-out remote call may still be executing remotely."""
 
 
 class ToolDeniedError(PermissionError):
@@ -47,6 +65,7 @@ class ToolExecutor:
         policy: PolicyEngine,
         *,
         audit: Callable[[AuditEvent], None],
+        trace_sink: TraceSink | None = None,
         confirmation: AsyncConfirmationProvider | None = None,
         confirmation_timeout_seconds: float = 120,
     ) -> None:
@@ -55,10 +74,60 @@ class ToolExecutor:
         self.registry = registry
         self.policy = policy
         self.audit = audit
+        self.trace_sink = trace_sink
         self.confirmation = confirmation
         self.confirmation_timeout_seconds = confirmation_timeout_seconds
 
     async def execute(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+        *,
+        budget: RequestBudget,
+        granted_capabilities: frozenset[str] = frozenset(),
+        confirmation_provider: AsyncConfirmationProvider | None = None,
+        _invoke: Callable[[Mapping[str, Any]], Awaitable[Any]] | None = None,
+    ) -> Any:
+        """Create one governed tool span and execute within its request context."""
+        span_context = child_trace_context()
+        started_at = perf_counter()
+        with trace_context_scope(span_context):
+            try:
+                result = await self._execute(
+                    name,
+                    arguments,
+                    budget=budget,
+                    granted_capabilities=granted_capabilities,
+                    confirmation_provider=confirmation_provider,
+                    _invoke=_invoke,
+                )
+            except asyncio.CancelledError:
+                self._record_tool_span(
+                    span_context,
+                    name,
+                    status="cancelled",
+                    duration_ms=int((perf_counter() - started_at) * 1000),
+                    reason_code="execution_cancelled",
+                )
+                raise
+            except Exception as error:
+                self._record_tool_span(
+                    span_context,
+                    name,
+                    status="failed",
+                    duration_ms=int((perf_counter() - started_at) * 1000),
+                    reason_code=type(error).__name__,
+                )
+                raise
+            self._record_tool_span(
+                span_context,
+                name,
+                status="completed",
+                duration_ms=int((perf_counter() - started_at) * 1000),
+            )
+            return result
+
+    async def _execute(
         self,
         name: str,
         arguments: Mapping[str, Any],
@@ -155,7 +224,7 @@ class ToolExecutor:
             verify_tool_result(registration.verify_result, result, validated_arguments)
         except TimeoutError as error:
             self._record("tool.execute", AuditOutcome.FAILED, name, "tool_timeout")
-            raise ToolExecutionError("Tool execution timed out.") from error
+            raise ToolExecutionTimeoutError("Tool execution timed out.") from error
         except asyncio.CancelledError:
             self._record("tool.execute", AuditOutcome.CANCELLED, name, "execution_cancelled")
             raise
@@ -216,8 +285,10 @@ class ToolExecutor:
         tool_name: str,
         reason_code: str | None,
     ) -> None:
+        parent_context = current_trace_context()
         self.audit(
             AuditEvent(
+                trace_id=parent_context.trace_id if parent_context is not None else None,
                 action=action,
                 outcome=outcome,
                 resource_type="tool",
@@ -225,6 +296,50 @@ class ToolExecutor:
                 reason_code=reason_code,
             )
         )
+        if self.trace_sink is None:
+            return
+        event_context = (
+            child_trace_context()
+            if action == "tool.confirmation"
+            else parent_context or TraceContext()
+        )
+        attributes: dict[str, str | int | float | bool] = {
+            "tool_id": tool_name,
+            "status": outcome.value,
+        }
+        if reason_code is not None:
+            attributes["reason_code"] = reason_code
+        try:
+            self.trace_sink.record(
+                TraceEvent(context=event_context, name=action, attributes=attributes)
+            )
+        except Exception:
+            return
+
+    def _record_tool_span(
+        self,
+        span_context: TraceContext,
+        tool_name: str,
+        *,
+        status: str,
+        duration_ms: int,
+        reason_code: str | None = None,
+    ) -> None:
+        if self.trace_sink is None:
+            return
+        attributes: dict[str, str | int | float | bool] = {
+            "tool_id": tool_name,
+            "status": status,
+            "duration_ms": duration_ms,
+        }
+        if reason_code is not None:
+            attributes["reason_code"] = reason_code
+        try:
+            self.trace_sink.record(
+                TraceEvent(context=span_context, name="tool.span", attributes=attributes)
+            )
+        except Exception:
+            return
 
 
 __all__ = [
@@ -232,5 +347,7 @@ __all__ = [
     "ToolConfirmationDeniedError",
     "ToolDeniedError",
     "ToolExecutionError",
+    "ToolExecutionTimeoutError",
+    "RemoteToolOutcomeUnknownError",
     "ToolExecutor",
 ]

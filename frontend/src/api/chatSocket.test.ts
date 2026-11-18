@@ -33,9 +33,17 @@ describe('chat WebSocket confirmation outcomes', () => {
   })
 
   it.each([
-    ['tool_confirmation_rejected', '你已拒绝此操作，文件未更改。'],
-    ['tool_confirmation_cancelled', '你已取消此操作，文件未更改。'],
-    ['tool_confirmation_timed_out', '审批等待超时，文件未更改。'],
+    ['tool_confirmation_rejected', '你已拒绝此操作，本次操作未执行。'],
+    ['tool_confirmation_cancelled', '你已取消此操作，本次操作未执行。'],
+    ['tool_confirmation_timed_out', '审批等待超时，本次操作未执行。'],
+    [
+      'sandbox_unavailable',
+      '沙箱运行环境不可用。请到“工具”页面查看缺少的依赖，并按 Linux 安装指南安装。',
+    ],
+    [
+      'remote_tool_outcome_unknown',
+      '远程工具调用超时，远端执行结果未知。请先检查目标系统状态，再决定是否重试。',
+    ],
   ])('shows a specific message for %s', async (code, expectedMessage) => {
     vi.stubGlobal('WebSocket', FakeWebSocket)
     const client = new ChatSocketClient()

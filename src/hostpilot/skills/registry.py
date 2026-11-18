@@ -21,11 +21,13 @@ MAX_SKILL_FILE_BYTES = 256 * 1024
 MAX_RESOURCE_BYTES = 512 * 1024
 MAX_PACKAGE_BYTES = 2 * 1024 * 1024
 MAX_PACKAGE_FILES = 100
-RESOURCE_EXTENSIONS = frozenset({".csv", ".json", ".md", ".toml", ".txt", ".yaml", ".yml"})
-EXECUTABLE_EXTENSIONS = frozenset(
-    {".bat", ".cmd", ".dll", ".exe", ".js", ".py", ".ps1", ".sh", ".so"}
-)
+SCRIPT_RESOURCE_EXTENSIONS = frozenset({".js", ".py", ".sh"})
+RESOURCE_EXTENSIONS = frozenset(
+    {".csv", ".json", ".md", ".toml", ".txt", ".yaml", ".yml"}
+) | SCRIPT_RESOURCE_EXTENSIONS
+EXECUTABLE_EXTENSIONS = frozenset({".bat", ".cmd", ".dll", ".exe", ".ps1", ".so"})
 VIRTUAL_SKILLS_ROOT = "/skills/user"
+DISABLED_MARKER = ".hostpilot-disabled"
 
 
 class SkillValidationError(ValueError):
@@ -51,6 +53,7 @@ class SkillPackage:
     metadata: Mapping[str, object]
     instructions: str
     resources: Mapping[str, str]
+    enabled: bool
 
     @property
     def name(self) -> str:
@@ -88,6 +91,7 @@ class SkillRegistry:
         self,
         root: Path | str | None = None,
         *,
+        additional_roots: tuple[Path | str, ...] = (),
         max_skill_file_bytes: int = MAX_SKILL_FILE_BYTES,
         max_resource_bytes: int = MAX_RESOURCE_BYTES,
         max_package_bytes: int = MAX_PACKAGE_BYTES,
@@ -96,6 +100,7 @@ class SkillRegistry:
         if root is None:
             root = os.environ.get("HOSTPILOT_SKILLS_DIR")
         self.root = Path(root).expanduser() if root else Path.home() / ".hostpilot" / "skills"
+        self.additional_roots = tuple(Path(item).expanduser() for item in additional_roots)
         self.max_skill_file_bytes = max_skill_file_bytes
         self.max_resource_bytes = max_resource_bytes
         self.max_package_bytes = max_package_bytes
@@ -103,38 +108,36 @@ class SkillRegistry:
 
     def discover(self) -> SkillCatalog:
         """Load valid packages and return errors for invalid packages."""
-        if not self.root.exists():
-            return SkillCatalog(skills=(), issues=())
-        if self.root.is_symlink() or not self.root.is_dir():
-            return SkillCatalog(
-                skills=(),
-                issues=(SkillCatalogIssue(self.root, "Skill root must be a real directory."),),
-            )
-
-        root = self.root.resolve()
         packages: list[SkillPackage] = []
         issues: list[SkillCatalogIssue] = []
         names: set[str] = set()
-
-        try:
-            children = sorted(self.root.iterdir(), key=lambda path: path.name)
-        except OSError as error:
-            return SkillCatalog(
-                skills=(),
-                issues=(SkillCatalogIssue(self.root, f"Cannot list Skill root: {error}"),),
-            )
-
-        for child in children:
-            if child.name.startswith(".") or not child.is_dir():
+        for configured_root in (self.root, *self.additional_roots):
+            if not configured_root.exists():
                 continue
+            if configured_root.is_symlink() or not configured_root.is_dir():
+                issues.append(
+                    SkillCatalogIssue(configured_root, "Skill root must be a real directory.")
+                )
+                continue
+            root = configured_root.resolve()
             try:
-                package = self._load_package(child, root)
-                if package.name in names:
-                    raise SkillValidationError(f"Duplicate Skill name: {package.name}")
-                names.add(package.name)
-                packages.append(package)
-            except (OSError, SkillValidationError) as error:
-                issues.append(SkillCatalogIssue(child, str(error)))
+                children = sorted(configured_root.iterdir(), key=lambda path: path.name)
+            except OSError as error:
+                issues.append(
+                    SkillCatalogIssue(configured_root, f"Cannot list Skill root: {error}")
+                )
+                continue
+            for child in children:
+                if child.name.startswith(".") or not child.is_dir():
+                    continue
+                try:
+                    package = self._load_package(child, root)
+                    if package.name in names:
+                        raise SkillValidationError(f"Duplicate Skill name: {package.name}")
+                    names.add(package.name)
+                    packages.append(package)
+                except (OSError, SkillValidationError) as error:
+                    issues.append(SkillCatalogIssue(child, str(error)))
 
         return SkillCatalog(skills=tuple(packages), issues=tuple(issues))
 
@@ -215,6 +218,11 @@ class SkillRegistry:
             raise SkillValidationError("Skill package path escapes the configured root.")
         if not resolved_directory.is_dir():
             raise SkillValidationError("Skill package path must be a directory.")
+        disabled_marker = directory / DISABLED_MARKER
+        if disabled_marker.is_symlink() or (
+            disabled_marker.exists() and not disabled_marker.is_file()
+        ):
+            raise SkillValidationError("Skill enabled marker must be a regular file.")
 
         skill_file = directory / "SKILL.md"
         if skill_file.is_symlink() or not skill_file.is_file():
@@ -284,6 +292,7 @@ class SkillRegistry:
             metadata=MappingProxyType(metadata),
             instructions=instructions,
             resources=MappingProxyType(resources),
+            enabled=not disabled_marker.exists(),
         )
 
     @staticmethod

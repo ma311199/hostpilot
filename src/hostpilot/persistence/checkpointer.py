@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import UUID
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -37,4 +38,13 @@ async def open_sqlite_checkpointer(
         yield checkpointer
 
 
-__all__ = ["open_sqlite_checkpointer"]
+def conversation_thread_config(conversation_id: str) -> dict[str, dict[str, str]]:
+    """Map a validated HostPilot conversation ID to LangGraph thread configuration."""
+    try:
+        thread_id = str(UUID(conversation_id))
+    except (ValueError, AttributeError) as error:
+        raise ValueError("conversation_id must be a UUID.") from error
+    return {"configurable": {"thread_id": thread_id}}
+
+
+__all__ = ["conversation_thread_config", "open_sqlite_checkpointer"]

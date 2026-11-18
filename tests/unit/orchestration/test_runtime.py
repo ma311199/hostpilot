@@ -1,8 +1,6 @@
 import asyncio
 import operator
-import sys
 from pathlib import Path
-from types import ModuleType
 from typing import Annotated, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage
@@ -53,34 +51,32 @@ def test_langgraph_runtime_closes_the_model_async_client() -> None:
     assert Model.root_async_client.closed
 
 
-def test_configured_runtime_uses_openai_compatible_settings(monkeypatch, tmp_path) -> None:
-    model_arguments: dict[str, object] = {}
-    owned_http_clients: list[object] = []
+def test_configured_runtime_uses_model_provider_and_agent_adapter(monkeypatch, tmp_path) -> None:
+    from hostpilot.models.factory import ModelRuntime
 
-    def http_client_factory() -> object:
-        client = object()
-        owned_http_clients.append(client)
-        return client
-
-    import openai
-
-    monkeypatch.setattr(
-        openai,
-        "DefaultAsyncHttpx2Client",
-        http_client_factory,
-    )
-
-    def model_factory(**kwargs):
-        model_arguments.update(kwargs)
-        return "model-instance"
-
-    fake_provider = ModuleType("langchain_openai")
-    fake_provider.ChatOpenAI = model_factory
-    monkeypatch.setitem(sys.modules, "langchain_openai", fake_provider)
-
+    provider = object()
+    agent_chat_model = object()
+    components = ModelRuntime(provider=provider, agent_chat_model=agent_chat_model)
+    import hostpilot.models.factory as model_factory_module
     import hostpilot.orchestration.runtime as runtime_module
 
-    expected_runtime = object()
+    monkeypatch.setattr(
+        model_factory_module,
+        "create_model_runtime",
+        lambda settings, *, registry=None: components,
+    )
+
+    class ExpectedRuntime:
+        async def read_messages(self, conversation_id):
+            return ()
+
+        async def respond(self, message, context, **kwargs):
+            return None
+
+        async def record_turn(self, conversation_id, user_message, assistant_message):
+            return None
+
+    expected_runtime = ExpectedRuntime()
     runtime_arguments: dict[str, object] = {}
 
     def runtime_factory(model, **kwargs):
@@ -96,16 +92,15 @@ def test_configured_runtime_uses_openai_compatible_settings(monkeypatch, tmp_pat
     )
 
     result = create_configured_runtime(settings, checkpointer="checkpoint")
-    create_configured_runtime(settings, checkpointer="checkpoint")
 
-    assert result is expected_runtime
-    assert model_arguments["model"] == "test-model"
-    assert model_arguments["api_key"].get_secret_value() == "test-secret"
-    assert model_arguments["base_url"] == "https://model.example/v1"
-    assert len(owned_http_clients) == 2
-    assert owned_http_clients[0] is not owned_http_clients[1]
-    assert model_arguments["http_async_client"] is owned_http_clients[1]
-    assert runtime_arguments["model"] == "model-instance"
+    from hostpilot.orchestration.skill_runtime import SkillRuntimeAgentAdapter
+
+    assert isinstance(result, SkillRuntimeAgentAdapter)
+    assert result.chat_runtime is expected_runtime
+    assert result.skill_runtime.registry.discover().get("business/code-review-check") is not None
+    result.skill_runtime.actions.get("llm.complete")
+    assert result.skill_runtime.plan_fallback is not None
+    assert runtime_arguments["model"] is agent_chat_model
     assert runtime_arguments["checkpointer"] == "checkpoint"
 
 
@@ -182,3 +177,55 @@ def test_runtime_reports_provider_token_usage_for_only_the_current_turn() -> Non
     assert usage.input_tokens == 23
     assert usage.output_tokens == 7
     assert usage.total_tokens == 32
+
+
+def test_langgraph_runtime_accounts_model_tokens_before_returning() -> None:
+    from hostpilot.budget import RequestBudget
+    from hostpilot.contracts import BudgetContext, BudgetLimits, ModelTokenUsage
+    from hostpilot.models import ModelResponse
+    from hostpilot.models.langchain_adapter import ProviderChatModel
+
+    class Provider:
+        async def complete(self, request):
+            del request
+            return ModelResponse(
+                text="bounded reply",
+                token_usage=ModelTokenUsage(input_tokens=3, output_tokens=2, total_tokens=5),
+            )
+
+    model = ProviderChatModel(provider=Provider(), model_id="test-model")
+
+    class Graph:
+        async def ainvoke(self, agent_input, config, *, context):
+            del config, context
+            answer = await model.ainvoke(agent_input["messages"])
+            return {"messages": [*agent_input["messages"], answer]}
+
+    async def scenario():
+        budget = RequestBudget.start(
+            BudgetContext(
+                limits=BudgetLimits(
+                    total_tokens=8,
+                    tool_calls=0,
+                    retrieval_calls=0,
+                    timeout_seconds=10,
+                )
+            )
+        )
+        runtime = LangGraphAgentRuntime(Graph(), model=model)
+        response = await runtime.respond(
+            "Hello",
+            ContextSnapshot(
+                request_id="request-1",
+                conversation_id="6c442c1e-6e95-4908-88ab-0b3a3c195443",
+            ),
+            budget=budget,
+        )
+        return response, budget
+
+    response, budget = asyncio.run(scenario())
+
+    assert response.content == "bounded reply"
+    assert response.budget_usage_accounted is True
+    assert response.token_usage is not None and response.token_usage.total_tokens == 5
+    assert budget.snapshot().usage.total_tokens == 5

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from time import monotonic
 
 from hostpilot.contracts import BudgetContext, BudgetUsage
@@ -22,6 +23,8 @@ class RequestBudget:
 
     context: BudgetContext
     started_at: float
+    model_call_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _tokens_exhausted: bool = field(default=False, repr=False)
 
     @classmethod
     def start(cls, context: BudgetContext) -> RequestBudget:
@@ -37,8 +40,17 @@ class RequestBudget:
             update={"usage": self.context.usage.model_copy(update={"elapsed_seconds": elapsed})}
         )
 
+    @property
+    def remaining_tokens(self) -> int:
+        """Return the unused token allowance for the next model request."""
+        if self._tokens_exhausted:
+            return 0
+        return max(0, self.context.limits.total_tokens - self.context.usage.total_tokens)
+
     def ensure_available(self) -> None:
         """Raise when any resource limit has been reached."""
+        if self._tokens_exhausted:
+            raise BudgetExceededError("total_tokens")
         snapshot = self.snapshot()
         limits = snapshot.limits
         usage = snapshot.usage
@@ -78,6 +90,7 @@ class RequestBudget:
         current = self.context.usage
         total = current.total_tokens + delta.total_tokens
         if total > self.context.limits.total_tokens:
+            self._tokens_exhausted = True
             raise BudgetExceededError(resource)
         self.context = self.context.model_copy(
             update={"usage": current.model_copy(update={"total_tokens": total})}

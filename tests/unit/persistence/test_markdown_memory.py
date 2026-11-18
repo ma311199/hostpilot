@@ -1,8 +1,10 @@
 import stat
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
+from hostpilot.contracts import MemoryRawArchive, MemoryScope
 from hostpilot.persistence import MarkdownMemoryStore
 
 
@@ -46,4 +48,58 @@ def test_memory_rejects_symlinked_session_directory(tmp_path: Path) -> None:
         memory.write_session_summary(
             "6c442c1e-6e95-4908-88ab-0b3a3c195443",
             "summary",
+        )
+
+
+def test_raw_memory_archive_round_trips_and_filters_other_sessions(tmp_path: Path) -> None:
+    memory = MarkdownMemoryStore(tmp_path / "memory")
+    first = MemoryRawArchive(
+        archive_id=uuid4(),
+        proposal_id="proposal-first",
+        scope=MemoryScope.SESSION_SUMMARY,
+        conversation_id="b1e1a2f4-a333-4f47-93fb-88936298d70c",
+        importance_score=55,
+        content="Original private detail",
+    )
+    second = MemoryRawArchive(
+        archive_id=uuid4(),
+        proposal_id="proposal-second",
+        scope=MemoryScope.LONG_TERM,
+        importance_score=55,
+        content="Original shared detail",
+    )
+    memory.archive_raw_memory(first)
+    memory.archive_raw_memory(second)
+
+    visible = memory.list_raw_memory_archives(first.conversation_id, limit=10)
+
+    assert {item.archive_id for item in visible} == {first.archive_id, second.archive_id}
+    assert memory.read_raw_memory_archive(first.archive_id) == first
+    assert b"Original private detail" in (
+        memory.archives_directory / f"{first.archive_id}.json"
+    ).read_bytes()
+
+
+def test_raw_memory_archive_rejects_other_session_and_enforces_limit(tmp_path: Path) -> None:
+    memory = MarkdownMemoryStore(tmp_path / "memory", max_archives=1)
+    archive = MemoryRawArchive(
+        archive_id=uuid4(),
+        proposal_id="proposal-first",
+        scope=MemoryScope.SESSION_SUMMARY,
+        conversation_id="b1e1a2f4-a333-4f47-93fb-88936298d70c",
+        importance_score=55,
+        content="Private original detail",
+    )
+    memory.archive_raw_memory(archive)
+
+    assert memory.list_raw_memory_archives("e300d895-4582-48dd-87b9-8a9e7e9c54cd") == ()
+    with pytest.raises(ValueError, match="limit has been reached"):
+        memory.archive_raw_memory(
+            MemoryRawArchive(
+                archive_id=uuid4(),
+                proposal_id="proposal-second",
+                scope=MemoryScope.LONG_TERM,
+                importance_score=55,
+                content="Shared original detail",
+            )
         )

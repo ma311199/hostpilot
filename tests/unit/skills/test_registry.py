@@ -87,14 +87,15 @@ def test_resource_symlink_is_rejected(tmp_path: Path) -> None:
     assert "Symbolic links" in catalog.issues[0].message
 
 
-def test_executable_resources_are_rejected(tmp_path: Path) -> None:
+def test_script_resources_are_loaded_as_text(tmp_path: Path) -> None:
     package = write_skill(tmp_path)
-    (package / "helper.py").write_text("print('not run')", encoding="utf-8")
+    script = "print('not run')"
+    (package / "helper.py").write_text(script, encoding="utf-8")
 
     catalog = SkillRegistry(tmp_path).discover()
 
-    assert catalog.skills == ()
-    assert "not supported" in catalog.issues[0].message
+    assert len(catalog.skills) == 1
+    assert catalog.skills[0].resources["helper.py"] == script
 
 
 def test_save_creates_and_updates_local_skill(tmp_path: Path) -> None:

@@ -7,6 +7,8 @@ from pathlib import Path
 from threading import RLock
 from uuid import UUID, uuid4
 
+from hostpilot.contracts import MemoryRawArchive
+
 MAX_MEMORY_FILE_BYTES = 256 * 1024
 
 
@@ -22,9 +24,13 @@ class MarkdownMemoryStore:
         root: Path | str,
         *,
         max_file_bytes: int = MAX_MEMORY_FILE_BYTES,
+        max_archives: int = 500,
     ) -> None:
+        if max_file_bytes < 1 or max_archives < 1:
+            raise ValueError("Memory file and archive limits must be positive.")
         self.root = Path(root).expanduser()
         self.max_file_bytes = max_file_bytes
+        self.max_archives = max_archives
         self._write_lock = RLock()
 
     @property
@@ -36,6 +42,11 @@ class MarkdownMemoryStore:
     def shared_memory_path(self) -> Path:
         """Path to cross-conversation long-term memory."""
         return self.root / "long_term.md"
+
+    @property
+    def archives_directory(self) -> Path:
+        """Directory containing original content for medium-tier memories."""
+        return self.root / "archives"
 
     def read_session_summary(self, conversation_id: str) -> str | None:
         """Read one conversation summary without exposing other sessions."""
@@ -68,6 +79,65 @@ class MarkdownMemoryStore:
         The caller owns proposal review and policy checks before invoking this method.
         """
         self._atomic_write(self.shared_memory_path, content)
+
+    def archive_raw_memory(self, archive: MemoryRawArchive) -> None:
+        """Atomically persist original memory content with non-sensitive metadata."""
+        path = self._archive_path(archive.archive_id)
+        encoded = archive.model_dump_json()
+        with self._write_lock:
+            self._ensure_root()
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._ensure_safe_parent(path)
+            if path.is_symlink():
+                raise ValueError("Memory archives cannot be symbolic links.")
+            if not path.exists() and len(tuple(path.parent.glob("*.json"))) >= self.max_archives:
+                raise ValueError("Memory archive limit has been reached.")
+            self._atomic_write(path, encoded)
+
+    def read_raw_memory_archive(self, archive_id: UUID) -> MemoryRawArchive | None:
+        """Read one validated original memory archive by its immutable ID."""
+        content = self._read(self._archive_path(archive_id))
+        if content is None:
+            return None
+        return MemoryRawArchive.model_validate_json(content)
+
+    def list_raw_memory_archives(
+        self, conversation_id: str, *, limit: int = 100
+    ) -> tuple[MemoryRawArchive, ...]:
+        """List shared and current-session archives in newest-first order."""
+        if not 1 <= limit <= 500:
+            raise ValueError("Memory archive list limit must be between 1 and 500.")
+        self._ensure_root()
+        directory = self.archives_directory
+        self._ensure_safe_parent(directory / "placeholder.json")
+        if not directory.exists():
+            return ()
+        archives: list[MemoryRawArchive] = []
+        for path in directory.glob("*.json"):
+            content = self._read(path)
+            if content is None:
+                continue
+            archive = MemoryRawArchive.model_validate_json(content)
+            if archive.scope.value == "long_term" or archive.conversation_id == conversation_id:
+                archives.append(archive)
+        archives.sort(key=lambda item: (item.created_at, str(item.archive_id)), reverse=True)
+        return tuple(archives[:limit])
+
+    def delete_raw_memory_archive(self, archive_id: UUID) -> bool:
+        """Delete one archive, used when its paired summary write fails."""
+        path = self._archive_path(archive_id)
+        with self._write_lock:
+            self._ensure_root()
+            self._ensure_safe_parent(path)
+            if path.is_symlink():
+                raise ValueError("Memory archives cannot be symbolic links.")
+            if not path.exists():
+                return False
+            path.unlink()
+            return True
+
+    def _archive_path(self, archive_id: UUID) -> Path:
+        return self.archives_directory / f"{archive_id}.json"
 
     def _session_path(self, conversation_id: str) -> Path:
         try:

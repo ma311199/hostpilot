@@ -33,3 +33,12 @@
 
 - 供应商速率限制、实际费用、并发隔离和错误响应映射尚未验证。
 - 本次未采集覆盖率；不报告覆盖率数值。
+
+## 2026-11-04 Chat Completions 路由兼容修正
+
+- 用户配置的 OpenAI 兼容服务在模型配置接口返回 200，但聊天时收到 `/responses` 路径 404。配置接口此前只构造 Runtime，没有发起模型请求；`langchain-openai` 会根据模型名自动切换到 Responses API。
+- `ChatOpenAI` 现在显式设置 `use_responses_api=False`，避免自动选用不受兼容服务支持的 Responses API。
+- 当前配置的 OpenAI 兼容服务已由用户通过 `stream: true` 的 Chat Completions 请求验证。模型配置页现提供流式调用选项，默认开启；环境变量 `HOSTPILOT_MODEL_STREAMING` 可控制启动配置。此选项控制后端到供应商的 SSE 请求，聊天页面仍在收齐完整回复后展示。
+- 现场后续发现，顶层分类使用的结构化调用也被兼容服务以 HTTP 400 拒绝。分类现通过普通 Chat Completions 请求要求 JSON，再由 HostPilot/Pydantic 校验；路由目标和三类内置 Skill 不变。若 JSON 缺失或无效，则按 fail-closed 原则进入 `clarify`，不绕过分类。
+- 模型配置页现在可保存流式模式，默认开启；API 请求/状态契约和环境变量启动配置均传递该选项到 `ChatOpenAI`。
+- 回归验证：后端全量测试 199 项通过；前端 15 项测试通过；Ruff、格式检查、mypy（61 个源码文件）、前端 lint/build 和 `git diff --check` 通过。未执行真实供应商联调，需重启应用并重新配置后由用户验证。

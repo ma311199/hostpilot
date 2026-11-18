@@ -1,7 +1,8 @@
 # ADR-0003：本地 Skill 与高影响操作确认
 
-- 状态：已接受
+- 状态：安全原则继续有效；Skill 格式已由新架构取代，迁移待实施
 - 日期：2026-10-29
+- 关联：[新架构文档](../新架构文档.md)、[Skill 开发指南](../skills-guide.md)、[ADR-0009](0009-skill-runtime-and-yaml-contract.md)
 
 ## 背景
 
@@ -21,3 +22,7 @@ HostPilot 的个人客户端需要允许用户扩展 Agent 能力，同时保证
 
 - Skill 需要覆盖本地添加、修改、无效包拒绝、路径逃逸防护、工具权限和确认状态的测试。
 - 高影响工具的具体分类由 ToolDescriptor 和策略配置逐步明确；Gradio 原型只绑定本地回环地址。
+
+## 新架构对本决策的影响
+
+YAML Skill 使用 `skill.yaml` 执行，DeepAgents Skill 使用 `SKILL.md` 执行；两种形式长期并行，选择规则见 [ADR-0013](0013-dual-skill-formats-and-execution-selection.md)。工具权限独立于 Skill 内容、用户确认不能覆盖策略拒绝、加载 Skill 不执行包内代码等安全原则继续有效。

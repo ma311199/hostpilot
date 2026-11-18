@@ -4,7 +4,7 @@ HostPilot 是部署在用户终端上的 Agent 后端项目，当前面向单个
 
 ## 项目状态
 
-当前仓库已具备本地 Skill、会话持久化、ContextBuilder、模型运行时、FastMCP 工具治理链、工作区文件工具、WebSocket 人工审批和本地工具目录页；真实模型发起 MCP 高影响操作、浏览器审批、批准写入和拒绝阻断已完成本机手动联调。知识库 MCP 工具只向 Agent 暴露 query，后端可通过 RAG_BASE_URL、RAG_USER_ID、RAG_KEY 等本地配置连接服务；真实 RAG 服务接口联调是 Phase 1 下一项工作。未配置模型时，聊天接口返回 503。目标架构和当前阶段见 [架构设计初版](docs/architecture.md) 与 [实施路线](docs/roadmap.md)。
+HostPilot 当前提供本地 Vue Web 界面、FastAPI 聊天服务、YAML/Markdown Skill 执行、混合 Skill 路由、Plan 编排、MCP 工具治理和 Linux 沙箱。当前实现边界与模块结构见[新架构文档](docs/新架构文档.md)，阶段进度见[实施路线](docs/roadmap.md)，按模块组织的测试类型与用例见[模块测试总览](docs/testing-catalog.md)，质量指标见[测试台账](docs/testing-metrics.md)。
 
 ## 目录概览
 
@@ -18,7 +18,7 @@ docs/                架构、需求、规范、测试和决策文档
 
 ## 开发入口
 
-开发环境和依赖分组见 [开发指南](docs/development-guide.md) 与 [依赖管理](docs/dependency-management.md)。项目要求 Python 3.11 或更高版本，使用 uv 根据 pyproject.toml 和 uv.lock 创建可复现环境。
+开发环境和依赖分组见 [开发指南](docs/development-guide.md) 与 [依赖管理](docs/dependency-management.md)。Linux 用户还需安装操作系统级沙箱依赖，详见 [Linux 安装与沙箱前置依赖](docs/linux-installation.md)。项目要求 Python 3.11 或更高版本，使用 uv 根据 pyproject.toml 和 uv.lock 创建可复现环境。
 
 ~~~bash
 uv sync --locked --python 3.11 --group dev --group agents
@@ -66,6 +66,6 @@ uv sync --locked --group dev --group agents --group prototype
 ## 安全原则
 
 - 所有工具调用在执行前经过 Policy Engine 授权和参数约束。
-- 不可信脚本默认使用零权限隔离；WASM / OS 原生沙箱按阶段接入。
+- 提供经用户审批后运行的 Linux Python、JavaScript 和 POSIX Shell 工具：使用 bubblewrap 隔离网络和宿主工作区访问，并限制运行时间、资源和输出。缺少对应运行时或可用隔离环境时会拒绝执行；这些工具不隔离本地 STDIO MCP 子进程。
 - 不提交个人会话数据、密钥或外部服务运行时凭证。
 - 外部 Agentic RAG 服务负责其自身的用户认证、数据范围和多用户隔离。

@@ -2,13 +2,17 @@
 
 ## 当前状态
 
-项目使用 Python 3.11+ 与 uv。Python 版本下限、依赖范围和开发工具在 pyproject.toml 中声明；uv.lock 用于可复现安装。FastAPI、aiosqlite 和 Uvicorn 是本地后端 API 与会话目录的运行依赖；HTTPX 在 dev 组用于 API 测试，在 agents 组用于 RAG HTTP 适配器。agents 组包含 LangChain、LangGraph、DeepAgents、langchain-openai、langgraph-checkpoint-sqlite、FastMCP 和 langchain-mcp-adapters。模型适配首版采用 OpenAI 兼容 Chat API，不限定供应商；运行时不配置 Base URL 时采用 SDK 默认地址。已在当前依赖锁定组合中验证 DeepAgents 0.7.32、LangGraph 1.2.18 与 SQLite checkpointer 3.1.2。Web 前端独立开发，不纳入本仓库依赖；Gradio 仅用于开发期原型。CrewAI 未纳入项目依赖。FastMCP 与 langchain-mcp-adapters 已加入 agents 依赖组并通过工具调用集成测试；当前锁定 FastMCP 2.14.7、langchain-mcp-adapters 0.3.2。Agentic RAG 是独立项目能力，不作为 HostPilot 内部实现依赖；HostPilot 用 FastMCP 定义工具，并由 MCP 适配器接入 DeepAgents。Markdown 记忆使用标准文件接口，不额外引入存储服务。
+Linux OS 沙箱依赖不属于 Python 包：需要系统安装 Bubblewrap 和 util-linux（提供 `prlimit`）；JavaScript 沙箱另需 Node.js。用户安装步骤和命名空间故障排查见 [Linux 安装指南](linux-installation.md)。
+
+项目使用 Python 3.11+ 与 uv。Python 版本下限、依赖范围和开发工具在 pyproject.toml 中声明；uv.lock 用于可复现安装。FastAPI、aiosqlite、Uvicorn、Pydantic 和 JSON Schema 验证器是本地后端运行依赖；HTTPX 在 dev 组用于 API 测试，在 agents 组用于 RAG HTTP 适配器。agents 组包含 LangChain、LangGraph、DeepAgents、langchain-openai、langgraph-checkpoint-sqlite、FastMCP 和 langchain-mcp-adapters。模型适配首版采用 OpenAI 兼容 Chat API，不限定供应商；运行时不配置 Base URL 时采用 SDK 默认地址。已在当前依赖锁定组合中验证 DeepAgents 0.7.32、LangGraph 1.2.18 与 SQLite checkpointer 3.1.2。Web 前端独立开发，不纳入本仓库依赖；Gradio 仅用于开发期原型。CrewAI 未纳入项目依赖。FastMCP 与 langchain-mcp-adapters 已加入 agents 依赖组并通过工具调用集成测试；当前锁定 FastMCP 2.14.7、langchain-mcp-adapters 0.3.2。Agentic RAG 是独立项目能力，不作为 HostPilot 内部实现依赖；HostPilot 用 FastMCP 定义工具，并由 MCP 适配器接入 DeepAgents。Markdown 记忆使用标准文件接口，不额外引入存储服务。
+
+上述为当前代码的依赖事实，不等于新架构的完整实现。HostPilot 自有的路由、Plan、评估和 Skill action 已通过 `ModelProvider` 契约调用模型；首个 OpenAI 兼容适配器仍使用 `langchain-openai`，DeepAgents 图也继续使用框架 ChatModel。未来 LLM 接入类型按需增加 Provider 适配器，不预设特定推理引擎。Skill Runtime 与 MCP Tool Facade 依赖 HostPilot 契约；当前 LangChain、LangGraph、DeepAgents 和进程内 MCP 仍服务于已交付实现，后续边界按迁移设计逐步调整。MCP 使用内置进程内 FastMCP，以及 FastMCP 支持的本地 STDIO 与远程 Streamable HTTP Client；STDIO 连接规则见 ADR-0016。新架构目标以 [新架构文档](新架构文档.md) 及已确认修订为准。
 
 ## 选择规则
 
 - 先明确依赖对应的模块、使用理由、许可证、维护状态及安全边界。
 - 核心代码依赖 HostPilot 契约，不直接依赖具体供应方对象或框架专有类型。
-- LangChain、LangGraph、DeepAgents 的组合已确定；SQLite checkpointer 3.1.2 已通过重启恢复和会话隔离集成验证。其他框架 API 组合在相关模块实现前继续验证。
+- 当前实现使用 LangChain、LangGraph、DeepAgents；SQLite checkpointer 3.1.2 已通过重启恢复和会话隔离集成验证。Skill Runtime、Plan 和 DeepAgents 通过 HostPilot 自有契约与适配器接入这些框架；长期是否替换底层框架仍属于迁移评估，不改变当前模块职责边界。
 - FastAPI 仅作为后端 HTTP API 适配层；核心业务模块和稳定领域契约不得依赖 FastAPI 专有类型。
 - Web 前端独立开发，不纳入 HostPilot 后端依赖。
 - Gradio 仅用于开发期交互原型，不能被核心业务模块或稳定领域接口依赖，也不代表正式 Web 前端。
@@ -19,10 +23,10 @@
 
 ## 依赖组
 
-- dev：Ruff、mypy、pytest 等开发与质量工具。
+- dev：Ruff、mypy、pytest、PyYAML 和 JSON Schema 类型存根等开发与质量工具。
 - agents：LangChain、LangGraph、DeepAgents、OpenAI 兼容模型适配器和 SQLite checkpointer。
 - prototype：Gradio 开发期原型界面。
-- FastMCP 用于 MCP 工具开发；langchain-mcp-adapters 将 MCP 服务工具映射为 LangChain Agent 工具，并由工具拦截器接入 HostPilot 治理链。
+- 当前 FastMCP 与 langchain-mcp-adapters 将 MCP 工具映射到 DeepAgents，并由拦截器接入治理链。内置工具使用进程内 MCP；外部 Server 通过独立 Streamable HTTP Client 或 STDIO Client 连接；Skill 模块不直接依赖传输库。
 - CrewAI 不属于当前选型，不在项目依赖清单或锁文件中。
 
 基础开发环境：
@@ -50,4 +54,4 @@
 
 ## 待决策
 
-私有包源、依赖扫描工具、实际使用的模型供应商与模型，以及 LangChain / LangGraph / DeepAgents 的后续兼容升级策略仍需确认。
+私有包源、依赖扫描工具、其他 LLM 接入类型及其依赖、Skill Runtime/Plan 对现有 Agent 框架的长期替换范围、MCP 客户端库的后续封装方式，以及长期记忆向量检索存储仍需确认；这些待决策不改变当前已交付的 Runtime、Plan 与工具治理边界。

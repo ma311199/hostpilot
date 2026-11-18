@@ -11,7 +11,9 @@ from uuid import UUID, uuid4
 
 import aiosqlite
 
-from hostpilot.contracts import ConversationSummary
+from hostpilot.contracts import ConversationSummary, SandboxMode
+from hostpilot.persistence.checkpointer import conversation_thread_config
+from hostpilot.persistence.sqlite_path import prepare_sqlite_database_path
 
 
 class ConversationNotFoundError(KeyError):
@@ -35,12 +37,7 @@ class SQLiteConversationStore:
         async with self._initialize_lock:
             if self._initialized:
                 return
-            if self.database_path.is_symlink():
-                raise ValueError("Conversation database cannot be a symbolic link.")
-            self.database_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if self.database_path.parent.is_symlink():
-                raise ValueError("Conversation data directory cannot be a symbolic link.")
-            os.chmod(self.database_path.parent, 0o700)
+            prepare_sqlite_database_path(self.database_path)
 
             async with aiosqlite.connect(self.database_path) as connection:
                 connection.row_factory = sqlite3.Row
@@ -49,7 +46,7 @@ class SQLiteConversationStore:
                 if version_row is None:
                     raise RuntimeError("Could not read conversation database schema version.")
                 schema_version = int(version_row[0])
-                if schema_version > 1:
+                if schema_version > 2:
                     raise RuntimeError("Conversation database schema is newer than this app.")
                 await connection.execute(
                     """
@@ -57,12 +54,20 @@ class SQLiteConversationStore:
                         conversation_id TEXT PRIMARY KEY,
                         title TEXT NOT NULL,
                         created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
+                        updated_at TEXT NOT NULL,
+                        sandbox_mode TEXT NOT NULL DEFAULT 'read-only'
                     )
                     """
                 )
-                if schema_version == 0:
-                    await connection.execute("PRAGMA user_version = 1")
+                cursor = await connection.execute("PRAGMA table_info(conversations)")
+                columns = {str(row[1]) for row in await cursor.fetchall()}
+                if "sandbox_mode" not in columns:
+                    await connection.execute(
+                        "ALTER TABLE conversations ADD COLUMN sandbox_mode TEXT "
+                        "NOT NULL DEFAULT 'read-only'"
+                    )
+                if schema_version < 2:
+                    await connection.execute("PRAGMA user_version = 2")
                 await connection.commit()
             os.chmod(self.database_path, 0o600)
             self._initialized = True
@@ -161,10 +166,45 @@ class SQLiteConversationStore:
             await connection.commit()
         return cursor.rowcount > 0
 
+    async def upgrade_sandbox_mode(
+        self, conversation_id: str, target: SandboxMode
+    ) -> ConversationSummary:
+        """Atomically apply one strict privilege upgrade to a conversation."""
+        await self.initialize()
+        normalized_id = _normalize_conversation_id(conversation_id)
+        async with aiosqlite.connect(self.database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                "SELECT * FROM conversations WHERE conversation_id = ?", (normalized_id,)
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await connection.rollback()
+                raise ConversationNotFoundError(normalized_id)
+            current = SandboxMode(row["sandbox_mode"])
+            if target.rank <= current.rank:
+                await connection.rollback()
+                raise ValueError("Sandbox mode can only be upgraded to a higher level.")
+            now = datetime.now(UTC).isoformat()
+            await connection.execute(
+                "UPDATE conversations SET sandbox_mode = ?, updated_at = ? "
+                "WHERE conversation_id = ?",
+                (target.value, now, normalized_id),
+            )
+            await connection.commit()
+            updated = await connection.execute(
+                "SELECT * FROM conversations WHERE conversation_id = ?", (normalized_id,)
+            )
+            updated_row = await updated.fetchone()
+        if updated_row is None:
+            raise RuntimeError("Conversation disappeared after sandbox upgrade.")
+        return _record_from_row(updated_row)
+
     @staticmethod
     def thread_config(conversation_id: str) -> dict[str, dict[str, str]]:
         """Map a HostPilot conversation ID to LangGraph's persistent thread ID."""
-        return {"configurable": {"thread_id": _normalize_conversation_id(conversation_id)}}
+        return conversation_thread_config(conversation_id)
 
 
 def _normalize_conversation_id(conversation_id: str) -> str:
@@ -180,6 +220,7 @@ def _record_from_row(row: sqlite3.Row) -> ConversationSummary:
         title=row["title"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+        sandbox_mode=SandboxMode(row["sandbox_mode"]),
     )
 
 

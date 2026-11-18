@@ -1,0 +1,85 @@
+dataset_id: memory-retrieval-evaluation
+version: 1
+status: synthetic_baseline
+description: >-
+  Synthetic local-only cases comparing fixed-order bounded recall, BM25-only ranking,
+  and BM25-first recall with fixed-order fallback. The dataset contains deliberately
+  paraphrased queries; it is not production user data and does not evaluate embeddings.
+
+entries:
+  - entry_id: session-alpha-contract
+    scope: session_summary
+    conversation_id: conversation-alpha
+    content: >-
+      本次合同讨论确认税费由乙方承担，首批交付安排在六月十二日；尚未确认的是验收材料的提交人。
+  - entry_id: session-beta-private
+    scope: session_summary
+    conversation_id: conversation-beta
+    content: >-
+      另一个会话的合同讨论确认税费由甲方承担，私人报价与本会话无关。
+  - entry_id: preference-concise
+    scope: long_term
+    content: >-
+      用户偏好简洁、直接的中文回答；给出开发结果时同时说明改动原因和验证结果。
+  - entry_id: model-credential-lifecycle
+    scope: long_term
+    content: >-
+      模型名称和 Base URL 跨重启保存；模型 API Key 只保存在后端进程内存，应用重启后需要重新输入。
+  - entry_id: mcp-credential-lifecycle
+    scope: long_term
+    content: >-
+      MCP Server 的传输方式和非敏感连接参数跨重启保存；需要密钥的 Server 在应用重启后要求重新输入 API Key。
+  - entry_id: workspace-access-recovery
+    scope: long_term
+    content: >-
+      保存的工作区无法读取时，应用暂时回退到后端启动目录并提示用户重新选择；目录可读但不可写时以只读方式使用。
+  - entry_id: sandbox-one-way-upgrade
+    scope: long_term
+    content: >-
+      会话文件权限从 read-only 升级到 workspace-write 或 danger-full-access；权限只能单向升级，不能降级。
+  - entry_id: skill-format-selection
+    scope: long_term
+    content: >-
+      Skill 包可以选择 YAML 或 DeepAgents 执行；双格式包每次请求只进入一个执行入口，不会失败后自动切换重试。
+  - entry_id: memory-recall-boundary
+    scope: long_term
+    content: >-
+      Memory Controller 当前按会话范围读取摘要与共享记忆，并遵守字符预算；当前 Markdown 后端没有语义索引或相关性排序。
+
+cases:
+  - case_id: session-contract-tax
+    conversation_id: conversation-alpha
+    query: 这个会话里税费由谁承担？
+    relevant_ids: [session-alpha-contract]
+  - case_id: model-key-after-restart
+    conversation_id: conversation-alpha
+    query: 应用重新启动后，模型访问凭据还保留在设置里吗？
+    relevant_ids: [model-credential-lifecycle]
+  - case_id: mcp-key-after-restart
+    conversation_id: conversation-alpha
+    query: MCP 连接认证在下次打开程序时要不要再填？
+    relevant_ids: [mcp-credential-lifecycle]
+  - case_id: workspace-permission-fallback
+    conversation_id: conversation-alpha
+    query: 选中的目录没有访问权限时程序会怎样处理？
+    relevant_ids: [workspace-access-recovery]
+  - case_id: sandbox-cannot-downgrade
+    conversation_id: conversation-alpha
+    query: 会话提权后能否再恢复成只读？
+    relevant_ids: [sandbox-one-way-upgrade]
+  - case_id: skill-dual-entry
+    conversation_id: conversation-alpha
+    query: 同一个 Skill 有两种运行格式时失败后会换另一种吗？
+    relevant_ids: [skill-format-selection]
+  - case_id: memory-semantic-status
+    conversation_id: conversation-alpha
+    query: 目前记忆会根据问题含义自动找相似内容吗？
+    relevant_ids: [memory-recall-boundary]
+  - case_id: response-style
+    conversation_id: conversation-alpha
+    query: 开发完成后我希望用什么语言和篇幅汇报？
+    relevant_ids: [preference-concise]
+  - case_id: credential-after-exit-paraphrase
+    conversation_id: conversation-alpha
+    query: 之前授权的访问口令退出程序后还能用吗？
+    relevant_ids: [model-credential-lifecycle, mcp-credential-lifecycle]

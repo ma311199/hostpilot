@@ -1,0 +1,68 @@
+schema_version: 1
+meta:
+  skill_id: business/code-review-check
+  name: Code review
+  version: 1.0.0
+  priority: 70
+  enabled: true
+intent_summary: >-
+  Review code or a diff supplied by the user and report actionable defects and security
+  concerns with evidence from the supplied text only.
+tags:
+  - code review
+  - security review
+  - diff review
+examples:
+  - Review this code and identify bugs with evidence.
+  - Check this diff for security issues.
+  - Review the pasted implementation for correctness and maintainability.
+  - 评审我贴出的代码或 diff，指出缺陷和安全问题。
+  - 帮我做代码评审，检查代码规范和潜在缺陷。
+  - 对下面的代码变更做缺陷检查。
+input_schema:
+  type: object
+  properties:
+    code_or_diff:
+      title: 要评审的代码或 diff
+      type: string
+      minLength: 1
+      maxLength: 30000
+  required:
+    - code_or_diff
+  additionalProperties: false
+output_schema:
+  type: object
+  properties:
+    text:
+      type: string
+      minLength: 1
+  required:
+    - text
+  additionalProperties: false
+side_effect_level: read_only
+execution:
+  kind: steps
+  steps:
+    - step_id: review
+      action: llm.complete
+      depends_on: []
+      params:
+        instruction: >-
+          Perform a focused code review. Report only actionable findings supported by the
+          supplied code or diff. For each finding include severity (critical, high, medium,
+          or low), the line or symbol when identifiable, the concrete failure or exploit
+          path, and a concise remediation. Prioritize correctness, security, data loss,
+          concurrency, and API compatibility. Do not invent line numbers or claim that code
+          was executed or that files outside the supplied text were inspected. If no
+          actionable defect is supported, say that no findings were identified and state
+          the review scope and limitations. Do not ask for surrounding repository context,
+          intended behavior, or review focus when non-empty code or a diff is supplied. Review
+          the provided text as-is; if it is too incomplete to support a finding, report no
+          findings with a clear scope limitation. Ask for clarification only when no code or
+          diff was provided.
+      input_mapping:
+        source:
+          $ref: input.code_or_diff
+dependencies:
+  skills: []
+  tools: []

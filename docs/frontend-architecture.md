@@ -2,7 +2,8 @@
 
 - 状态：首版架构
 - 日期：2026-10-31
-- 范围：frontend/ 下的本地项目看板与聊天界面
+- 范围：frontend/ 下的本地项目看板、聊天和 Harness 管理 Web
+- 目标架构关联：[新架构文档](新架构文档.md)
 
 ## 目标与需求
 
@@ -12,25 +13,27 @@
 
 ```text
 frontend/
-├── public/             静态图标和浏览器资源
+├── public/               静态图标和浏览器资源
 ├── src/
-│   ├── api/            后端 API 调用
-│   │   ├── chat.ts     会话列表、历史和消息提交
-│   │   ├── chatSocket.ts 聊天 WebSocket 客户端
-│   │   ├── model.ts    模型配置状态与提交
-│   │   └── tools.ts    后端注册工具目录
-│   ├── data/           与 docs/roadmap.md 对齐的阶段展示数据
-│   ├── App.vue         看板布局、导航和状态轮询
-│   ├── ChatPanel.vue   会话列表、历史消息和聊天输入
-│   ├── ModelSettings.vue 模型配置面板
-│   ├── ToolsPanel.vue 工具目录和状态
-│   ├── main.ts         Vue 应用入口
-│   └── style.css       全局主题和响应式样式
-├── package.json        脚本和直接依赖
-└── pnpm-lock.yaml      可复现的依赖解析
+│   ├── api/              后端 HTTP 与 WebSocket 客户端
+│   ├── data/             与 docs/roadmap.md 对齐的阶段展示数据
+│   ├── App.vue           看板布局、主导航和后端状态 WebSocket
+│   ├── ChatPanel.vue     工作区选择、会话管理、聊天和工具审批
+│   ├── HarnessSettingsPanel.vue Harness 运行时配置
+│   ├── McpConnectionsPanel.vue MCP Server 配置和连接状态
+│   ├── ModelSettings.vue 模型配置
+│   ├── ToolsPanel.vue    工具目录和能力状态
+│   ├── SkillsPanel.vue   Skill 浏览、导入、启停和删除
+│   ├── TracesPanel.vue   Trace 列表与 Span 详情
+│   ├── AuditPanel.vue    Audit 筛选、分页和 CSV 导出
+│   ├── main.ts           Vue 应用入口
+│   └── style.css         全局主题和响应式样式
+├── e2e/                  Playwright 浏览器验收与隔离服务 fixture
+├── package.json          开发、检查、单测和 E2E 脚本
+└── pnpm-lock.yaml        可复现的依赖解析
 ```
 
-页面状态使用 Vue Composition API；阶段数据用类型化的本地模块维护；API 调用集中放在 api/。导航在项目路线看板、聊天界面和工具目录之间切换，当前不增加 Vue Router 或 Pinia。
+页面状态使用 Vue Composition API；阶段数据用类型化的本地模块维护；API 调用集中放在 api/。主导航连接项目看板、聊天、工具、MCP、Skill、Trace、Audit 和 Harness 配置页面。当前不增加 Vue Router 或 Pinia。
 
 ## 数据流与边界
 
@@ -39,13 +42,20 @@ frontend/
 - WebSocket 使用 JSON 消息：服务端发送 status.snapshot，客户端每 15 秒发送 ping 并以 pong 确认连接；协议错误使用 error 消息返回。
 - API 地址由 VITE_HOSTPILOT_API_BASE_URL 设置，默认 http://127.0.0.1:8000/api/v1。
 - 聊天界面通过 POST /conversations 创建会话，GET /conversations 加载会话列表，GET /conversations/{id}/messages 加载历史；消息由 WebSocket 发送并接收回复。
+- 聊天侧栏通过 POST `/api/v1/workspace/select` 请求本机原生文件夹选择器；后端校验读取和写入权限并持久化所选路径。只读工作区的写入操作会在 Tool Executor 参数校验阶段被拒绝；会话删除通过 DELETE `/api/v1/conversations/{id}` 完成，并提示用户确认。
 - 聊天消息通过 /api/v1/ws/chat WebSocket 发送并接收完整回复；会话创建、列表和历史仍使用现有 HTTP API。该通道当前不做 Token 流式传输。
-- 顶部“模型配置”面板通过 PUT /api/v1/model/configuration 配置 OpenAI 兼容模型；API Key 只发送到本机后端并在当前进程内存中持有，不返回给前端或写入浏览器存储。后端重启后需重新配置，或改用环境变量启动配置。
-- GET /api/v1/model/configuration 只返回 configured、model_name 和 base_url，不返回凭证。保存配置在运行时重建模型并立即替换；替换与聊天请求通过同一把运行时锁串行化。
+- “模型配置”面板将主 LLM、轻量 LLM、Embedding 和 Reranker 分为独立可展开卡片，每个角色可单独测试连接并保存配置。`POST /api/v1/model/configuration/test` 只发起一次最小模型请求，不保存草稿；成功/失败状态只展示经过脱敏的结果。模型名、Base URL 和流式选项保存在本地 SQLite。主 LLM 与轻量 LLM 的 API Key 只由本机后端进程内存持有，重启后需重新输入；Embedding 与 Reranker 的 Key 保存在本机 SQLite，重启后恢复。所有 Key 均不返回给前端或写入浏览器存储。流式选项只控制后端到模型服务的 SSE 请求；当前聊天页面仍在整条回复完成后显示结果。
+- GET /api/v1/model/configuration 只返回 configured、saved、api_key_required、model_name、base_url 和 streaming，不返回凭证。GET /api/v1/routing-model/configuration 对各角色只返回 API Key 是否已配置。保存配置在运行时重建模型并立即替换；替换与聊天请求通过同一把运行时锁串行化。
+- “Harness 配置”页面通过 GET/PUT `/api/v1/harness/configuration` 管理上下文消息数、记忆上下文字符数、请求/响应字符数、请求 Token/工具/知识检索预算和超时。完整配置保存在本地 SQLite；启动时恢复，在线更新与聊天请求通过同一把运行时锁串行化，设置立即应用于后续请求。当前未暴露尚无执行机制支撑的重试、Agent 循环、工具白/黑名单或沙箱控制。
+- MCP 连接页通过 GET/PUT/DELETE /api/v1/mcp/servers 管理本地 STDIO Server 的 command/args/cwd 与远程 Server 的 URL、超时、启用状态和凭证名称；“添加 Server”或“编辑”才打开配置编辑器，参数表单与 JSON 导入模式位于编辑器内且互斥。JSON 模式支持导入标准 `mcpServers` 的无密钥连接配置；JSON 中存在 `env` 或 `headers` 值时拒绝导入，密钥需单独提交。密钥只在 PUT 请求提交并留在后端进程内存；重启后配置显示等待 API Key。环境变量配置的 Server 只读展示，连接失败以状态码显示。Server 用途描述需待后端 API 提供字段后再接入。
 - “工具”页面通过 GET /api/v1/tools 读取后端注册表，只显示名称、用途、类型、配置状态和审批要求；不返回参数 schema、工具 handler、RAG_USER_ID 或 RAG_KEY。
 - 模型未配置或请求失败时，页面展示后端返回的错误，不在前端模拟模型回复。
 - RAG MCP 工具只向 Agent 暴露 query；本地配置完整 RAG 服务信息后由后端注入凭证并调用服务，未配置时返回“知识库暂未开启”。
 - 前端只访问本地后端；模型密钥、会话正文和记忆文件不进入前端构建变量。
+
+## 长列表与响应式浏览
+
+工具、Skill 和 Trace 页面在当前后端返回的数据范围内进行前端搜索、筛选和每页 12 项分页；工具和 Skill 的长描述最多折叠显示三行，同时提供鼠标提示及可点击的展开按钮，键盘和触屏用户均可查看全文。会话列表固定在侧栏可滚动区域，支持按标题搜索和按今天、昨天、更早分组；每个会话的操作菜单可重命名、置顶或通过现有 API 删除。重命名和置顶偏好保存在浏览器本机存储，不改变后端会话元数据。侧栏滚动条隐藏但保留滚轮、触控和键盘滚动。聊天工作区高度只随视口调整，会话列表和消息各自在固定面板内滚动，不因会话数量增长而撑高页面。当前工作目录与读写状态单独展示。Harness 配置分组使用原生折叠面板，首组默认展开。管理页面共享约 1280px 的最大宽度，并在窄屏下保持单列布局。
 - 后端 CORS 来源通过 HOSTPILOT_WEB_ORIGINS 配置，例如 ["http://localhost:5173"]。
 - 服务端校验 WebSocket Origin；拒绝不在同源或配置列表中的浏览器来源。
 
@@ -100,5 +110,17 @@ frontend/
 - 不提供模型回复的 WebSocket 流式传输。
 - 不新增后端项目进度 API；阶段数据以仓库路线文档为准。
 - 不引入图表、UI 组件、HTTP 客户端或路由依赖。原生 Fetch 和 CSS 足以满足当前页面。
+
+## 当前浏览器 Web 交付状态
+
+Stage E 的本地浏览器管理页面已覆盖项目看板、聊天、模型与 Harness 配置、工具目录、MCP Server 管理、Skill 库、Trace 和 Audit。页面通过本机 FastAPI 提供的 HTTP API 和 WebSocket 工作；阶段内容作为前端版本化数据维护，不另建进度 API。
+
+MCP 连接页通过只读 `GET /api/v1/mcp/connections` 加载连接 ID、transport、生命周期状态、发现工具数和分类错误码；另通过 `/api/v1/mcp/servers` 管理持久化的本地 STDIO 与远程 HTTP Server 配置。配置编辑区默认显示参数表单，可切换到 JSON 导入视图，两个视图不会同时显示。密钥只提交至本地后端并在进程内保存，配置读取仅暴露密钥是否已提供；环境变量配置的 Server 只读展示。连接状态代表最近一次建立连接与工具发现结果，当前没有周期性健康探测。
+
+`GET /api/v1/skills` 聚合用户目录与只读 bundled 目录中的 YAML 和 `SKILL.md` 包，只返回通过校验的 Skill ID、名称、说明、检测格式、当前及可选执行入口、启用状态、来源和无效包数量；不返回文件路径、资源或指令正文。`GET /api/v1/skills/detail?skill_id=...` 按目录 ID 返回通过校验的 YAML manifest、`SKILL.md` 和文本资源，不接受文件系统路径。`POST /api/v1/skills/import` 接收原始 ZIP 请求体，不依赖 multipart；限制压缩文件 4 MiB、解压后文件总量 2 MiB 和最多 100 个文件，校验一个包后才安装。拒绝路径穿越、符号链接、隐藏路径、二进制可执行文件、无效包和重复 Skill；UTF-8 的 `.py`、`.js`、`.sh` 可作为普通文本资源导入，不会在导入或加载时运行。需要执行脚本时，Agent 将源码交给对应的内置沙箱工具；当前工具接收源码字符串，不会把 Skill 目录挂载到脚本进程。`PATCH /api/v1/skills/state` 按 Skill ID 启停用户包；`PATCH /api/v1/skills/execution` 按 Skill ID 持久化兼容的执行入口；`DELETE /api/v1/skills?skill_id=...` 删除用户包。管理操作只修改用户目录内经校验的直接子目录，bundled 包不可编辑。双格式包可选择 YAML、DeepAgents 或 `both`，默认 YAML；`both` 的分类器每次请求只选择一个入口，DeepAgents 输入只包含被选中的 Markdown Skill。执行偏好在 SQLite 持久化，并在运行时锁内即时应用。Harness 配置只管理运行时参数和凭证，不保存 Skill steps 或业务 Prompt。MCP 连接面板显示连接状态及动态发现的工具，不复制 MCP 工具定义。Trace 展示应遵守凭证和敏感参数脱敏要求。
+
+前端形态确认为本地浏览器 Web，不打包为 Electron、Tauri 等桌面壳。Harness 运行参数配置、MCP/Skill 管理、Trace 和 Audit 页面均已交付。Trace 展示请求及 Skill、工具、审批等关联 Span；Audit 支持筛选、分页和 CSV 导出。当前尚未提供记忆编辑页面，也未提供模型回复的 WebSocket 流式传输。
+
+Trace 页面从 `GET /api/v1/observability/traces` 读取最近请求，并从 `GET /api/v1/observability/traces/{trace_id}` 读取事件详情。SQLite 只保存固定白名单属性，最多保留 30 天或 100,000 个事件；日志查询不包含消息正文、工具参数或凭证。
 
 增加流式传输、工具审批或记忆管理时，应先更新需求、后端契约和本架构文档。

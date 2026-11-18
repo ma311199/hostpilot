@@ -20,6 +20,19 @@ class PolicyDecision:
 class PolicyEngine:
     """Check capabilities and trust boundaries before any tool side effect."""
 
+    def __init__(
+        self,
+        *,
+        sandboxed_environments: frozenset[ExecutionEnvironment] = frozenset(),
+        sandboxed_tools: frozenset[str] | None = None,
+    ) -> None:
+        if not sandboxed_environments.issubset(
+            {ExecutionEnvironment.WASM, ExecutionEnvironment.NATIVE_SANDBOX}
+        ):
+            raise ValueError("Only isolated execution environments may be enabled here.")
+        self.sandboxed_environments = sandboxed_environments
+        self.sandboxed_tools = sandboxed_tools
+
     def authorize(
         self,
         descriptor: ToolDescriptor,
@@ -42,12 +55,18 @@ class PolicyEngine:
             and descriptor.execution_env is ExecutionEnvironment.HOST
         ):
             return PolicyDecision(False, "third_party_tool_requires_boundary")
-        if descriptor.execution_env in {
-            ExecutionEnvironment.WASM,
-            ExecutionEnvironment.NATIVE_SANDBOX,
-            ExecutionEnvironment.REMOTE,
-        }:
+        if (
+            descriptor.execution_env
+            in {ExecutionEnvironment.WASM, ExecutionEnvironment.NATIVE_SANDBOX}
+            and descriptor.execution_env not in self.sandboxed_environments
+        ) or descriptor.execution_env is ExecutionEnvironment.REMOTE:
             return PolicyDecision(False, "execution_environment_unavailable")
+        if (
+            descriptor.execution_env is ExecutionEnvironment.NATIVE_SANDBOX
+            and self.sandboxed_tools is not None
+            and descriptor.name not in self.sandboxed_tools
+        ):
+            return PolicyDecision(False, "sandbox_tool_unavailable")
         return PolicyDecision(True, "authorized")
 
 

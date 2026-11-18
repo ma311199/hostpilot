@@ -4,13 +4,28 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 from hostpilot.budget import RequestBudget
+from hostpilot.budget.context import request_budget_scope
 from hostpilot.config import Settings
-from hostpilot.contracts import ContextSnapshot, ConversationMessage, MessageRole, ModelTokenUsage
-from hostpilot.persistence import SQLiteConversationStore
+from hostpilot.contracts import (
+    ContextSnapshot,
+    ConversationMessage,
+    MessageRole,
+    ModelTokenUsage,
+    Route,
+)
+from hostpilot.models.factory import ModelRuntimeRegistry
+from hostpilot.observability import TraceSink
+from hostpilot.orchestration.runtime_plugins import (
+    ChatRuntimePluginContext,
+    ChatRuntimeRegistry,
+)
+from hostpilot.persistence import conversation_thread_config
 from hostpilot.skills import SkillRegistry
+from hostpilot.skills.plan_plugins import PlanComponentRegistry, PlanComponentSelection
 from hostpilot.tools.executor import AsyncConfirmationProvider
 
 if TYPE_CHECKING:
@@ -18,6 +33,7 @@ if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
     from langgraph.graph.state import CompiledStateGraph
 
+    from hostpilot.skills.compensation import CancellationSink, CompensationRegistry
     from hostpilot.skills.deepagents_adapter import DeepAgentsSkillAdapter
 
 
@@ -35,6 +51,9 @@ class AgentResponse:
 
     content: str
     token_usage: ModelTokenUsage | None = None
+    budget_usage_accounted: bool = False
+    route: Route | None = None
+    clarification_prompt: str | None = None
 
 
 class AgentRuntime(Protocol):
@@ -73,7 +92,7 @@ class LangGraphAgentRuntime:
         self,
         graph: CompiledStateGraph[Any, Any, Any, Any],
         *,
-        input_preparer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        input_preparer: Callable[..., dict[str, Any]] | None = None,
         model: Any | None = None,
     ) -> None:
         self.graph = graph
@@ -83,6 +102,10 @@ class LangGraphAgentRuntime:
     async def aclose(self) -> None:
         """Close the model's lazy async HTTP client before its event loop shuts down."""
         root_async_client = getattr(self.model, "root_async_client", None)
+        if root_async_client is None:
+            provider = getattr(self.model, "provider", None)
+            chat_model = getattr(provider, "chat_model", None)
+            root_async_client = getattr(chat_model, "root_async_client", None)
         if root_async_client is not None:
             await root_async_client.close()
 
@@ -90,7 +113,7 @@ class LangGraphAgentRuntime:
         """Read user-visible conversation messages from the current graph checkpoint."""
         config = cast(
             "RunnableConfig",
-            SQLiteConversationStore.thread_config(conversation_id),
+            conversation_thread_config(conversation_id),
         )
         snapshot = await self.graph.aget_state(config)
         raw_messages = snapshot.values.get("messages", ())
@@ -110,6 +133,7 @@ class LangGraphAgentRuntime:
         *,
         budget: RequestBudget | None = None,
         confirmation_provider: AsyncConfirmationProvider | None = None,
+        selected_skill_id: str | None = None,
     ) -> AgentResponse:
         """Run one agent turn; the graph checkpointer commits the resulting state."""
         if context.conversation_id is None:
@@ -118,10 +142,16 @@ class LangGraphAgentRuntime:
 
         agent_input: dict[str, Any] = {"messages": [HumanMessage(content=message)]}
         if self.input_preparer is not None:
-            agent_input = self.input_preparer(agent_input)
+            if selected_skill_id is None:
+                agent_input = self.input_preparer(agent_input)
+            else:
+                agent_input = self.input_preparer(
+                    agent_input,
+                    selected_skill_id=selected_skill_id,
+                )
         config = cast(
             "RunnableConfig",
-            SQLiteConversationStore.thread_config(context.conversation_id),
+            conversation_thread_config(context.conversation_id),
         )
         runtime_context: ContextSnapshot | AgentExecutionContext = context
         if budget is not None:
@@ -130,15 +160,44 @@ class LangGraphAgentRuntime:
                 budget=budget,
                 confirmation_provider=confirmation_provider,
             )
-        result = await self.graph.ainvoke(agent_input, config, context=runtime_context)
+        budget_managed = budget is not None and getattr(
+            self.model, "accounts_request_budget", False
+        )
+        if budget is not None and budget_managed:
+            with request_budget_scope(budget):
+                result = await self.graph.ainvoke(agent_input, config, context=runtime_context)
+        else:
+            result = await self.graph.ainvoke(agent_input, config, context=runtime_context)
         messages = result.get("messages", ())
         usage = _token_usage_after_latest_user(messages)
         for response in reversed(messages):
             if getattr(response, "type", None) == "ai":
                 content = _message_content(response).strip()
                 if content:
-                    return AgentResponse(content=content, token_usage=usage)
+                    return AgentResponse(
+                        content=content,
+                        token_usage=usage,
+                        budget_usage_accounted=budget_managed,
+                    )
         raise RuntimeError("Agent graph completed without an assistant response.")
+
+    async def respond_with_skill(
+        self,
+        message: str,
+        context: ContextSnapshot,
+        *,
+        skill_id: str,
+        budget: RequestBudget | None = None,
+        confirmation_provider: AsyncConfirmationProvider | None = None,
+    ) -> AgentResponse:
+        """Run DeepAgents with exactly one selected Markdown Skill in its input snapshot."""
+        return await self.respond(
+            message,
+            context,
+            budget=budget,
+            confirmation_provider=confirmation_provider,
+            selected_skill_id=skill_id,
+        )
 
     async def record_turn(
         self,
@@ -151,7 +210,7 @@ class LangGraphAgentRuntime:
 
         config = cast(
             "RunnableConfig",
-            SQLiteConversationStore.thread_config(conversation_id),
+            conversation_thread_config(conversation_id),
         )
         await self.graph.aupdate_state(
             config,
@@ -198,35 +257,219 @@ def create_deepagents_runtime(
     return LangGraphAgentRuntime(graph, input_preparer=skills.prepare_input, model=model)
 
 
+def create_default_chat_runtime_registry() -> ChatRuntimeRegistry:
+    """Register the built-in DeepAgents adapter behind the chat runtime contract."""
+    registry = ChatRuntimeRegistry()
+
+    def build_deepagents(context: ChatRuntimePluginContext) -> AgentRuntime:
+        return create_deepagents_runtime(
+            context.model,
+            checkpointer=context.checkpointer,
+            skills=context.skills,
+            tools=context.tools,
+        )
+
+    registry.register("builtin.deepagents", build_deepagents)
+    return registry
+
+
 def create_configured_runtime(
-    settings: Settings, *, checkpointer: Any, tools: Sequence[Any] = ()
-) -> LangGraphAgentRuntime:
-    """Create a DeepAgents runtime for a configured OpenAI-compatible model."""
-    if not settings.model_name or not settings.model_api_key:
-        raise ValueError("Model name and API key must be configured before creating the runtime.")
-
-    try:
-        from langchain_openai import ChatOpenAI
-        from openai import DefaultAsyncHttpx2Client
-    except ImportError as error:
-        raise RuntimeError(
-            "Install the agents dependency group to use the configured model runtime."
-        ) from error
-
+    settings: Settings,
+    *,
+    checkpointer: Any,
+    tools: Sequence[Any] = (),
+    tool_provider: Any | None = None,
+    memory_controller: Any | None = None,
+    compensation_registry: CompensationRegistry | None = None,
+    cancellation_sink: CancellationSink | None = None,
+    skill_execution_modes: Mapping[str, str] | None = None,
+    trace_sink: TraceSink | None = None,
+    plan_component_registry: PlanComponentRegistry | None = None,
+    chat_runtime_registry: ChatRuntimeRegistry | None = None,
+    model_runtime_registry: ModelRuntimeRegistry | None = None,
+) -> AgentRuntime:
+    """Create the configured chat graph plus the Skill selector and execution runtime."""
+    from hostpilot.models.factory import create_model_runtime
+    from hostpilot.orchestration.skill_runtime import SkillRuntimeAgentAdapter
+    from hostpilot.routing.skill_selector import ModelProviderSkillSelector
+    from hostpilot.skills.compensation import CompensationRegistry
     from hostpilot.skills.deepagents_adapter import DeepAgentsSkillAdapter
+    from hostpilot.skills.llm_actions import register_llm_completion_action
+    from hostpilot.skills.mcp_actions import build_mcp_step_actions
+    from hostpilot.skills.model_plan import (
+        LLMSkillAssessor,
+        ModelPlanFallback,
+        build_model_plan_executor,
+    )
+    from hostpilot.skills.model_provider_adapter import ProviderSingleTurnLLM
+    from hostpilot.skills.runtime import (
+        BuiltinExecutorRegistry,
+        SkillRuntime,
+        register_core_builtin_skills,
+    )
+    from hostpilot.skills.yaml_registry import YamlSkillRegistry
+    from hostpilot.tools.facade import ToolFacade
 
-    model = ChatOpenAI(
-        model=settings.model_name,
-        api_key=settings.model_api_key,
-        base_url=settings.model_base_url,
-        http_async_client=DefaultAsyncHttpx2Client(),
+    model_runtime = create_model_runtime(settings, registry=model_runtime_registry)
+    model_provider = model_runtime.provider
+    if tool_provider is not None and not callable(getattr(tool_provider, "descriptors", None)):
+        tool_provider = ToolFacade(tool_provider)
+    compensation_handlers = compensation_registry or CompensationRegistry()
+    additional_roots = (Path(__file__).resolve().parents[1] / "skill_packages",)
+    legacy_registry = SkillRegistry(settings.skills_dir, additional_roots=additional_roots)
+    registered_tool_ids = (
+        tuple(descriptor.name for descriptor in _tool_descriptors(tool_provider))
+        if tool_provider is not None
+        else ()
     )
-    return create_deepagents_runtime(
-        model,
-        checkpointer=checkpointer,
-        skills=DeepAgentsSkillAdapter(SkillRegistry(settings.skills_dir)),
-        tools=tools,
+    yaml_registry_options: dict[str, Any] = {
+        "additional_roots": additional_roots,
+        "registered_tool_ids": registered_tool_ids,
+    }
+    unfiltered_yaml_registry = YamlSkillRegistry(legacy_registry.root, **yaml_registry_options)
+    yaml_by_directory = {
+        package.source_directory.resolve(): package
+        for package in unfiltered_yaml_registry.discover().skills
+    }
+    markdown_by_directory = {
+        package.source_directory.resolve(): package for package in legacy_registry.discover().skills
+    }
+    skill_ids_by_name: dict[str, str] = {}
+    execution_modes: dict[str, str] = {}
+    saved_execution_modes = skill_execution_modes or {}
+    for package in yaml_by_directory.values():
+        markdown_package = markdown_by_directory.get(package.source_directory.resolve())
+        available_modes = (
+            {"yaml", "deepagents", "both"} if markdown_package is not None else {"yaml"}
+        )
+        preferred = saved_execution_modes.get(package.skill_id, "yaml")
+        execution_modes[package.skill_id] = preferred if preferred in available_modes else "yaml"
+    for markdown_package in markdown_by_directory.values():
+        yaml_package = yaml_by_directory.get(markdown_package.source_directory.resolve())
+        skill_id = (
+            yaml_package.skill_id if yaml_package is not None else f"legacy/{markdown_package.name}"
+        )
+        skill_ids_by_name[markdown_package.name] = skill_id
+        if yaml_package is None:
+            execution_modes[skill_id] = "deepagents"
+    deepagents_skills = DeepAgentsSkillAdapter(
+        legacy_registry,
+        execution_modes=execution_modes,
+        skill_ids_by_name=skill_ids_by_name,
     )
+    runtime_registry = chat_runtime_registry or create_default_chat_runtime_registry()
+    chat_runtime = runtime_registry.create(
+        settings.chat_runtime_plugin,
+        ChatRuntimePluginContext(
+            model=model_runtime.agent_chat_model,
+            checkpointer=checkpointer,
+            skills=deepagents_skills,
+            tools=tools,
+        ),
+    )
+    skill_registry = YamlSkillRegistry(
+        legacy_registry.root,
+        **yaml_registry_options,
+        execution_modes=execution_modes,
+    )
+    tool_descriptors = (
+        {descriptor.name: descriptor for descriptor in _tool_descriptors(tool_provider)}
+        if tool_provider is not None
+        else {}
+    )
+    step_actions = build_mcp_step_actions(tool_provider) if tool_provider is not None else None
+    if tool_provider is not None and hasattr(tool_provider, "compensate_existing_file_write"):
+
+        async def compensate_existing_file_write(call: Any) -> None:
+            if call.compensation_handle is None:
+                raise ValueError("Existing-file compensation handle is unavailable.")
+            await tool_provider.compensate_existing_file_write(
+                call.compensation_handle,
+                budget=call.budget,
+                confirmation_provider=call.confirmation_provider,
+            )
+
+        compensation_handlers.register(
+            "write_existing_text_file",
+            compensate_existing_file_write,
+            safe_for_uncertain_effect=True,
+        )
+    if step_actions is None:
+        from hostpilot.skills.runtime import StepActionRegistry
+
+        step_actions = StepActionRegistry()
+    register_llm_completion_action(step_actions, model_provider)
+
+    builtins = BuiltinExecutorRegistry()
+    assessors = LLMSkillAssessor(model_provider)
+    skill_runtime = SkillRuntime(
+        skill_registry,
+        step_actions,
+        builtins,
+        assessors,
+        assessors,
+        compensation_registry=compensation_handlers,
+        cancellation_sink=cancellation_sink,
+    )
+    plan_executor = build_model_plan_executor(
+        model_provider,
+        skills=skill_registry,
+        skill_runtime=skill_runtime,
+        tool_provider=tool_provider,
+        tool_descriptors=tool_descriptors,
+        memory_controller=memory_controller,
+        compensation_registry=compensation_handlers,
+        cancellation_sink=cancellation_sink,
+        trace_sink=trace_sink,
+        component_registry=plan_component_registry,
+        component_selection=PlanComponentSelection(
+            planner=settings.plan_planner_plugin,
+            validator=settings.plan_validator_plugin,
+            task_executor=settings.plan_task_executor_plugin,
+            verifier=settings.plan_verifier_plugin,
+            replanner=settings.plan_replanner_plugin,
+        ),
+        plan_max_tasks=settings.plan_max_tasks,
+        plan_tool_agent_max_turns=settings.plan_tool_agent_max_turns,
+        plan_tool_candidate_limit=settings.plan_tool_candidate_limit,
+    )
+    skill_runtime.plan_fallback = ModelPlanFallback(plan_executor)
+    register_core_builtin_skills(
+        builtins,
+        llm=ProviderSingleTurnLLM(model_provider),
+        plan_executor=plan_executor,
+    )
+    selector = ModelProviderSkillSelector(
+        skill_registry,
+        model_provider,
+        fallback_provider=model_provider,
+        deepagents_registry=legacy_registry,
+        deepagents_skill_ids_by_name=skill_ids_by_name,
+        execution_modes=execution_modes,
+        minimum_business_confidence=settings.routing_minimum_business_confidence,
+        minimum_business_margin=settings.routing_minimum_business_margin,
+        minimum_plan_candidate_confidence=settings.routing_minimum_plan_candidate_confidence,
+        max_plan_candidates=settings.routing_max_plan_candidates,
+        max_business_candidates=settings.routing_max_business_candidates,
+        trace_sink=trace_sink,
+    )
+    return SkillRuntimeAgentAdapter(
+        chat_runtime,
+        skill_runtime,
+        selector,
+        trace_sink=trace_sink,
+    )
+
+
+def _tool_descriptors(provider: Any) -> tuple[Any, ...]:
+    """Read descriptors from the facade, with compatibility for older adapters."""
+    describe = getattr(provider, "descriptors", None)
+    if callable(describe):
+        return tuple(describe())
+    registry = getattr(provider, "registry", None)
+    if registry is None:
+        raise TypeError("Tool provider must expose a descriptor catalog.")
+    return tuple(registry.descriptors())
 
 
 def append_memory_context(base_prompt: str, context: ContextSnapshot) -> str:
@@ -334,4 +577,5 @@ __all__ = [
     "append_memory_context",
     "create_configured_runtime",
     "create_deepagents_runtime",
+    "create_default_chat_runtime_registry",
 ]

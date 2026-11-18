@@ -1,0 +1,152 @@
+dataset_id: contextual-reference-resolution
+version: 4
+description: >-
+  Selector-only cases for contextual reference resolution, including topical distractors,
+  ambiguous topic-matched candidates, generic requests grounded by recent conversation, and
+  near-miss candidates with partial lexical overlap. Adds a follow-up grounded by a prior
+  clarification exchange. No Skill or tool execution is performed.
+cases:
+  - case_id: reference-memory-release-checklist
+    prompt: 请把上线前那段关于回归检查的记录整理成清单。
+    evaluation_context:
+      long_term_memory: |-
+        # Travel preferences
+        出行优先选择火车，并提前确认酒店是否允许延迟入住。
+
+        # Release checklist
+        发布前必须完成回归测试，并确认数据库迁移脚本已通过检查。
+    expected_candidate_id: context-2
+    expected_resolution: matched
+
+  - case_id: reference-memory-database-migration
+    prompt: 把刚才提到的数据升级准备工作列出来。
+    evaluation_context:
+      long_term_memory: |-
+        # On-call handoff
+        值班交接必须记录告警渠道和负责人。
+
+        # Database migration
+        执行数据库迁移之前，先备份当前数据并在预发布环境验证回滚脚本。
+    expected_candidate_id: context-2
+    expected_resolution: matched
+
+  - case_id: reference-memory-unrelated
+    prompt: 把这段内容整理一下。
+    evaluation_context:
+      long_term_memory: |-
+        # Gardening note
+        阳台植物每周浇水两次，春季修剪枯叶。
+    expected_candidate_id: null
+    expected_resolution: clarify
+
+  - case_id: reference-memory-ambiguous
+    prompt: 把刚才提到的方案整理一下。
+    evaluation_context:
+      long_term_memory: |-
+        # Quarterly budget proposal
+        第一份预算方案按季度分配市场活动经费。
+
+        # Annual budget proposal
+        第二份预算方案按年度分配市场活动经费。
+    expected_candidate_id: null
+    expected_resolution: clarify
+
+  - case_id: reference-session-history
+    prompt: 把上面提到的发布检查内容列成清单。
+    evaluation_context:
+      messages:
+        - role: user
+          content: 我们要准备下周发布，先讨论检查项。
+        - role: assistant
+          content: 发布前需要跑冒烟测试，并确认迁移方案和回滚步骤。
+      long_term_memory: |-
+        # Unrelated preference
+        文档示例优先使用中文，并保持标题简短。
+    expected_candidate_id: context-1
+    expected_resolution: matched
+
+  - case_id: reference-memory-synonym-match
+    prompt: 把刚才提到的上线前验证步骤改写成待办项。
+    evaluation_context:
+      long_term_memory: |-
+        # Team meeting location
+        每周例会在周三下午召开，主持人提前发送议程。
+
+        # Quality gate
+        交付前执行完整回归，并由值班人员确认监控和回退方案可用。
+    expected_candidate_id: context-2
+    expected_resolution: matched
+
+  - case_id: reference-topical-unrelated-memory
+    prompt: 把这段关于回归测试的内容整理一下。
+    evaluation_context:
+      long_term_memory: |-
+        # Gardening note
+        阳台植物每周浇水两次，春季修剪枯叶。
+    expected_candidate_id: null
+    expected_resolution: clarify
+
+  - case_id: reference-topical-ambiguous-budget
+    prompt: 把刚才提到的预算方案整理一下。
+    evaluation_context:
+      long_term_memory: |-
+        # Quarterly budget proposal
+        第一份预算方案按季度分配市场活动经费。
+
+        # Annual budget proposal
+        第二份预算方案按年度分配市场活动经费。
+    expected_candidate_id: null
+    expected_resolution: clarify
+
+  - case_id: reference-generic-grounded-in-recent-conversation
+    prompt: 把刚才提到的内容整理成清单。
+    evaluation_context:
+      messages:
+        - role: user
+          content: 我们正在准备下周发布，需要整理上线前验证步骤。
+        - role: assistant
+          content: 发布前需要执行回归测试，核对数据库迁移，并确认回滚方案。
+    expected_candidate_id: context-1
+    expected_resolution: matched
+
+  - case_id: reference-near-miss-version-rollback
+    prompt: 把刚才提到的版本回滚步骤整理成清单。
+    evaluation_context:
+      long_term_memory: |-
+        # Release version review
+        发布前需要核对版本号、提交记录和公告渠道，确保版本说明准确。
+    expected_candidate_id: null
+    expected_resolution: clarify
+
+  - case_id: reference-near-miss-order-refund
+    prompt: 把上面提到的订单退款流程整理一下。
+    evaluation_context:
+      long_term_memory: |-
+        # Order creation
+        创建订单时校验付款状态和收货信息，支付成功后发送确认消息。
+    expected_candidate_id: null
+    expected_resolution: clarify
+
+  - case_id: reference-near-miss-database-rollback
+    prompt: 整理这段数据库迁移回滚验证步骤。
+    evaluation_context:
+      long_term_memory: |-
+        # Database upgrade checks
+        数据库升级后检查索引和查询性能，并清理旧的测试数据。
+    expected_candidate_id: null
+    expected_resolution: clarify
+
+  - case_id: reference-clarification-followup-history
+    prompt: 把刚才那段整理成清单。
+    evaluation_context:
+      messages:
+        - role: user
+          content: 把这段内容整理一下。
+        - role: assistant
+          content: 你指的是哪段内容？请补充主题或材料。
+        - role: user
+          content: 发布前回归测试方案：执行完整回归，修复失败项，确认通过后再发布。
+        - role: assistant
+          content: 收到，我会按这个发布前回归测试方案处理。
+    expected_candidate_id: context-2
+    expected_resolution: matched

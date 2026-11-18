@@ -1,8 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 
+import AuditPanel from './AuditPanel.vue'
 import ChatPanel from './ChatPanel.vue'
+import HarnessSettingsPanel from './HarnessSettingsPanel.vue'
+import McpConnectionsPanel from './McpConnectionsPanel.vue'
 import ModelSettings from './ModelSettings.vue'
+import SkillsPanel from './SkillsPanel.vue'
+import TracesPanel from './TracesPanel.vue'
 import ToolsPanel from './ToolsPanel.vue'
 import { createPingMessage, getStatusSocketUrl, parseStatusMessage } from './api/statusSocket'
 import { latestQualityCheck, projectPhases } from './data/roadmap'
@@ -10,8 +15,9 @@ import { latestQualityCheck, projectPhases } from './data/roadmap'
 type ConnectionState = 'connecting' | 'online' | 'offline'
 
 const connectionState = ref<ConnectionState>('connecting')
-const activeView = ref<'dashboard' | 'chat' | 'tools'>('dashboard')
+const activeView = ref<'dashboard' | 'chat' | 'tools' | 'connections' | 'skills' | 'traces' | 'audit' | 'configuration'>('dashboard')
 const showModelSettings = ref(false)
+const mobileNavOpen = ref(false)
 const lastSeen = ref<Date | null>(null)
 const activePhase = computed(() => projectPhases.find((phase) => phase.status === 'active'))
 const completedPhases = computed(
@@ -25,6 +31,12 @@ let reconnectAttempt = 0
 let pingSequence = 0
 let lastResponseAt = 0
 let disposed = false
+
+function selectView(view: typeof activeView.value): void {
+  activeView.value = view
+  mobileNavOpen.value = false
+  void nextTick(() => document.getElementById('top')?.focus())
+}
 
 function connect(): void {
   if (disposed) return
@@ -121,6 +133,10 @@ onUnmounted(() => {
   <div class="app-shell">
     <header class="topbar">
       <a
+        class="skip-link"
+        href="#top"
+      >跳到主内容</a>
+      <a
         class="brand"
         href="#top"
         aria-label="HostPilot 首页"
@@ -129,35 +145,91 @@ onUnmounted(() => {
         <span>hostpilot<span class="brand-period">.</span></span>
       </a>
       <nav
+        id="primary-navigation"
         class="topnav"
         aria-label="主导航"
+        :data-open="mobileNavOpen"
+        @keydown.esc="mobileNavOpen = false"
       >
         <button
           :class="{ 'nav-active': activeView === 'dashboard' }"
+          :aria-current="activeView === 'dashboard' ? 'page' : undefined"
           type="button"
-          @click="activeView = 'dashboard'"
+          @click="selectView('dashboard')"
         >
           项目路线
         </button>
         <button
           :class="{ 'nav-active': activeView === 'chat' }"
+          :aria-current="activeView === 'chat' ? 'page' : undefined"
           type="button"
-          @click="activeView = 'chat'"
+          @click="selectView('chat')"
         >
           聊天
         </button>
         <button
           :class="{ 'nav-active': activeView === 'tools' }"
+          :aria-current="activeView === 'tools' ? 'page' : undefined"
           type="button"
-          @click="activeView = 'tools'"
+          @click="selectView('tools')"
         >
           工具
+        </button>
+        <button
+          :class="{ 'nav-active': activeView === 'connections' }"
+          :aria-current="activeView === 'connections' ? 'page' : undefined"
+          type="button"
+          @click="selectView('connections')"
+        >
+          MCP 连接
+        </button>
+        <button
+          :class="{ 'nav-active': activeView === 'skills' }"
+          :aria-current="activeView === 'skills' ? 'page' : undefined"
+          type="button"
+          @click="selectView('skills')"
+        >
+          Skill 库
+        </button>
+        <button
+          :class="{ 'nav-active': activeView === 'traces' }"
+          :aria-current="activeView === 'traces' ? 'page' : undefined"
+          type="button"
+          @click="selectView('traces')"
+        >
+          Trace
+        </button>
+        <button
+          :class="{ 'nav-active': activeView === 'audit' }"
+          :aria-current="activeView === 'audit' ? 'page' : undefined"
+          type="button"
+          @click="selectView('audit')"
+        >
+          Audit
+        </button>
+        <button
+          :class="{ 'nav-active': activeView === 'configuration' }"
+          :aria-current="activeView === 'configuration' ? 'page' : undefined"
+          type="button"
+          @click="selectView('configuration')"
+        >
+          Harness 配置
         </button>
         <a
           v-if="activeView === 'dashboard'"
           href="#next"
         >下一步</a>
       </nav>
+      <button
+        class="mobile-nav-toggle"
+        type="button"
+        :aria-expanded="mobileNavOpen"
+        aria-controls="primary-navigation"
+        :aria-label="mobileNavOpen ? '收起主导航' : '展开主导航'"
+        @click="mobileNavOpen = !mobileNavOpen"
+      >
+        <span aria-hidden="true">{{ mobileNavOpen ? '×' : '☰' }}</span>
+      </button>
       <div
         class="connection-pill"
         :class="'connection-' + connectionState"
@@ -178,9 +250,17 @@ onUnmounted(() => {
       </button>
     </header>
 
-    <main id="top">
+    <main
+      id="top"
+      tabindex="-1"
+    >
       <ChatPanel v-if="activeView === 'chat'" />
       <ToolsPanel v-else-if="activeView === 'tools'" />
+      <McpConnectionsPanel v-else-if="activeView === 'connections'" />
+      <SkillsPanel v-else-if="activeView === 'skills'" />
+      <TracesPanel v-else-if="activeView === 'traces'" />
+      <AuditPanel v-else-if="activeView === 'audit'" />
+      <HarnessSettingsPanel v-else-if="activeView === 'configuration'" />
       <template v-else>
         <section class="hero">
           <div class="hero-copy">
@@ -189,7 +269,7 @@ onUnmounted(() => {
             </div>
             <h1>HostPilot<br><span>开发进度</span></h1>
             <p class="hero-description">
-              一个面向本地个人使用、可治理且可观测的 Agent 后端。查看当前交付、阶段边界与接下来要完成的工作。
+              一个面向本地浏览器 Web、Skill 驱动、可治理且可观测的 Agent Harness。查看当前交付、迁移阶段与接下来要完成的工作。
             </p>
             <a
               class="hero-link"
@@ -335,8 +415,8 @@ onUnmounted(() => {
             <article class="next-card">
               <span class="next-index">01</span>
               <div>
-                <h3>完善路由决策</h3>
-                <p>让 Router 能按意图选择 direct、clarify 和受治理的工具调用路径。</p>
+                <h3>验证本地 ChromaDB 索引</h3>
+                <p>安装 agents 依赖后，验收 Skill 向量的增量更新、删除和重启恢复。</p>
               </div>
               <span
                 class="next-arrow"
@@ -346,8 +426,8 @@ onUnmounted(() => {
             <article class="next-card">
               <span class="next-index">02</span>
               <div>
-                <h3>打通顶层工具路由</h3>
-                <p>让 ChatService 支持 Router 选出的 tool_call 决策，并保留现有策略治理。</p>
+                <h3>评测业务 Skill 路由质量</h3>
+                <p>使用独立远端小模型和脱敏样例检查召回率、置信度与 0.85/0.30 Gate。</p>
               </div>
               <span
                 class="next-arrow"
@@ -357,8 +437,8 @@ onUnmounted(() => {
             <article class="next-card">
               <span class="next-index">03</span>
               <div>
-                <h3>启用知识库检索</h3>
-                <p>确认外部服务契约后配置 RAG_KEY，并恢复 EvidenceSet 校验。</p>
+                <h3>验收 Linux STDIO 沙箱进程池</h3>
+                <p>按工具能力隔离 Server，验证并行分流、取消清理和故障恢复。</p>
               </div>
               <span
                 class="next-arrow"

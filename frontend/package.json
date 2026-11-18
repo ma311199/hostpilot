@@ -12,6 +12,8 @@
     "build": "pnpm typecheck && vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc -b --pretty false",
+    "test:e2e": "playwright test",
+    "test:e2e:approval": "playwright test --config playwright.approval.config.ts",
     "test": "vitest run",
     "lint": "eslint ."
   },
@@ -20,6 +22,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.65.0",
     "@types/node": "^24.19.2",
     "@vitejs/plugin-vue": "^6.0.10",
     "@vue/test-utils": "^2.5.1",

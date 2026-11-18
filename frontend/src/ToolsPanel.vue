@@ -1,19 +1,57 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 
 import { getToolCatalog, type ToolCatalog } from './api/tools'
+import PaginationControls from './PaginationControls.vue'
 
 const catalog = ref<ToolCatalog | null>(null)
 const loading = ref(false)
 const errorMessage = ref('')
+const query = ref('')
+const selectedType = ref('all')
+const selectedState = ref('all')
+const page = ref(1)
+const expandedDescriptions = ref<Set<string>>(new Set())
+const pageSize = 12
 const toolTypeLabels: Record<string, string> = {
   retrieval: '知识检索',
   action: '本地操作',
   code: '代码执行',
 }
+const transportLabels: Record<string, string> = {
+  in_process: '内置',
+  stdio: 'STDIO MCP',
+  streamable_http: 'Streamable HTTP MCP',
+}
+const trustLabels: Record<string, string> = {
+  host: 'HostPilot 内置',
+  third_party: '第三方',
+  untrusted: '不可信代码',
+}
 const runtimeLabel = computed(() =>
   catalog.value?.runtime_configured ? '模型运行时已就绪' : '请先配置模型运行时',
 )
+const visibleTools = computed(() => (catalog.value?.tools || []).filter((tool) => {
+  const search = query.value.trim().toLocaleLowerCase()
+  const matchesSearch = !search || `${tool.name} ${tool.description}`.toLocaleLowerCase().includes(search)
+  const matchesType = selectedType.value === 'all' || tool.tool_type === selectedType.value
+  const state = availabilityLabel(tool.configured)
+  const matchesState = selectedState.value === 'all'
+    || (selectedState.value === 'ready' && state === '可调用')
+    || (selectedState.value === 'waiting' && state !== '可调用')
+  return matchesSearch && matchesType && matchesState
+}))
+const pageCount = computed(() => Math.max(1, Math.ceil(visibleTools.value.length / pageSize)))
+const pagedTools = computed(() => visibleTools.value.slice((page.value - 1) * pageSize, page.value * pageSize))
+watch([query, selectedType, selectedState], () => { page.value = 1 })
+watch(pageCount, (count) => { if (page.value > count) page.value = count })
+
+function toggleDescription(name: string): void {
+  const expanded = new Set(expandedDescriptions.value)
+  if (expanded.has(name)) expanded.delete(name)
+  else expanded.add(name)
+  expandedDescriptions.value = expanded
+}
 
 async function refresh(): Promise<void> {
   loading.value = true
@@ -71,17 +109,30 @@ onMounted(() => void refresh())
       {{ errorMessage }}
     </p>
     <div
+      v-if="catalog?.tools.length"
+      class="tools-browse-controls"
+    >
+      <label>搜索工具<input
+        v-model="query"
+        type="search"
+        placeholder="名称或描述"
+      ></label>
+      <label>分类<select v-model="selectedType"><option value="all">全部分类</option><option value="retrieval">知识检索</option><option value="action">本地操作</option><option value="code">代码执行</option></select></label>
+      <label>状态<select v-model="selectedState"><option value="all">全部状态</option><option value="ready">可调用</option><option value="waiting">等待配置</option></select></label>
+      <span class="tools-result-count">{{ visibleTools.length }} 项工具</span>
+    </div>
+    <div
       v-if="loading && !catalog"
       class="tools-empty"
     >
       正在读取工具目录…
     </div>
     <div
-      v-else-if="catalog?.tools.length"
+      v-else-if="catalog?.tools.length && pagedTools.length"
       class="tools-grid"
     >
       <article
-        v-for="tool in catalog.tools"
+        v-for="tool in pagedTools"
         :key="tool.name"
         class="tool-card"
       >
@@ -99,9 +150,42 @@ onMounted(() => void refresh())
           </span>
         </div>
         <h2>{{ tool.name }}</h2>
-        <p class="tool-description">
+        <p
+          :class="['tool-description', { 'tool-description-expanded': expandedDescriptions.has(tool.name) }]"
+          :title="tool.description"
+        >
           {{ tool.description }}
         </p>
+        <button
+          v-if="tool.description.length > 140"
+          class="tool-description-toggle"
+          type="button"
+          :aria-expanded="expandedDescriptions.has(tool.name)"
+          @click="toggleDescription(tool.name)"
+        >
+          {{ expandedDescriptions.has(tool.name) ? '收起描述' : '展开完整描述' }}
+        </button>
+        <dl class="tool-permission-details">
+          <div>
+            <dt>能力范围</dt>
+            <dd>{{ tool.access_summary }}</dd>
+          </div>
+          <div>
+            <dt>运行位置</dt>
+            <dd>{{ tool.execution_location }}</dd>
+          </div>
+          <div>
+            <dt>来源与信任</dt>
+            <dd>
+              {{ transportLabels[tool.transport] || tool.transport }} ·
+              {{ trustLabels[tool.trust_level] || tool.trust_level }}
+            </dd>
+          </div>
+          <div>
+            <dt>沙箱</dt>
+            <dd>{{ tool.sandbox_status }}</dd>
+          </div>
+        </dl>
         <div class="tool-card-footer">
           <span
             v-if="tool.confirmation_required"
@@ -122,7 +206,18 @@ onMounted(() => void refresh())
       </article>
     </div>
     <div
-      v-else-if="catalog && !errorMessage"
+      v-if="catalog?.tools.length && !pagedTools.length"
+      class="tools-empty"
+    >
+      没有符合条件的工具。
+    </div>
+    <PaginationControls
+      v-model:page="page"
+      :page-size="pageSize"
+      :total="visibleTools.length"
+    />
+    <div
+      v-if="catalog && !catalog.tools.length && !errorMessage"
       class="tools-empty"
     >
       当前没有注册的工具。
@@ -135,7 +230,7 @@ onMounted(() => void refresh())
 
 <style scoped>
 .tools-page {
-  width: min(100% - 40px, 1080px);
+  width: min(100% - 40px, 1280px);
   margin: 0 auto;
   padding: clamp(34px, 6vw, 70px) 0 64px;
   color: #263b30;
@@ -229,6 +324,33 @@ onMounted(() => void refresh())
   gap: 10px;
 }
 
+.tool-permission-details {
+  display: grid;
+  gap: 10px;
+  margin: 17px 0;
+}
+
+.tool-permission-details > div {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.tool-permission-details dt {
+  color: #52665a;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.tool-permission-details dd {
+  margin: 0;
+  color: #718076;
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
 .tool-type-label,
 .tool-availability,
 .tool-confirmation-tag,
@@ -308,10 +430,27 @@ onMounted(() => void refresh())
   font-size: 13px;
 }
 
+.tools-browse-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+  margin: 18px 0;
+}
+
+.tools-browse-controls label { display: grid; gap: 5px; color: #52665a; font-size: 12px; }
+.tools-browse-controls input, .tools-browse-controls select { min-width: 160px; min-height: 42px; padding: 0 10px; border: 1px solid #dce4dc; border-radius: 8px; background: white; }
+.tools-result-count { padding: 0 0 12px; color: #718076; font-size: 12px; }
+.tool-description { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow-wrap: anywhere; }
+.tool-description-expanded { display: block; overflow: visible; }
+.tool-description-toggle { min-height: 44px; padding: 0 8px; border: 0; background: transparent; color: #37664a; cursor: pointer; }
+
 @media (max-width: 560px) {
   .tools-page-header {
     align-items: flex-start;
     flex-direction: column;
   }
+  .tools-browse-controls { align-items: stretch; }
+  .tools-browse-controls label, .tools-browse-controls input, .tools-browse-controls select { width: 100%; }
 }
 </style>

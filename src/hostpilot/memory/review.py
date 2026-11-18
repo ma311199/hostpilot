@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 
-from hostpilot.contracts import MemoryScope, MemoryWriteProposal
+from hostpilot.contracts import MemoryImportanceTier, MemoryScope, MemoryWriteProposal
 from hostpilot.memory import MemoryWriteDenied, MemoryWriteService
+from hostpilot.memory.scoring import assess_memory_content
 from hostpilot.observability import AuditEvent, AuditOutcome, AuditSink
 
 
@@ -31,7 +32,7 @@ class MemoryProposalReview:
         self._lock = asyncio.Lock()
 
     async def submit(self, proposal: MemoryWriteProposal) -> MemoryWriteProposal:
-        """Validate and enqueue a proposal without changing the Markdown files."""
+        """Score a proposal, discard low-value content, and queue the rest."""
         encoded_size = len(proposal.content.encode("utf-8"))
         if encoded_size > self.writer.memory.max_file_bytes:
             raise MemoryWriteDenied("Memory proposal exceeds the configured file size limit.")
@@ -43,23 +44,44 @@ class MemoryProposalReview:
             ):
                 raise MemoryWriteDenied("Session summary proposal targets an unknown conversation.")
 
+        assessment = assess_memory_content(proposal.content)
+        scored_proposal = proposal.model_copy(
+            update={
+                "importance_score": assessment.score,
+                "importance_tier": assessment.tier,
+                "importance_reasons": assessment.reason_codes,
+                "summary_content": assessment.summary,
+                "discarded": assessment.tier is MemoryImportanceTier.LOW,
+            }
+        )
+        if scored_proposal.discarded:
+            self._record(
+                "memory.proposal.discarded",
+                AuditOutcome.CANCELLED,
+                proposal.proposal_id,
+                reason_code="low_importance",
+            )
+            return scored_proposal
+
         async with self._lock:
-            if proposal.proposal_id in self._proposals:
+            if scored_proposal.proposal_id in self._proposals:
                 raise DuplicatePendingProposal("Proposal ID is already pending.")
-            target = _target_key(proposal)
+            target = _target_key(scored_proposal)
             if any(_target_key(item) == target for item in self._proposals.values()):
                 raise DuplicatePendingProposal(
                     "A proposal for this memory target is already pending."
                 )
-            self._proposals[proposal.proposal_id] = proposal
+            self._proposals[scored_proposal.proposal_id] = scored_proposal
             try:
                 self._record(
-                    "memory.proposal.submitted", AuditOutcome.ALLOWED, proposal.proposal_id
+                    "memory.proposal.submitted",
+                    AuditOutcome.ALLOWED,
+                    scored_proposal.proposal_id,
                 )
             except Exception:
-                del self._proposals[proposal.proposal_id]
+                del self._proposals[scored_proposal.proposal_id]
                 raise
-        return proposal
+        return scored_proposal
 
     async def list_pending(self) -> tuple[MemoryWriteProposal, ...]:
         """Return pending proposals in submission order."""

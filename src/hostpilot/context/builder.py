@@ -5,12 +5,24 @@ from __future__ import annotations
 from typing import Protocol
 from uuid import uuid4
 
-from hostpilot.contracts import ContextSnapshot, ConversationMessage
-from hostpilot.persistence import MarkdownMemoryStore, SQLiteConversationStore
+from hostpilot.contracts import ContextSnapshot, ConversationMessage, MemoryScope
+from hostpilot.memory import MemoryChunk
+from hostpilot.persistence import ConversationStore
 
 
 class ConversationStateReader(Protocol):
     async def read_messages(self, conversation_id: str) -> tuple[ConversationMessage, ...]: ...
+
+
+class MemoryRecallProvider(Protocol):
+    async def recall(
+        self,
+        *,
+        conversation_id: str,
+        query: str,
+        max_chars: int | None = None,
+        request_id: str | None = None,
+    ) -> tuple[MemoryChunk, ...]: ...
 
 
 class ConversationNotFoundError(KeyError):
@@ -22,8 +34,8 @@ class ContextBuilder:
 
     def __init__(
         self,
-        conversations: SQLiteConversationStore,
-        memory: MarkdownMemoryStore,
+        conversations: ConversationStore,
+        memory: MemoryRecallProvider,
         runtime: ConversationStateReader,
         *,
         max_messages: int = 40,
@@ -39,21 +51,28 @@ class ContextBuilder:
         self.max_messages = max_messages
         self.max_memory_chars = max_memory_chars
 
-    async def build(self, conversation_id: str) -> ContextSnapshot:
+    async def build(self, conversation_id: str, *, query: str | None = None) -> ContextSnapshot:
         """Validate the session, then load bounded history and scoped Markdown memory."""
         conversation = await self.conversations.get(conversation_id)
         if conversation is None:
             raise ConversationNotFoundError(conversation_id)
 
+        request_id = str(uuid4())
         messages = await self.runtime.read_messages(conversation.conversation_id)
-        session_summary = self.memory.read_session_summary(conversation.conversation_id)
-        long_term_memory = self.memory.read_long_term_memory()
+        chunks = await self.memory.recall(
+            conversation_id=conversation.conversation_id,
+            query=query or (messages[-1].content if messages else "conversation context"),
+            max_chars=self.max_memory_chars,
+            request_id=request_id,
+        )
+        session_summary = _join_memory_chunks(chunks, MemoryScope.SESSION_SUMMARY)
+        long_term_memory = _join_memory_chunks(chunks, MemoryScope.LONG_TERM)
         session_summary, long_term_memory = self._bound_memory(
             session_summary,
             long_term_memory,
         )
         return ContextSnapshot(
-            request_id=str(uuid4()),
+            request_id=request_id,
             conversation_id=conversation.conversation_id,
             messages=messages[-self.max_messages :],
             session_summary=session_summary,
@@ -85,4 +104,9 @@ def _truncate(content: str | None, max_chars: int) -> str | None:
     return content[: max_chars - len(marker)] + marker
 
 
-__all__ = ["ContextBuilder", "ConversationNotFoundError"]
+def _join_memory_chunks(chunks: tuple[MemoryChunk, ...], scope: MemoryScope) -> str | None:
+    selected = [chunk.content for chunk in chunks if chunk.scope is scope and chunk.content.strip()]
+    return "\n\n".join(selected) if selected else None
+
+
+__all__ = ["ContextBuilder", "ConversationNotFoundError", "MemoryRecallProvider"]

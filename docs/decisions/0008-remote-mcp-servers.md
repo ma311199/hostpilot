@@ -1,8 +1,10 @@
 # ADR-0008：远程 MCP Server 与 Streamable HTTP
 
-- 状态：已采纳
+- 状态：已采纳；传输范围由 [ADR-0016](0016-local-stdio-mcp-servers.md) 扩展
 - 日期：2026-11-01
-- 关联：[架构设计](../architecture.md)、[需求基线](../requirements.md)、[ADR-0007](0007-in-process-fastmcp-tools.md)
+- 关联：[新架构文档](../新架构文档.md)、[需求基线](../requirements.md)、[ADR-0007](0007-in-process-fastmcp-tools.md)
+
+> 2026-11-02 确认：保留多个独立远程 Server、每 Server 一个 Streamable HTTP Client，以及 `{server_name}_{tool_name}` 的重名区分；不采用 `team::{tool_name}` 命名空间或必须单一团队网关的假设。连接管理 UI 仍是后续目标。
 
 ## 背景
 
@@ -23,7 +25,7 @@ HostPilot 需要接入由独立服务部署的 MCP 工具，同时继续通过�
 
 ## 影响
 
-- 远程 Server 必须实现 MCP Streamable HTTP；普通 REST 服务不能直接使用该传输。
+- 本 ADR 的远程 Server 使用 MCP Streamable HTTP；本地 STDIO Server 按 ADR-0016 管理。普通 REST 服务不能直接使用 MCP 传输。
 - 凭证只从后端环境配置读取并保存在 SecretStr 中，不进入 Agent 工具 schema 或工具目录响应。
 - 首版通过环境 JSON 配置，不提供前端增删或连接状态管理；配置变更需重启 HostPilot。
 - 远程工具默认逐次审批，降低未知 Server 工具副作用风险，但会增加交互步骤。

@@ -1,15 +1,112 @@
 """SQLite conversation metadata, graph checkpoints, and Markdown memories."""
 
-from hostpilot.persistence.checkpointer import open_sqlite_checkpointer
+from hostpilot.persistence.audits import SQLiteAuditStore
+from hostpilot.persistence.cancellations import CancellationAuditEntry, SQLiteCancellationStore
+from hostpilot.persistence.checkpointer import (
+    conversation_thread_config,
+    open_sqlite_checkpointer,
+)
 from hostpilot.persistence.conversations import (
     ConversationNotFoundError,
     SQLiteConversationStore,
 )
+from hostpilot.persistence.harness_configuration import (
+    HarnessRuntimeConfiguration,
+    SQLiteHarnessConfigurationStore,
+)
 from hostpilot.persistence.markdown_memory import MarkdownMemoryStore
+from hostpilot.persistence.mcp_configuration import (
+    MCPServerConfiguration,
+    SQLiteMCPConfigurationStore,
+)
+from hostpilot.persistence.model_configuration import (
+    ModelConfiguration,
+    SQLiteModelConfigurationStore,
+)
+from hostpilot.persistence.ports import (
+    AuditStore,
+    AuditStoreFactory,
+    CancellationStore,
+    CancellationStoreFactory,
+    CheckpointerFactory,
+    ConversationCheckpointer,
+    ConversationStore,
+    ConversationStoreFactory,
+    HarnessConfigurationStore,
+    HarnessConfigurationStoreFactory,
+    MCPConfigurationStore,
+    MCPConfigurationStoreFactory,
+    MemoryStore,
+    MemoryStoreFactory,
+    ModelConfigurationStore,
+    ModelConfigurationStoreFactory,
+    RoutingModelConfigurationStore,
+    RoutingModelConfigurationStoreFactory,
+    SkillExecutionStore,
+    SkillExecutionStoreFactory,
+    TraceStore,
+    TraceStoreFactory,
+    WorkspaceConfigurationStore,
+    WorkspaceConfigurationStoreFactory,
+)
+from hostpilot.persistence.routing_model_configuration import (
+    RoutingModelConfiguration,
+    SQLiteRoutingModelConfigurationStore,
+)
+from hostpilot.persistence.skill_execution import (
+    SkillExecutionMode,
+    SkillExecutionPreference,
+    SQLiteSkillExecutionStore,
+)
+from hostpilot.persistence.traces import SQLiteTraceStore, StoredTraceEvent, TraceSummary
+from hostpilot.persistence.workspace_configuration import SQLiteWorkspaceConfigurationStore
 
 __all__ = [
     "ConversationNotFoundError",
+    "AuditStore",
+    "AuditStoreFactory",
+    "CancellationStore",
+    "CancellationStoreFactory",
+    "CheckpointerFactory",
+    "ConversationCheckpointer",
+    "ConversationStore",
+    "ConversationStoreFactory",
+    "HarnessConfigurationStore",
+    "HarnessConfigurationStoreFactory",
+    "MCPConfigurationStore",
+    "MCPConfigurationStoreFactory",
+    "MemoryStore",
+    "MemoryStoreFactory",
+    "ModelConfigurationStore",
+    "ModelConfigurationStoreFactory",
+    "RoutingModelConfigurationStore",
+    "RoutingModelConfigurationStoreFactory",
+    "SkillExecutionStore",
+    "SkillExecutionStoreFactory",
+    "TraceStore",
+    "TraceStoreFactory",
+    "WorkspaceConfigurationStore",
+    "WorkspaceConfigurationStoreFactory",
+    "CancellationAuditEntry",
+    "SQLiteAuditStore",
+    "SQLiteCancellationStore",
     "MarkdownMemoryStore",
+    "HarnessRuntimeConfiguration",
+    "SQLiteHarnessConfigurationStore",
     "SQLiteConversationStore",
+    "SQLiteModelConfigurationStore",
+    "SQLiteRoutingModelConfigurationStore",
+    "SQLiteTraceStore",
+    "SQLiteSkillExecutionStore",
+    "SkillExecutionMode",
+    "SkillExecutionPreference",
+    "StoredTraceEvent",
+    "TraceSummary",
+    "ModelConfiguration",
+    "RoutingModelConfiguration",
+    "MCPServerConfiguration",
+    "SQLiteMCPConfigurationStore",
+    "SQLiteWorkspaceConfigurationStore",
     "open_sqlite_checkpointer",
+    "conversation_thread_config",
 ]

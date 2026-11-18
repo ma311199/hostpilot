@@ -1,8 +1,10 @@
 # ADR-0007：进程内 FastMCP 内置工具
 
-- 状态：已采纳
+- 状态：已采纳（内置 MCP 连接方式仍有效；外部 MCP Transport 范围由 ADR-0016 扩展）
 - 日期：2026-11-01
-- 关联：[架构设计](../architecture.md)、[依赖管理](../dependency-management.md)
+- 关联：[新架构文档](../新架构文档.md)、[依赖管理](../dependency-management.md)
+
+> 2026-11-02 确认：内置 MCP Server/Client 继续在 HostPilot 进程内连接。此前“不采用本地 stdio 子进程”的范围限制已由 [ADR-0016](0016-local-stdio-mcp-servers.md) 更新；外部 Server 现在支持 STDIO 与 Streamable HTTP。
 
 ## 背景
 
@@ -23,10 +25,11 @@ HostPilot 需要向 Agent 提供本地文件操作和知识检索等工具，并
 ## 影响
 
 - FastMCP Client 与内置 Server 共享 HostPilot 的进程生命周期和故障域；HostPilot 关闭时，本地 MCP 会话也会关闭。
-- 当前集成覆盖进程内内存传输；独立 MCP 子进程、stdio 和远程 MCP 连接行为尚未由此实现或验证。
+- 内置工具沿用进程内连接；外部 MCP Server 可使用 ADR-0016 定义的 STDIO 子进程，或 ADR-0008 定义的独立 Streamable HTTP Client。
+- 真实远程网络、TLS 和服务端认证仍需使用实际端点做联调。
 - RAG HTTP 调用具有独立服务的网络故障和超时边界，应由其客户端配置与错误处理负责。
-- 这是简化当前本地工具宿主的架构选择，不应在缺少基准数据时描述为已经验证的性能优化。
+- 本地 MCP 连接不提供操作系统级沙箱隔离；工具权限仍由 HostPilot 策略与工具实现约束。
 
 ## 复核条件
 
-当需要让工具独立部署、跨进程隔离、被多个客户端共享，或要接入第三方 MCP Server 时，重新评估 stdio 或远程 MCP 传输，并补充相应生命周期、安全边界和集成验证。
+当内置工具需要独立部署、跨进程隔离或被多个客户端共享时，再评估额外的进程/沙箱边界。

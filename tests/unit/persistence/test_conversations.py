@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from hostpilot.contracts import SandboxMode
 from hostpilot.persistence import ConversationNotFoundError, SQLiteConversationStore
 
 
@@ -27,6 +28,16 @@ def test_conversation_index_persists_and_isolates_thread_ids(tmp_path: Path) -> 
             "configurable": {"thread_id": first.conversation_id}
         }
         assert first.conversation_id != second.conversation_id
+        assert first.sandbox_mode is SandboxMode.READ_ONLY
+        upgraded = await reopened_store.upgrade_sandbox_mode(
+            first.conversation_id, SandboxMode.WORKSPACE_WRITE
+        )
+        assert upgraded.sandbox_mode is SandboxMode.WORKSPACE_WRITE
+        assert (
+            await SQLiteConversationStore(database_path).get(first.conversation_id)
+        ).sandbox_mode is SandboxMode.WORKSPACE_WRITE
+        with pytest.raises(ValueError, match="only be upgraded"):
+            await reopened_store.upgrade_sandbox_mode(first.conversation_id, SandboxMode.READ_ONLY)
         await reopened_store.touch(first.conversation_id, title="Research notes")
         assert (await reopened_store.get(first.conversation_id)).title == "Research notes"
 
@@ -51,11 +62,42 @@ def test_conversation_store_rejects_invalid_ids_and_reports_missing_records(
 def test_conversation_store_rejects_newer_schema(tmp_path: Path) -> None:
     database_path = tmp_path / "hostpilot.sqlite3"
     with sqlite3.connect(database_path) as connection:
-        connection.execute("PRAGMA user_version = 2")
+        connection.execute("PRAGMA user_version = 3")
 
     async def scenario() -> None:
         store = SQLiteConversationStore(database_path)
         with pytest.raises(RuntimeError, match="newer than this app"):
             await store.initialize()
+
+    asyncio.run(scenario())
+
+
+def test_conversation_store_migrates_existing_rows_to_read_only(tmp_path: Path) -> None:
+    database_path = tmp_path / "hostpilot.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """CREATE TABLE conversations (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            "INSERT INTO conversations VALUES (?, ?, ?, ?)",
+            (
+                "72de5425-9a94-4a18-a012-52fe98e7ed7d",
+                "Existing",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        connection.execute("PRAGMA user_version = 1")
+
+    async def scenario() -> None:
+        store = SQLiteConversationStore(database_path)
+        existing = await store.get("72de5425-9a94-4a18-a012-52fe98e7ed7d")
+        assert existing is not None
+        assert existing.sandbox_mode is SandboxMode.READ_ONLY
 
     asyncio.run(scenario())

@@ -3,7 +3,10 @@ export interface ConversationSummary {
   title: string
   created_at: string
   updated_at: string
+  sandbox_mode: SandboxMode
 }
+
+export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 
 export interface ConversationMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
@@ -19,7 +22,7 @@ export interface ChatResponse {
   conversation_id: string
   request_id: string
   assistant_message: string
-  route: 'direct' | 'clarify' | 'tool_call' | 'plan_execute'
+  route: 'direct' | 'clarify' | 'tool_call' | 'plan_execute' | 'skill_execute'
   clarification_prompt: string | null
   token_usage: { input_tokens: number; output_tokens: number; total_tokens: number } | null
 }
@@ -66,6 +69,22 @@ export function createConversation(title?: string): Promise<ConversationSummary>
     method: 'POST',
     body: JSON.stringify(title ? { title } : {}),
   })
+}
+
+export function deleteConversation(conversationId: string): Promise<void> {
+  return request<void>(`/conversations/${encodeURIComponent(conversationId)}`, {
+    method: 'DELETE',
+  })
+}
+
+export function upgradeConversationSandbox(
+  conversationId: string,
+  targetMode: SandboxMode,
+): Promise<ConversationSummary> {
+  return request<ConversationSummary>(
+    `/conversations/${encodeURIComponent(conversationId)}/sandbox/upgrade`,
+    { method: 'POST', body: JSON.stringify({ target_mode: targetMode }) },
+  )
 }
 
 export async function getConversationMessages(

@@ -3,7 +3,7 @@
 - 验证日期：2026-11-01
 - 变更范围：`HOSTPILOT_MCP_SERVERS` 配置、Streamable HTTP Client、工具发现与命名、ToolExecutor 审批治理
 - 关联决策：[ADR-0008：远程 MCP Server 与 Streamable HTTP](../decisions/0008-remote-mcp-servers.md)
-- 关联架构：[HostPilot 架构设计](../architecture.md)
+- 关联架构：[HostPilot 当前架构](../新架构文档.md)
 
 ## 验证内容
 
