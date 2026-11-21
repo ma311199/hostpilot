@@ -6,7 +6,7 @@ from hostpilot.observability import TraceEvent
 from hostpilot.orchestration.chat import ChatService
 from hostpilot.orchestration.skill_runtime import SkillSelection
 from hostpilot.routing import CommandRouter
-from hostpilot.runtime import RequestContext
+from hostpilot.runtime import RequestContext, TurnLifecycleManager
 
 
 class FakeConversationStore:
@@ -65,6 +65,44 @@ def test_chat_service_executes_router_selected_tool_and_records_the_turn() -> No
             "HostPilot workspace",
         )
         assert conversations.touched == "conversation-1"
+
+    asyncio.run(scenario())
+
+
+def test_chat_service_does_not_execute_when_turn_start_persistence_fails() -> None:
+    async def scenario() -> None:
+        class FailingTurnStore:
+            async def create_turn(self, **kwargs) -> None:
+                del kwargs
+                raise OSError("turn store unavailable")
+
+        class ExecutionRecorder(ChatService):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.executed = False
+
+            async def _execute_turn(self, *args, **kwargs):
+                del args, kwargs
+                self.executed = True
+                raise AssertionError("turn execution must not start")
+
+        service = ExecutionRecorder(
+            FakeConversationStore(),
+            FakeContextBuilder(),
+            FakeRuntime(),
+            turn_lifecycle=TurnLifecycleManager(
+                store=FailingTurnStore(),
+                runtime_host_id="host-1",
+            ),
+        )
+
+        try:
+            await service.send("session-1", "hello")
+        except OSError as error:
+            assert str(error) == "turn store unavailable"
+        else:
+            raise AssertionError("Turn start persistence failure must reach the caller")
+        assert not service.executed
 
     asyncio.run(scenario())
 

@@ -44,8 +44,12 @@ from hostpilot.persistence.ports import (
     RoutingModelConfigurationStoreFactory,
     SkillExecutionStore,
     SkillExecutionStoreFactory,
+    TaskStore,
+    TaskStoreFactory,
     TraceStore,
     TraceStoreFactory,
+    TurnStore,
+    TurnStoreFactory,
     WorkspaceConfigurationStore,
     WorkspaceConfigurationStoreFactory,
 )
@@ -58,7 +62,9 @@ from hostpilot.persistence.skill_execution import (
     SkillExecutionPreference,
     SQLiteSkillExecutionStore,
 )
+from hostpilot.persistence.tasks import SQLiteTaskStore, StoredTaskRun
 from hostpilot.persistence.traces import SQLiteTraceStore, StoredTraceEvent, TraceSummary
+from hostpilot.persistence.turns import SQLiteTurnStore, StoredTurn
 from hostpilot.persistence.workspace_configuration import SQLiteWorkspaceConfigurationStore
 
 __all__ = [
@@ -85,6 +91,10 @@ __all__ = [
     "SkillExecutionStoreFactory",
     "TraceStore",
     "TraceStoreFactory",
+    "TurnStore",
+    "TurnStoreFactory",
+    "TaskStore",
+    "TaskStoreFactory",
     "WorkspaceConfigurationStore",
     "WorkspaceConfigurationStoreFactory",
     "CancellationAuditEntry",
@@ -97,10 +107,14 @@ __all__ = [
     "SQLiteModelConfigurationStore",
     "SQLiteRoutingModelConfigurationStore",
     "SQLiteTraceStore",
+    "SQLiteTurnStore",
+    "SQLiteTaskStore",
     "SQLiteSkillExecutionStore",
     "SkillExecutionMode",
     "SkillExecutionPreference",
     "StoredTraceEvent",
+    "StoredTurn",
+    "StoredTaskRun",
     "TraceSummary",
     "ModelConfiguration",
     "RoutingModelConfiguration",

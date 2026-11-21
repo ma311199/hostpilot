@@ -7,8 +7,9 @@ from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
+from uuid import uuid4
 
-from hostpilot.runtime.lifecycle import TurnLifecycleManager
+from hostpilot.runtime.lifecycle import TaskLifecycleManager, TurnLifecycleManager
 
 
 class RuntimeHostState(StrEnum):
@@ -79,7 +80,9 @@ class RuntimeContext:
 
     services: RuntimeServiceRegistry = field(default_factory=RuntimeServiceRegistry)
     shutdown_event: asyncio.Event = field(default_factory=asyncio.Event)
+    runtime_host_id: str = field(default_factory=lambda: str(uuid4()))
     turns: TurnLifecycleManager = field(default_factory=TurnLifecycleManager)
+    tasks: TaskLifecycleManager = field(default_factory=TaskLifecycleManager)
 
 
 class RuntimePlugin(Protocol):
@@ -188,9 +191,14 @@ class RuntimeHost:
             return
         self.state = RuntimeHostState.STOPPING
         self.context.shutdown_event.set()
-        await self.context.turns.cancel_all()
-        await self._stop_started_plugins()
-        self.state = RuntimeHostState.STOPPED
+        try:
+            await self.context.turns.cancel_all()
+        finally:
+            try:
+                await self.context.tasks.cancel_all()
+            finally:
+                await self._stop_started_plugins()
+                self.state = RuntimeHostState.STOPPED
 
     def _resolve_order(self) -> list[RuntimePlugin]:
         for plugin in self._plugins.values():
