@@ -11,11 +11,11 @@ from hostpilot.models.contracts import (
     ModelToolDefinition,
 )
 from hostpilot.models.factory import (
-    MODEL_RUNTIME_PLUGIN_API_VERSION,
-    ModelRuntime,
-    ModelRuntimeRegistry,
-    create_default_model_runtime_registry,
-    create_model_runtime,
+    MODEL_PROVIDER_PLUGIN_API_VERSION,
+    ModelProviderRegistry,
+    ModelRuntimeComponents,
+    create_default_model_provider_registry,
+    create_model_runtime_components,
 )
 from hostpilot.models.provider import ModelProvider
 
@@ -29,9 +29,9 @@ __all__ = [
     "ModelRole",
     "ModelToolCall",
     "ModelToolDefinition",
-    "ModelRuntime",
-    "ModelRuntimeRegistry",
-    "MODEL_RUNTIME_PLUGIN_API_VERSION",
-    "create_default_model_runtime_registry",
-    "create_model_runtime",
+    "ModelRuntimeComponents",
+    "ModelProviderRegistry",
+    "MODEL_PROVIDER_PLUGIN_API_VERSION",
+    "create_default_model_provider_registry",
+    "create_model_runtime_components",
 ]

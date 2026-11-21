@@ -48,17 +48,17 @@ class MarkdownMemoryStore:
         """Directory containing original content for medium-tier memories."""
         return self.root / "archives"
 
-    def read_session_summary(self, conversation_id: str) -> str | None:
+    def read_session_summary(self, session_id: str) -> str | None:
         """Read one conversation summary without exposing other sessions."""
-        return self._read(self._session_path(conversation_id))
+        return self._read(self._session_path(session_id))
 
-    def write_session_summary(self, conversation_id: str, content: str) -> None:
+    def write_session_summary(self, session_id: str, content: str) -> None:
         """Atomically replace a single conversation's summary."""
-        self._atomic_write(self._session_path(conversation_id), content)
+        self._atomic_write(self._session_path(session_id), content)
 
-    def delete_session_summary(self, conversation_id: str) -> bool:
+    def delete_session_summary(self, session_id: str) -> bool:
         """Delete one summary without touching shared long-term memory."""
-        path = self._session_path(conversation_id)
+        path = self._session_path(session_id)
         with self._write_lock:
             self._ensure_root()
             self._ensure_safe_parent(path)
@@ -102,7 +102,7 @@ class MarkdownMemoryStore:
         return MemoryRawArchive.model_validate_json(content)
 
     def list_raw_memory_archives(
-        self, conversation_id: str, *, limit: int = 100
+        self, session_id: str, *, limit: int = 100
     ) -> tuple[MemoryRawArchive, ...]:
         """List shared and current-session archives in newest-first order."""
         if not 1 <= limit <= 500:
@@ -118,7 +118,7 @@ class MarkdownMemoryStore:
             if content is None:
                 continue
             archive = MemoryRawArchive.model_validate_json(content)
-            if archive.scope.value == "long_term" or archive.conversation_id == conversation_id:
+            if archive.scope.value == "long_term" or archive.session_id == session_id:
                 archives.append(archive)
         archives.sort(key=lambda item: (item.created_at, str(item.archive_id)), reverse=True)
         return tuple(archives[:limit])
@@ -139,11 +139,11 @@ class MarkdownMemoryStore:
     def _archive_path(self, archive_id: UUID) -> Path:
         return self.archives_directory / f"{archive_id}.json"
 
-    def _session_path(self, conversation_id: str) -> Path:
+    def _session_path(self, session_id: str) -> Path:
         try:
-            normalized_id = str(UUID(conversation_id))
+            normalized_id = str(UUID(session_id))
         except (ValueError, AttributeError) as error:
-            raise ValueError("conversation_id must be a UUID.") from error
+            raise ValueError("session_id must be a UUID.") from error
         return self.sessions_directory / f"{normalized_id}.md"
 
     def _read(self, path: Path) -> str | None:

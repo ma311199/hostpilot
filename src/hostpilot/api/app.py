@@ -72,14 +72,18 @@ from hostpilot.memory.review import (
     MemoryProposalReview,
     PendingProposalNotFound,
 )
-from hostpilot.models.factory import ModelRuntimeRegistry
+from hostpilot.models.factory import ModelProviderRegistry
 from hostpilot.observability import (
     AuditEvent,
     AuditOutcome,
     CompositeAuditSink,
     StructuredAuditSink,
 )
-from hostpilot.orchestration import AgentRuntime, ChatService, create_configured_runtime
+from hostpilot.orchestration import (
+    ChatAgentRuntime,
+    ChatService,
+    create_configured_chat_agent_runtime,
+)
 from hostpilot.orchestration.application_stores_host_plugin import (
     ApplicationStoresHostPlugin,
 )
@@ -89,8 +93,8 @@ from hostpilot.orchestration.configuration_stores_host_plugin import (
 )
 from hostpilot.orchestration.mcp_provider_host_plugin import MCPProviderHostPlugin
 from hostpilot.orchestration.routing_models_host_plugin import RoutingModelsHostPlugin
-from hostpilot.orchestration.runtime_host_plugin import AgentRuntimeHostPlugin
-from hostpilot.orchestration.runtime_plugins import ChatRuntimeRegistry
+from hostpilot.orchestration.runtime_host_plugin import ChatAgentRuntimeHostPlugin
+from hostpilot.orchestration.runtime_plugins import ChatAgentRuntimeRegistry
 from hostpilot.orchestration.sandbox_backends_host_plugin import (
     SandboxBackendsHostPlugin,
 )
@@ -105,9 +109,9 @@ from hostpilot.persistence import (
     CheckpointerFactory,
     ConversationStore,
     ConversationStoreFactory,
+    HarnessConfiguration,
     HarnessConfigurationStore,
     HarnessConfigurationStoreFactory,
-    HarnessRuntimeConfiguration,
     MarkdownMemoryStore,
     MCPConfigurationStore,
     MCPConfigurationStoreFactory,
@@ -181,7 +185,7 @@ class ChatSocketRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: str = Field(pattern="^chat.send$")
-    conversation_id: str = Field(min_length=1, max_length=64)
+    session_id: str = Field(min_length=1, max_length=64)
     message: str = Field(min_length=1, max_length=100_000)
 
     @field_validator("message")
@@ -275,7 +279,7 @@ def _set_runtime_sandbox_mode(application: FastAPI, mode: SandboxMode | None) ->
         set_mode = getattr(candidate, "set_sandbox_mode", None)
         if callable(set_mode):
             set_mode(mode)
-        for attribute in ("provider", "tool_provider", "runtime", "_provider"):
+        for attribute in ("provider", "tool_provider", "runtime", "_provider", "_runtime"):
             nested = getattr(candidate, attribute, None)
             if nested is not None:
                 pending.append(nested)
@@ -616,6 +620,12 @@ class SkillExecutionRequest(BaseModel):
     skill_id: str = Field(min_length=1, max_length=128)
     execution_mode: SkillExecutionMode
 
+    @field_validator("execution_mode", mode="before")
+    @classmethod
+    def normalize_legacy_execution_mode(cls, value: Any) -> Any:
+        """Accept the retired backend name from older API clients."""
+        return "markdown" if value == "deepagents" else value
+
 
 class CancellationAuditResponse(BaseModel):
     """Sanitized execution cancellation diagnostics without handles or payloads."""
@@ -923,26 +933,26 @@ async def configure_routing_model(
 
 @router.get(
     "/harness/configuration",
-    response_model=HarnessRuntimeConfiguration,
+    response_model=HarnessConfiguration,
     tags=["configuration"],
 )
-async def get_harness_configuration(request: Request) -> HarnessRuntimeConfiguration:
+async def get_harness_configuration(request: Request) -> HarnessConfiguration:
     """Return active request limits and budgets without exposing credentials."""
-    return cast(HarnessRuntimeConfiguration, request.app.state.harness_configuration)
+    return cast(HarnessConfiguration, request.app.state.harness_configuration)
 
 
 @router.put(
     "/harness/configuration",
-    response_model=HarnessRuntimeConfiguration,
+    response_model=HarnessConfiguration,
     tags=["configuration"],
 )
 async def configure_harness(
-    configuration: HarnessRuntimeConfiguration,
+    configuration: HarnessConfiguration,
     request: Request,
-) -> HarnessRuntimeConfiguration:
+) -> HarnessConfiguration:
     """Persist and apply the complete validated Harness runtime configuration."""
     configure = cast(
-        Callable[[HarnessRuntimeConfiguration], Awaitable[HarnessRuntimeConfiguration]],
+        Callable[[HarnessConfiguration], Awaitable[HarnessConfiguration]],
         request.app.state.configure_harness_configuration,
     )
     try:
@@ -1181,13 +1191,13 @@ async def list_skills(request: Request) -> SkillCatalogResponse:
             ("yaml", "skill_md") if markdown_package is not None else ("yaml",)
         )
         available_modes: tuple[SkillExecutionMode, ...] = (
-            ("yaml", "deepagents", "both") if markdown_package is not None else ("yaml",)
+            ("yaml", "markdown", "both") if markdown_package is not None else ("yaml",)
         )
         default_mode: SkillExecutionMode = "yaml"
         preferred = preferences.get(yaml_package.skill_id, default_mode)
         execution_mode = preferred if preferred in available_modes else default_mode
         enabled = yaml_package.manifest.meta.enabled
-        if execution_mode == "deepagents" and markdown_package is not None:
+        if execution_mode == "markdown" and markdown_package is not None:
             enabled = markdown_package.enabled
         elif execution_mode == "both" and markdown_package is not None:
             enabled = enabled and markdown_package.enabled
@@ -1224,8 +1234,8 @@ async def list_skills(request: Request) -> SkillCatalogResponse:
                 description=markdown_package.description,
                 execution_format="skill_md",
                 detected_formats=("skill_md",),
-                execution_mode="deepagents",
-                available_execution_modes=("deepagents",),
+                execution_mode="markdown",
+                available_execution_modes=("markdown",),
                 enabled=markdown_package.enabled,
                 source="user",
             )
@@ -1381,7 +1391,7 @@ async def update_skill_state(
     root = SkillRegistry(app_settings.skills_dir).root
     tool_ids = tuple(descriptor.name for descriptor in request.app.state.tool_facade.descriptors())
     try:
-        async with request.app.state.model_runtime_lock:
+        async with request.app.state.model_components_lock:
             skill = set_skill_enabled(
                 root,
                 body.skill_id,
@@ -1417,7 +1427,7 @@ async def update_skill_execution(
             detail="所选执行方式与 Skill 包中已校验的文件格式不兼容。",
         )
 
-    async with request.app.state.model_runtime_lock:
+    async with request.app.state.model_components_lock:
         await request.app.state.skill_execution_store.set(
             body.skill_id,
             body.execution_mode,
@@ -1446,7 +1456,7 @@ async def remove_skill(
     root = SkillRegistry(app_settings.skills_dir).root
     tool_ids = tuple(descriptor.name for descriptor in request.app.state.tool_facade.descriptors())
     try:
-        async with request.app.state.model_runtime_lock:
+        async with request.app.state.model_components_lock:
             delete_skill(root, skill_id, registered_tool_ids=tool_ids)
             await request.app.state.skill_execution_store.delete(skill_id)
             request.app.state.skill_execution_modes.pop(skill_id, None)
@@ -1523,17 +1533,17 @@ async def chat_websocket(websocket: WebSocket) -> None:
                 )
                 continue
             try:
-                async with websocket.scope["app"].state.model_runtime_lock:
+                async with websocket.scope["app"].state.model_components_lock:
                     conversation = await websocket.scope["app"].state.conversations.get(
-                        body.conversation_id
+                        body.session_id
                     )
                     if conversation is None:
-                        raise ConversationNotFoundError(body.conversation_id)
+                        raise ConversationNotFoundError(body.session_id)
                     _set_runtime_sandbox_mode(websocket.scope["app"], conversation.sandbox_mode)
                     try:
                         with sandbox_mode_scope(conversation.sandbox_mode):
                             result = await chat_service.send(
-                                body.conversation_id,
+                                body.session_id,
                                 body.message,
                                 confirmation_provider=WebSocketConfirmationProvider(websocket),
                             )
@@ -1567,7 +1577,7 @@ async def chat_websocket(websocket: WebSocket) -> None:
                     {
                         "type": "chat.response",
                         "data": ChatResponse(
-                            conversation_id=result.conversation_id,
+                            session_id=result.session_id,
                             request_id=result.request_id,
                             assistant_message=result.assistant_message,
                             route=result.route,
@@ -1609,18 +1619,18 @@ async def list_conversations(request: Request) -> tuple[ConversationSummary, ...
 
 
 @router.get(
-    "/conversations/{conversation_id}",
+    "/conversations/{session_id}",
     response_model=ConversationSummary,
     tags=["conversations"],
 )
 async def get_conversation(
-    conversation_id: str,
+    session_id: str,
     request: Request,
 ) -> ConversationSummary:
     """Return metadata for one conversation."""
     store: ConversationStore = request.app.state.conversations
     try:
-        conversation = await store.get(conversation_id)
+        conversation = await store.get(session_id)
     except ValueError as error:
         raise HTTPException(status_code=404, detail="Conversation not found.") from error
     if conversation is None:
@@ -1629,20 +1639,20 @@ async def get_conversation(
 
 
 @router.post(
-    "/conversations/{conversation_id}/sandbox/upgrade",
+    "/conversations/{session_id}/sandbox/upgrade",
     response_model=ConversationSummary,
     tags=["conversations"],
 )
 async def upgrade_conversation_sandbox(
-    conversation_id: str,
+    session_id: str,
     body: SandboxUpgradeRequest,
     request: Request,
 ) -> ConversationSummary:
     """Persist one user-approved privilege increase and audit the transition."""
     store: ConversationStore = request.app.state.conversations
-    async with request.app.state.model_runtime_lock:
+    async with request.app.state.model_components_lock:
         try:
-            current = await store.get(conversation_id)
+            current = await store.get(session_id)
         except ValueError as error:
             raise HTTPException(status_code=404, detail="Conversation not found.") from error
         if current is None:
@@ -1653,7 +1663,7 @@ async def upgrade_conversation_sandbox(
                     action="sandbox.upgrade",
                     outcome=AuditOutcome.DENIED,
                     resource_type="conversation",
-                    resource_id=current.conversation_id,
+                    resource_id=current.session_id,
                     reason_code="mode_must_increase",
                 )
             )
@@ -1662,7 +1672,7 @@ async def upgrade_conversation_sandbox(
                 detail="会话沙箱级别只能向上升级，不能降级或重复升级。",
             )
         try:
-            upgraded = await store.upgrade_sandbox_mode(current.conversation_id, body.target_mode)
+            upgraded = await store.upgrade_sandbox_mode(current.session_id, body.target_mode)
         except ConversationNotFoundError as error:
             raise HTTPException(status_code=404, detail="Conversation not found.") from error
         except ValueError as error:
@@ -1675,7 +1685,7 @@ async def upgrade_conversation_sandbox(
                 action="sandbox.upgrade",
                 outcome=AuditOutcome.ALLOWED,
                 resource_type="conversation",
-                resource_id=upgraded.conversation_id,
+                resource_id=upgraded.session_id,
                 reason_code=(
                     f"approved_{current.sandbox_mode.value.replace('-', '_')}_to_"
                     f"{upgraded.sandbox_mode.value.replace('-', '_')}"
@@ -1686,26 +1696,26 @@ async def upgrade_conversation_sandbox(
 
 
 @router.delete(
-    "/conversations/{conversation_id}",
+    "/conversations/{session_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     tags=["conversations"],
 )
-async def delete_conversation(conversation_id: str, request: Request) -> Response:
+async def delete_conversation(session_id: str, request: Request) -> Response:
     """Delete a conversation, its graph checkpoints, and its session summary."""
     store: ConversationStore = request.app.state.conversations
     memory: MemoryStore = request.app.state.memory
     checkpointer = request.app.state.checkpointer
     try:
-        conversation = await store.get(conversation_id)
+        conversation = await store.get(session_id)
     except ValueError as error:
         raise HTTPException(status_code=404, detail="Conversation not found.") from error
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found.")
 
-    await checkpointer.adelete_thread(conversation.conversation_id)
-    await store.delete(conversation.conversation_id)
-    memory.delete_session_summary(conversation.conversation_id)
-    await request.app.state.memory_review.remove_for_conversation(conversation.conversation_id)
+    await checkpointer.adelete_thread(conversation.session_id)
+    await store.delete(conversation.session_id)
+    memory.delete_session_summary(conversation.session_id)
+    await request.app.state.memory_review.remove_for_conversation(conversation.session_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -1735,8 +1745,8 @@ async def submit_memory_proposal(
     review: MemoryProposalReview = request.app.state.memory_review
     if (
         proposal.scope is MemoryScope.SESSION_SUMMARY
-        and proposal.conversation_id is not None
-        and await request.app.state.conversations.get(proposal.conversation_id) is None
+        and proposal.session_id is not None
+        and await request.app.state.conversations.get(proposal.session_id) is None
     ):
         raise HTTPException(status_code=404, detail="Conversation not found.")
     try:
@@ -1783,12 +1793,12 @@ async def reject_memory_proposal(proposal_id: str, request: Request) -> Response
 
 
 @router.post(
-    "/conversations/{conversation_id}/messages",
+    "/conversations/{session_id}/messages",
     response_model=ChatResponse,
     tags=["chat"],
 )
 async def send_message(
-    conversation_id: str,
+    session_id: str,
     body: ChatRequest,
     request: Request,
 ) -> ChatResponse:
@@ -1800,14 +1810,14 @@ async def send_message(
             detail="Agent runtime is not configured; select a model provider first.",
         )
     try:
-        async with request.app.state.model_runtime_lock:
-            conversation = await request.app.state.conversations.get(conversation_id)
+        async with request.app.state.model_components_lock:
+            conversation = await request.app.state.conversations.get(session_id)
             if conversation is None:
-                raise ConversationNotFoundError(conversation_id)
+                raise ConversationNotFoundError(session_id)
             _set_runtime_sandbox_mode(request.app, conversation.sandbox_mode)
             try:
                 with sandbox_mode_scope(conversation.sandbox_mode):
-                    result = await chat_service.send(conversation_id, body.message)
+                    result = await chat_service.send(session_id, body.message)
             finally:
                 _set_runtime_sandbox_mode(request.app, None)
     except RequestTooLargeError as error:
@@ -1864,7 +1874,7 @@ async def send_message(
             detail=f"Route '{error}' is not available yet.",
         ) from error
     return ChatResponse(
-        conversation_id=result.conversation_id,
+        session_id=result.session_id,
         request_id=result.request_id,
         assistant_message=result.assistant_message,
         route=result.route,
@@ -1874,12 +1884,12 @@ async def send_message(
 
 
 @router.post(
-    "/conversations/{conversation_id}/routing-evaluation",
+    "/conversations/{session_id}/routing-evaluation",
     response_model=RoutingEvaluationResponse,
     tags=["chat", "evaluation"],
 )
 async def evaluate_conversation_route(
-    conversation_id: str,
+    session_id: str,
     body: RoutingEvaluationRequest,
     request: Request,
 ) -> RoutingEvaluationResponse:
@@ -1891,13 +1901,13 @@ async def evaluate_conversation_route(
             detail="Agent runtime is not configured; select a model provider first.",
         )
     try:
-        async with request.app.state.model_runtime_lock:
-            conversation = await request.app.state.conversations.get(conversation_id)
+        async with request.app.state.model_components_lock:
+            conversation = await request.app.state.conversations.get(session_id)
             if conversation is None:
-                raise ConversationNotFoundError(conversation_id)
+                raise ConversationNotFoundError(session_id)
             evaluation_context = body.evaluation_context
             result = await chat_service.select_route_only(
-                conversation_id,
+                session_id,
                 body.message,
                 evaluation_messages=(
                     tuple(
@@ -1943,12 +1953,12 @@ async def evaluate_conversation_route(
 
 
 @router.get(
-    "/conversations/{conversation_id}/messages",
+    "/conversations/{session_id}/messages",
     response_model=ConversationHistoryResponse,
     tags=["chat"],
 )
 async def get_messages(
-    conversation_id: str,
+    session_id: str,
     request: Request,
 ) -> ConversationHistoryResponse:
     """Return persisted messages for one conversation."""
@@ -1959,8 +1969,8 @@ async def get_messages(
             detail="Agent runtime is not configured; select a model provider first.",
         )
     try:
-        async with request.app.state.model_runtime_lock:
-            conversation, messages = await chat_service.history(conversation_id)
+        async with request.app.state.model_components_lock:
+            conversation, messages = await chat_service.history(session_id)
     except (ConversationNotFoundError, ValueError) as error:
         raise HTTPException(status_code=404, detail="Conversation not found.") from error
     return ConversationHistoryResponse(conversation=conversation, messages=messages)
@@ -1969,12 +1979,12 @@ async def get_messages(
 def create_app(
     settings: Settings | None = None,
     *,
-    runtime_factory: Callable[[Any], AgentRuntime] | None = None,
+    chat_agent_runtime_factory: Callable[[Any], ChatAgentRuntime] | None = None,
     agent_router: Router | None = None,
     workspace_picker: Callable[[Path], Path | None] | None = None,
     plan_component_registry: PlanComponentRegistry | None = None,
-    chat_runtime_registry: ChatRuntimeRegistry | None = None,
-    model_runtime_registry: ModelRuntimeRegistry | None = None,
+    chat_agent_runtime_registry: ChatAgentRuntimeRegistry | None = None,
+    model_provider_registry: ModelProviderRegistry | None = None,
     conversation_store_factory: ConversationStoreFactory | None = None,
     checkpointer_factory: CheckpointerFactory | None = None,
     model_configuration_store_factory: ModelConfigurationStoreFactory | None = None,
@@ -2002,7 +2012,9 @@ def create_app(
         runtime_context = runtime_host.context
         mcp_provider_plugin: MCPProviderHostPlugin = application.state.mcp_provider_plugin
         tool_governance_plugin: ToolGovernanceHostPlugin = application.state.tool_governance_plugin
-        agent_runtime_plugin: AgentRuntimeHostPlugin = application.state.agent_runtime_plugin
+        chat_agent_runtime_plugin: ChatAgentRuntimeHostPlugin = (
+            application.state.chat_agent_runtime_plugin
+        )
         routing_models_plugin: RoutingModelsHostPlugin = application.state.routing_models_plugin
         services = runtime_context.services
         tool_executor_factory = cast(
@@ -2041,7 +2053,7 @@ def create_app(
         saved_routing_model_configuration: (
             RoutingModelConfiguration | None
         ) = await routing_model_configuration_store.get()
-        routing_model_runtime: Any | None = None
+        routing_model_components: Any | None = None
         routing_model_api_keys: dict[str, str] = {}
         if saved_routing_model_configuration is not None:
             for role, api_key in (
@@ -2051,7 +2063,7 @@ def create_app(
                 if api_key:
                     routing_model_api_keys[role] = api_key
         if saved_routing_model_configuration is not None and routing_model_api_keys:
-            from hostpilot.routing.models import create_routing_model_runtime
+            from hostpilot.routing.models import create_routing_model_components
 
             saved_embedding_model = saved_routing_model_configuration["embedding_model"]
             saved_reranker_model = saved_routing_model_configuration["reranker_model"]
@@ -2062,7 +2074,7 @@ def create_app(
                 saved_reranker_model if routing_model_api_keys.get("reranker") else None
             )
             if embedding_model or reranker_model:
-                routing_model_runtime = create_routing_model_runtime(
+                routing_model_components = create_routing_model_components(
                     app_settings,
                     judge_model=None,
                     judge_api_key=None,
@@ -2074,7 +2086,7 @@ def create_app(
                     reranker_api_key=routing_model_api_keys.get("reranker"),
                     reranker_base_url=saved_routing_model_configuration["reranker_base_url"],
                 )
-                await routing_models_plugin.replace(routing_model_runtime)
+                await routing_models_plugin.replace(routing_model_components)
         mcp_configuration_store = cast(
             MCPConfigurationStore,
             services.resolve(ConfigurationStoresHostPlugin.mcp_configuration_service_id),
@@ -2089,11 +2101,8 @@ def create_app(
         )
         saved_harness_configuration = await harness_configuration_store.get()
         harness_configuration = saved_harness_configuration or (
-            HarnessRuntimeConfiguration.model_validate(
-                {
-                    field: getattr(app_settings, field)
-                    for field in HarnessRuntimeConfiguration.model_fields
-                }
+            HarnessConfiguration.model_validate(
+                {field: getattr(app_settings, field) for field in HarnessConfiguration.model_fields}
             )
         )
         app_settings = app_settings.model_copy(update=harness_configuration.model_dump())
@@ -2209,10 +2218,10 @@ def create_app(
         )
         application.state.tool_facade = tool_facade
         application.state.mcp_connection_status = None
-        runtime: AgentRuntime | None = None
+        runtime: ChatAgentRuntime | None = None
         chat_service: ChatService | None = None
         runtime_lock = asyncio.Lock()
-        application.state.model_runtime_lock = runtime_lock
+        application.state.model_components_lock = runtime_lock
 
         def make_workspace_status(*, selected: bool = True) -> WorkspaceStatusResponse:
             return WorkspaceStatusResponse(
@@ -2243,7 +2252,7 @@ def create_app(
         application.state.select_workspace_directory = select_workspace_directory
 
         def make_chat_service(
-            agent_runtime: AgentRuntime,
+            chat_agent_runtime: ChatAgentRuntime,
             tool_provider: Any | None,
         ) -> ChatService:
             return ChatService(
@@ -2251,11 +2260,11 @@ def create_app(
                 ContextBuilder(
                     hosted_conversation_store(),
                     memory_controller,
-                    agent_runtime,
+                    chat_agent_runtime,
                     max_messages=app_settings.max_context_messages,
                     max_memory_chars=app_settings.max_memory_context_chars,
                 ),
-                agent_runtime,
+                chat_agent_runtime,
                 budget_limits=BudgetLimits(
                     total_tokens=app_settings.request_token_budget,
                     tool_calls=app_settings.request_tool_call_budget,
@@ -2270,10 +2279,10 @@ def create_app(
                 turn_lifecycle=runtime_context.turns,
             )
 
-        def hosted_agent_runtime() -> AgentRuntime:
+        def hosted_chat_agent_runtime() -> ChatAgentRuntime:
             return cast(
-                AgentRuntime,
-                runtime_context.services.resolve(AgentRuntimeHostPlugin.service_id),
+                ChatAgentRuntime,
+                runtime_context.services.resolve(ChatAgentRuntimeHostPlugin.service_id),
             )
 
         def hosted_tool_facade() -> ToolFacade:
@@ -2382,7 +2391,7 @@ def create_app(
                 sandbox_backends=sandbox_backends,
             )
             candidate_facade = ToolFacade(candidate_provider)
-            candidate_runtime: AgentRuntime | None = None
+            candidate_chat_agent_runtime: ChatAgentRuntime | None = None
             try:
                 candidate_tools: list[Any] = []
                 should_start = bool(
@@ -2392,11 +2401,11 @@ def create_app(
                 if should_start:
                     candidate_tools = await candidate_provider.start()
                 if candidate_settings.model_name and candidate_settings.model_api_key:
-                    if runtime_factory is not None:
+                    if chat_agent_runtime_factory is not None:
                         raise RuntimeError(
                             "A custom runtime factory cannot be rebuilt dynamically."
                         )
-                    candidate_runtime = create_configured_runtime(
+                    candidate_chat_agent_runtime = create_configured_chat_agent_runtime(
                         candidate_settings,
                         checkpointer=hosted_checkpointer(),
                         tools=candidate_tools,
@@ -2406,8 +2415,8 @@ def create_app(
                         skill_execution_modes=saved_skill_execution_modes,
                         trace_sink=trace_store,
                         plan_component_registry=plan_component_registry,
-                        chat_runtime_registry=chat_runtime_registry,
-                        model_runtime_registry=model_runtime_registry,
+                        chat_agent_runtime_registry=chat_agent_runtime_registry,
+                        model_provider_registry=model_provider_registry,
                     )
             except Exception:
                 application.state.mcp_connection_status = candidate_facade.connections()
@@ -2418,11 +2427,11 @@ def create_app(
                 return
 
             async with runtime_lock:
-                await agent_runtime_plugin.replace(candidate_runtime)
+                await chat_agent_runtime_plugin.replace(candidate_chat_agent_runtime)
                 await mcp_provider_plugin.replace(candidate_provider)
                 tool_governance_plugin.bind(candidate_provider)
                 mcp_provider = candidate_provider
-                runtime = candidate_runtime
+                runtime = candidate_chat_agent_runtime
                 workspace_tools = candidate_workspace
                 application.state.workspace_files = workspace_tools
                 application.state.mcp_provider = candidate_provider
@@ -2430,10 +2439,12 @@ def create_app(
                 application.state.mcp_connection_status = None
                 application.state.settings = candidate_settings
                 mcp_configuration_errors.clear()
-                if candidate_runtime is None:
+                if candidate_chat_agent_runtime is None:
                     chat_service = None
                 elif chat_service is None:
-                    chat_service = make_chat_service(hosted_agent_runtime(), hosted_tool_facade())
+                    chat_service = make_chat_service(
+                        hosted_chat_agent_runtime(), hosted_tool_facade()
+                    )
                 else:
                     chat_service.tool_provider = hosted_tool_facade()
                 application.state.chat_service = chat_service
@@ -2445,7 +2456,7 @@ def create_app(
             configuration: MCPServerConfigurationRequest,
         ) -> MCPServerConfigurationsResponse:
             nonlocal saved_mcp_configurations
-            if runtime_factory is not None:
+            if chat_agent_runtime_factory is not None:
                 raise RuntimeError("MCP configuration is managed by the custom runtime factory.")
             if configuration.name in environment_server_names:
                 raise ValueError("Environment-managed MCP servers cannot be changed here.")
@@ -2520,8 +2531,8 @@ def create_app(
         application.state.delete_mcp_server = delete_mcp_server_configuration
 
         async def configure_harness_runtime(
-            configuration: HarnessRuntimeConfiguration,
-        ) -> HarnessRuntimeConfiguration:
+            configuration: HarnessConfiguration,
+        ) -> HarnessConfiguration:
             nonlocal app_settings
             candidate_settings = app_settings.model_copy(update=configuration.model_dump())
             async with runtime_lock:
@@ -2588,7 +2599,7 @@ def create_app(
                 and (saved["judge_model"] or saved["embedding_model"] or saved["reranker_model"])
             )
             return RoutingModelConfigurationStatus(
-                configured=routing_model_runtime is not None,
+                configured=routing_model_components is not None,
                 saved=has_optional_roles,
                 judge_api_key_configured=bool(routing_model_api_keys.get("judge")),
                 embedding_api_key_configured=bool(routing_model_api_keys.get("embedding")),
@@ -2601,10 +2612,10 @@ def create_app(
                 reranker_base_url=saved["reranker_base_url"] if saved else None,
             )
 
-        async def configure_routing_model_runtime(
+        async def configure_routing_model_components(
             configuration: RoutingModelConfigurationRequest,
         ) -> RoutingModelConfigurationStatus:
-            nonlocal routing_model_runtime
+            nonlocal routing_model_components
             nonlocal saved_routing_model_configuration
             nonlocal routing_model_api_keys
             stored = saved_routing_model_configuration or {
@@ -2664,11 +2675,11 @@ def create_app(
             has_optional_roles = any(
                 (active_judge_model, active_embedding_model, active_reranker_model)
             )
-            from hostpilot.routing.models import create_routing_model_runtime
+            from hostpilot.routing.models import create_routing_model_components
 
             candidate = None
             if has_optional_roles:
-                candidate = create_routing_model_runtime(
+                candidate = create_routing_model_components(
                     app_settings,
                     judge_model=active_judge_model,
                     judge_api_key=candidate_api_keys.get("judge"),
@@ -2721,7 +2732,7 @@ def create_app(
                     await candidate.aclose()
                 raise
             await routing_models_plugin.replace(candidate)
-            routing_model_runtime = candidate
+            routing_model_components = candidate
             routing_model_api_keys = candidate_api_keys
             saved_routing_model_configuration = {
                 "judge_base_url": judge_base_url,
@@ -2738,7 +2749,7 @@ def create_app(
         application.state.get_routing_model_configuration_status = (
             routing_model_configuration_status
         )
-        application.state.configure_routing_model = configure_routing_model_runtime
+        application.state.configure_routing_model = configure_routing_model_components
 
         async def test_model_connection_runtime(
             configuration: ModelConnectionTestRequest,
@@ -2778,9 +2789,8 @@ def create_app(
                                 content="Reply with OK.",
                             ),
                         ),
-                        temperature=0,
-                        max_output_tokens=8,
-                        timeout_seconds=15,
+                        max_output_tokens=128,
+                        timeout_seconds=45,
                     )
                 )
                 if not result.text.strip():
@@ -2788,7 +2798,7 @@ def create_app(
 
             try:
                 if configuration.role == "llm":
-                    from hostpilot.models.factory import create_model_runtime
+                    from hostpilot.models.factory import create_model_runtime_components
 
                     model_settings = app_settings.model_copy(
                         update={
@@ -2802,14 +2812,16 @@ def create_app(
                             ),
                         }
                     )
-                    candidate_runtime = create_model_runtime(
+                    candidate_model_components = create_model_runtime_components(
                         model_settings,
-                        registry=model_runtime_registry,
+                        registry=model_provider_registry,
                     )
                     try:
-                        await check_chat_provider(candidate_runtime.provider)
+                        await check_chat_provider(candidate_model_components.provider)
                     finally:
-                        chat_model = getattr(candidate_runtime.agent_chat_model, "provider", None)
+                        chat_model = getattr(
+                            candidate_model_components.agent_chat_model, "provider", None
+                        )
                         client = getattr(
                             getattr(chat_model, "chat_model", None), "root_async_client", None
                         )
@@ -2817,9 +2829,9 @@ def create_app(
                         if close is not None:
                             await close()
                 else:
-                    from hostpilot.routing.models import create_routing_model_runtime
+                    from hostpilot.routing.models import create_routing_model_components
 
-                    route_runtime = create_routing_model_runtime(
+                    route_model_components = create_routing_model_components(
                         app_settings,
                         judge_model=(
                             configuration.model_name if configuration.role == "judge" else None
@@ -2845,20 +2857,20 @@ def create_app(
                     )
                     try:
                         if configuration.role == "judge":
-                            if route_runtime.chat_provider is None:
+                            if route_model_components.chat_provider is None:
                                 raise ValueError("The chat model runtime was not created.")
-                            await check_chat_provider(route_runtime.chat_provider)
+                            await check_chat_provider(route_model_components.chat_provider)
                         elif configuration.role == "embedding":
-                            embedding_batch = await route_runtime.embed(
+                            embedding_batch = await route_model_components.embed(
                                 ("HostPilot connection test",),
                                 model=configuration.model_name,
                             )
                             if not embedding_batch.vectors or not embedding_batch.vectors[0]:
                                 raise ValueError("The embedding response was empty.")
                         else:
-                            if route_runtime.reranker_client is None:
+                            if route_model_components.reranker_client is None:
                                 raise ValueError("The reranker client was not created.")
-                            reranker_batch = await route_runtime.reranker_client.rerank(
+                            reranker_batch = await route_model_components.reranker_client.rerank(
                                 "HostPilot connection test",
                                 ("HostPilot connection test", "unrelated sample"),
                                 model=configuration.model_name,
@@ -2867,13 +2879,48 @@ def create_app(
                             if not reranker_batch.indices:
                                 raise ValueError("The reranker response was empty.")
                     finally:
-                        await route_runtime.aclose()
+                        await route_model_components.aclose()
                 return ModelConnectionTestResponse(
                     role=configuration.role,
                     success=True,
                     message="连接成功，模型已返回有效响应。",
                 )
             except Exception as error:
+                from hostpilot.models.contracts import (
+                    ModelProviderError,
+                    ModelProviderErrorCategory,
+                )
+
+                if isinstance(error, ModelProviderError):
+                    category_messages = {
+                        ModelProviderErrorCategory.AUTHENTICATION: "模型认证失败，请检查 API Key。",
+                        ModelProviderErrorCategory.INVALID_REQUEST: (
+                            "模型服务拒绝了当前测试请求，请检查模型名称、接口兼容性和服务商参数要求。"
+                        ),
+                        ModelProviderErrorCategory.MODEL_NOT_FOUND: (
+                            "模型服务未找到该模型，请检查模型名称和账号权限。"
+                        ),
+                        ModelProviderErrorCategory.RATE_LIMITED: (
+                            "模型服务请求过于频繁，请稍后重试。"
+                        ),
+                        ModelProviderErrorCategory.TIMEOUT: (
+                            "模型响应超时，请检查服务状态或稍后重试。"
+                        ),
+                        ModelProviderErrorCategory.UNAVAILABLE: (
+                            "模型服务暂时不可用，请稍后重试。"
+                        ),
+                        ModelProviderErrorCategory.CANCELLED: "模型连接测试已取消。",
+                        ModelProviderErrorCategory.UNKNOWN: "模型服务请求失败。",
+                    }
+                    status_suffix = (
+                        f"（HTTP {error.status_code}）" if error.status_code is not None else ""
+                    )
+                    return ModelConnectionTestResponse(
+                        role=configuration.role,
+                        success=False,
+                        message=category_messages[error.category] + status_suffix,
+                        error_code=error.category.value,
+                    )
                 return ModelConnectionTestResponse(
                     role=configuration.role,
                     success=False,
@@ -2883,13 +2930,13 @@ def create_app(
 
         application.state.test_model_connection = test_model_connection_runtime
 
-        async def configure_model_runtime(
+        async def configure_model_provider(
             configuration: ModelConfigurationRequest,
         ) -> ModelConfigurationStatus:
             nonlocal app_settings, chat_service, mcp_provider, runtime, tool_facade
             nonlocal workspace_tools
             nonlocal saved_model_configuration
-            if runtime_factory is not None:
+            if chat_agent_runtime_factory is not None:
                 raise RuntimeError("Model runtime is managed by the configured runtime factory.")
 
             stored: ModelConfiguration = saved_model_configuration or {
@@ -2941,7 +2988,7 @@ def create_app(
             candidate_facade = ToolFacade(candidate_provider)
             try:
                 candidate_tools = await candidate_provider.start()
-                candidate_runtime = create_configured_runtime(
+                candidate_chat_agent_runtime = create_configured_chat_agent_runtime(
                     candidate_settings,
                     checkpointer=hosted_checkpointer(),
                     tools=candidate_tools,
@@ -2951,21 +2998,21 @@ def create_app(
                     skill_execution_modes=saved_skill_execution_modes,
                     trace_sink=trace_store,
                     plan_component_registry=plan_component_registry,
-                    chat_runtime_registry=chat_runtime_registry,
-                    model_runtime_registry=model_runtime_registry,
+                    chat_agent_runtime_registry=chat_agent_runtime_registry,
+                    model_provider_registry=model_provider_registry,
                 )
                 if (
-                    routing_model_runtime is not None
+                    routing_model_components is not None
                     and saved_routing_model_configuration is not None
                 ):
-                    selector = getattr(candidate_runtime, "selector", None)
+                    selector = getattr(candidate_chat_agent_runtime, "selector", None)
                     if selector is not None:
                         from hostpilot.routing.vector_index import ChromaSkillVectorIndex
 
-                        if routing_model_runtime.chat_provider is not None:
-                            selector.provider = routing_model_runtime.chat_provider
-                        selector.reranker_client = routing_model_runtime.reranker_client
-                        selector.routing_models = routing_model_runtime
+                        if routing_model_components.chat_provider is not None:
+                            selector.provider = routing_model_components.chat_provider
+                        selector.reranker_client = routing_model_components.reranker_client
+                        selector.routing_models = routing_model_components
                         selector.reranker_model = saved_routing_model_configuration[
                             "reranker_model"
                         ]
@@ -2976,7 +3023,7 @@ def create_app(
                             ChromaSkillVectorIndex(
                                 app_settings.data_dir / "skill-vectors",
                                 embedding_model=selector.embedding_model,
-                                models=routing_model_runtime,
+                                models=routing_model_components,
                             )
                             if selector.embedding_model
                             else None
@@ -3002,8 +3049,8 @@ def create_app(
             }
 
             async with runtime_lock:
-                runtime = candidate_runtime
-                await agent_runtime_plugin.replace(candidate_runtime)
+                runtime = candidate_chat_agent_runtime
+                await chat_agent_runtime_plugin.replace(candidate_chat_agent_runtime)
                 await mcp_provider_plugin.replace(candidate_provider)
                 tool_governance_plugin.bind(candidate_provider)
                 mcp_provider = candidate_provider
@@ -3015,14 +3062,16 @@ def create_app(
                 app_settings = candidate_settings
                 application.state.settings = candidate_settings
                 if chat_service is None:
-                    chat_service = make_chat_service(hosted_agent_runtime(), hosted_tool_facade())
+                    chat_service = make_chat_service(
+                        hosted_chat_agent_runtime(), hosted_tool_facade()
+                    )
                 else:
                     chat_service.tool_provider = hosted_tool_facade()
                 application.state.chat_service = chat_service
             return model_configuration_status()
 
         application.state.get_model_configuration_status = model_configuration_status
-        application.state.configure_model = configure_model_runtime
+        application.state.configure_model = configure_model_provider
         application.state.conversations = hosted_conversation_store()
         application.state.checkpointer = hosted_checkpointer()
         memory_review = MemoryProposalReview(
@@ -3038,12 +3087,12 @@ def create_app(
             trace=trace_store,
         )
         application.state.memory_controller = memory_controller
-        if runtime_factory is not None:
-            runtime = runtime_factory(hosted_checkpointer())
-            await agent_runtime_plugin.replace(runtime)
+        if chat_agent_runtime_factory is not None:
+            runtime = chat_agent_runtime_factory(hosted_checkpointer())
+            await chat_agent_runtime_plugin.replace(runtime)
         elif app_settings.model_name and app_settings.model_api_key:
             mcp_tools = await mcp_provider.start()
-            runtime = create_configured_runtime(
+            runtime = create_configured_chat_agent_runtime(
                 startup_settings,
                 checkpointer=hosted_checkpointer(),
                 tools=mcp_tools,
@@ -3053,10 +3102,10 @@ def create_app(
                 skill_execution_modes=saved_skill_execution_modes,
                 trace_sink=trace_store,
                 plan_component_registry=plan_component_registry,
-                chat_runtime_registry=chat_runtime_registry,
-                model_runtime_registry=model_runtime_registry,
+                chat_agent_runtime_registry=chat_agent_runtime_registry,
+                model_provider_registry=model_provider_registry,
             )
-            await agent_runtime_plugin.replace(runtime)
+            await chat_agent_runtime_plugin.replace(runtime)
         elif startup_settings.mcp_servers:
             try:
                 await mcp_provider.start()
@@ -3065,7 +3114,7 @@ def create_app(
 
         if runtime is not None:
             chat_service = make_chat_service(
-                hosted_agent_runtime(),
+                hosted_chat_agent_runtime(),
                 tool_facade if mcp_provider._started else None,
             )
         application.state.chat_service = chat_service
@@ -3114,7 +3163,7 @@ def create_app(
             database_path,
             (checkpointer_factory or open_sqlite_checkpointer)(database_path),
         )
-        agent_runtime_plugin = AgentRuntimeHostPlugin()
+        chat_agent_runtime_plugin = ChatAgentRuntimeHostPlugin()
         runtime_host.register_plugin(configuration_plugin)
         runtime_host.register_plugin(application_stores_plugin)
         runtime_host.register_plugin(routing_models_plugin)
@@ -3122,12 +3171,12 @@ def create_app(
         runtime_host.register_plugin(mcp_provider_plugin)
         runtime_host.register_plugin(tool_governance_plugin)
         runtime_host.register_plugin(state_services_plugin)
-        runtime_host.register_plugin(agent_runtime_plugin)
+        runtime_host.register_plugin(chat_agent_runtime_plugin)
         application.state.runtime_host = runtime_host
         application.state.mcp_provider_plugin = mcp_provider_plugin
         application.state.tool_governance_plugin = tool_governance_plugin
         application.state.routing_models_plugin = routing_models_plugin
-        application.state.agent_runtime_plugin = agent_runtime_plugin
+        application.state.chat_agent_runtime_plugin = chat_agent_runtime_plugin
         try:
             await runtime_host.start()
             async with lifespan_body(application):

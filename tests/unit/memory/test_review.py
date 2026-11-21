@@ -22,12 +22,12 @@ CONVERSATION_ID = "6c442c1e-6e95-4908-88ab-0b3a3c195443"
 
 
 class FakeConversations:
-    async def get(self, conversation_id: str) -> ConversationSummary | None:
-        if conversation_id != CONVERSATION_ID:
+    async def get(self, session_id: str) -> ConversationSummary | None:
+        if session_id != CONVERSATION_ID:
             return None
         now = datetime.now(UTC)
         return ConversationSummary(
-            conversation_id=conversation_id,
+            session_id=session_id,
             title="Review test",
             created_at=now,
             updated_at=now,
@@ -205,7 +205,7 @@ def test_submission_for_unknown_session_is_rejected_without_queueing(tmp_path) -
         review = MemoryProposalReview(MemoryWriteService(memory, conversations))
         proposal = MemoryWriteProposal(
             scope=MemoryScope.SESSION_SUMMARY,
-            conversation_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            session_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             content="Unknown session",
         )
 

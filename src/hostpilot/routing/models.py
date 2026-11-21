@@ -12,7 +12,7 @@ from pydantic import SecretStr
 
 from hostpilot.config import Settings
 from hostpilot.models import ModelProvider
-from hostpilot.models.factory import create_model_runtime
+from hostpilot.models.factory import create_model_runtime_components
 
 
 @dataclass(frozen=True)
@@ -86,11 +86,7 @@ class RerankerClient:
             ranked.append((index, float(score)))
         ranked.sort(key=lambda item: item[1], reverse=True)
         usage = payload.get("usage") if isinstance(payload, dict) else None
-        input_tokens = (
-            usage.get("total_tokens", 0)
-            if isinstance(usage, dict)
-            else 0
-        )
+        input_tokens = usage.get("total_tokens", 0) if isinstance(usage, dict) else 0
         return RerankBatch(
             indices=tuple(index for index, _ in ranked),
             scores=tuple(score for _, score in ranked),
@@ -103,7 +99,7 @@ class RerankerClient:
         await self._client.aclose()
 
 
-class RoutingModelRuntime:
+class RoutingModelComponents:
     """Optional lightweight, reranker, and embedding clients for routing."""
 
     def __init__(
@@ -145,7 +141,7 @@ class RoutingModelRuntime:
             await self.reranker_client.aclose()
 
 
-def create_routing_model_runtime(
+def create_routing_model_components(
     settings: Settings,
     *,
     judge_model: str | None,
@@ -157,7 +153,7 @@ def create_routing_model_runtime(
     reranker_model: str | None = None,
     reranker_api_key: str | None = None,
     reranker_base_url: str | None = None,
-) -> RoutingModelRuntime:
+) -> RoutingModelComponents:
     """Build optional model clients with independent credentials and endpoints."""
 
     def create_chat_provider(
@@ -175,7 +171,7 @@ def create_routing_model_runtime(
                 "model_streaming": False,
             }
         )
-        return create_model_runtime(role_settings).provider
+        return create_model_runtime_components(role_settings).provider
 
     chat_provider = create_chat_provider(judge_model, judge_api_key, judge_base_url)
     reranker_client = None
@@ -198,7 +194,7 @@ def create_routing_model_runtime(
         raise RuntimeError(
             "Install the agents dependency group to use remote Embedding models."
         ) from error
-    return RoutingModelRuntime(
+    return RoutingModelComponents(
         chat_provider=chat_provider,
         reranker_client=reranker_client,
         embedding_client=embedding_client,
@@ -209,6 +205,6 @@ __all__ = [
     "EmbeddingBatch",
     "RerankBatch",
     "RerankerClient",
-    "RoutingModelRuntime",
-    "create_routing_model_runtime",
+    "RoutingModelComponents",
+    "create_routing_model_components",
 ]

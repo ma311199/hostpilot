@@ -96,9 +96,7 @@ class TurnLifecycleManager:
 
     async def cancel_all(self) -> None:
         current = asyncio.current_task()
-        tasks = [
-            active.task for active in self._active.values() if active.task is not current
-        ]
+        tasks = [active.task for active in self._active.values() if active.task is not current]
         for task in tasks:
             task.cancel()
         if tasks:

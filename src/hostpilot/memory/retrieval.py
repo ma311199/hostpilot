@@ -71,12 +71,9 @@ def rank_text_indexes(query: str, texts: Sequence[str]) -> tuple[int, ...]:
             if not frequency:
                 continue
             inverse_document_frequency = math.log1p(
-                (len(texts) - document_frequency[term] + 0.5)
-                / (document_frequency[term] + 0.5)
+                (len(texts) - document_frequency[term] + 0.5) / (document_frequency[term] + 0.5)
             )
-            normalization = frequency + 1.2 * (
-                0.25 + 0.75 * length / max(1.0, average_length)
-            )
+            normalization = frequency + 1.2 * (0.25 + 0.75 * length / max(1.0, average_length))
             score += query_frequency * inverse_document_frequency * frequency * 2.2 / normalization
         if score > 0:
             scored.append((score, index))

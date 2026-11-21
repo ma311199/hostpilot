@@ -6,6 +6,7 @@ from hostpilot.contracts import BudgetContext, BudgetLimits, ContextSnapshot, Mo
 from hostpilot.models import ModelMessage, ModelRequest, ModelResponse, ModelRole
 from hostpilot.models.budget import complete_with_budget
 from hostpilot.observability import TraceContext, TraceEvent, trace_context_scope
+from hostpilot.runtime import RequestContext
 from hostpilot.skills.compensation import (
     CompensationRegistry,
     CompensationStatus,
@@ -32,16 +33,18 @@ def request(*, total_tokens: int = 100) -> SkillExecutionRequest:
     return SkillExecutionRequest(
         "builtin/orchestrator_plan",
         {"task_description": "Prepare the requested report"},
-        ContextSnapshot(request_id="orchestration-test", conversation_id="conversation-1"),
-        RequestBudget.start(
-            BudgetContext(
-                limits=BudgetLimits(
-                    total_tokens=total_tokens,
-                    tool_calls=5,
-                    retrieval_calls=2,
-                    timeout_seconds=30,
+        RequestContext(
+            ContextSnapshot(request_id="orchestration-test", session_id="conversation-1"),
+            RequestBudget.start(
+                BudgetContext(
+                    limits=BudgetLimits(
+                        total_tokens=total_tokens,
+                        tool_calls=5,
+                        retrieval_calls=2,
+                        timeout_seconds=30,
+                    )
                 )
-            )
+            ),
         ),
     )
 
@@ -324,7 +327,7 @@ def test_plan_reasoning_overage_blocks_queued_model_and_dependent_tool_tasks() -
                 await complete_with_budget(
                     self.model,
                     ModelRequest(messages=(ModelMessage(ModelRole.USER, call.task.description),)),
-                    call.request.budget,
+                    call.request.request_context.budget,
                 )
             else:
                 self.tool_calls.append(call.task.task_id)

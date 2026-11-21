@@ -15,8 +15,8 @@ class FakeStateReader:
         self.messages = messages
         self.requested_ids: list[str] = []
 
-    async def read_messages(self, conversation_id: str) -> tuple[ConversationMessage, ...]:
-        self.requested_ids.append(conversation_id)
+    async def read_messages(self, session_id: str) -> tuple[ConversationMessage, ...]:
+        self.requested_ids.append(session_id)
         return self.messages
 
 
@@ -25,7 +25,7 @@ def test_context_builder_loads_one_session_and_bounds_context(tmp_path: Path) ->
         conversations = SQLiteConversationStore(tmp_path / "hostpilot.sqlite3")
         conversation = await conversations.create("Context")
         memory = MarkdownMemoryStore(tmp_path / "memory")
-        memory.write_session_summary(conversation.conversation_id, "session summary")
+        memory.write_session_summary(conversation.session_id, "session summary")
         memory.write_long_term_memory("shared memory")
         controller = MemoryController(
             memory,
@@ -45,13 +45,13 @@ def test_context_builder_loads_one_session_and_bounds_context(tmp_path: Path) ->
             max_memory_chars=100,
         )
 
-        context = await builder.build(conversation.conversation_id)
+        context = await builder.build(conversation.session_id)
 
-        assert context.conversation_id == conversation.conversation_id
+        assert context.session_id == conversation.session_id
         assert context.session_summary == "session summary"
         assert context.long_term_memory == "shared memory"
         assert [message.content for message in context.messages] == ["message 2", "message 3"]
-        assert reader.requested_ids == [conversation.conversation_id]
+        assert reader.requested_ids == [conversation.session_id]
 
     asyncio.run(scenario())
 

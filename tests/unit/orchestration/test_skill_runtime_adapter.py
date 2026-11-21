@@ -12,17 +12,18 @@ from hostpilot.contracts import (
     Route,
 )
 from hostpilot.observability import TraceContext, TraceEvent, trace_context_scope
-from hostpilot.orchestration.runtime import AgentResponse
+from hostpilot.orchestration.runtime import ChatAgentResponse
 from hostpilot.orchestration.skill_runtime import (
-    SkillRuntimeAgentAdapter,
+    SkillEngineAgentAdapter,
     SkillSelection,
     _render_result,
 )
+from hostpilot.runtime import RequestContext
 from hostpilot.skills.runtime import SkillExecutionResult, SkillExecutionStatus
 
 
 def context() -> ContextSnapshot:
-    return ContextSnapshot(request_id="request-1", conversation_id="conversation-1")
+    return ContextSnapshot(request_id="request-1", session_id="conversation-1")
 
 
 def budget() -> RequestBudget:
@@ -38,23 +39,31 @@ def budget() -> RequestBudget:
     )
 
 
+def request_context(confirmation_provider=None) -> RequestContext:
+    return RequestContext(
+        snapshot=context(),
+        budget=budget(),
+        confirmation_provider=confirmation_provider,
+    )
+
+
 class FakeChatRuntime:
     def __init__(self) -> None:
         self.turns = []
         self.responses = []
 
-    async def read_messages(self, conversation_id: str):
+    async def read_messages(self, session_id: str):
         return (ConversationMessage(role=MessageRole.USER, content="prior"),)
 
-    async def respond(self, message, context, *, budget=None, confirmation_provider=None):
-        self.responses.append((message, context, budget, confirmation_provider))
-        return AgentResponse("fallback response")
+    async def respond(self, message, request_context):
+        self.responses.append((message, request_context))
+        return ChatAgentResponse("fallback response")
 
-    async def record_turn(self, conversation_id, user_message, assistant_message):
-        self.turns.append((conversation_id, user_message, assistant_message))
+    async def record_turn(self, session_id, user_message, assistant_message):
+        self.turns.append((session_id, user_message, assistant_message))
 
 
-class FakeSkillRuntime:
+class FakeSkillEngine:
     def __init__(self, result: SkillExecutionResult) -> None:
         self.result = result
         self.requests = []
@@ -68,38 +77,35 @@ class FakeSelector:
     def __init__(self, selection: SkillSelection | None) -> None:
         self.selection = selection
 
-    async def select(self, message, context, *, budget):
-        del message, context, budget
+    async def select(self, message, request_context):
+        self.request_context = request_context
+        del message
         return self.selection
 
 
 def test_selected_skill_executes_and_persists_through_chat_runtime() -> None:
     chat_runtime = FakeChatRuntime()
-    skill_runtime = FakeSkillRuntime(
+    skill_runtime = FakeSkillEngine(
         SkillExecutionResult(SkillExecutionStatus.COMPLETED, output={"message": "Skill result"})
     )
     selector = FakeSelector(SkillSelection("builtin/direct_answer", {"message": "hello"}, "direct"))
-    adapter = SkillRuntimeAgentAdapter(chat_runtime, skill_runtime, selector)
+    adapter = SkillEngineAgentAdapter(chat_runtime, skill_runtime, selector)
     confirmation_provider = object()
+    request = request_context(confirmation_provider)
 
-    response = asyncio.run(
-        adapter.respond(
-            "hello",
-            context(),
-            budget=budget(),
-            confirmation_provider=confirmation_provider,
-        )
-    )
+    response = asyncio.run(adapter.respond("hello", request))
 
     assert response.content == "Skill result"
     assert chat_runtime.responses == []
     assert chat_runtime.turns == [("conversation-1", "hello", "Skill result")]
     assert skill_runtime.requests[0].skill_id == "builtin/direct_answer"
-    assert skill_runtime.requests[0].confirmation_provider is confirmation_provider
+    assert selector.request_context is request
+    assert skill_runtime.requests[0].request_context is request
+    assert skill_runtime.requests[0].request_context.confirmation_provider is confirmation_provider
     assert skill_runtime.requests[0].idempotency_key == "request-1"
 
 
-def test_selected_deepagents_skill_uses_only_the_chat_skill_entry() -> None:
+def test_selected_markdown_skill_uses_only_the_chat_skill_entry() -> None:
     class DeepAgentsChatRuntime(FakeChatRuntime):
         def __init__(self) -> None:
             super().__init__()
@@ -108,22 +114,20 @@ def test_selected_deepagents_skill_uses_only_the_chat_skill_entry() -> None:
         async def respond_with_skill(
             self,
             message,
-            context,
+            request_context,
             *,
             skill_id,
-            budget=None,
-            confirmation_provider=None,
         ):
-            self.selected_skills.append((message, skill_id, budget, confirmation_provider))
-            return AgentResponse(
+            self.selected_skills.append((message, skill_id, request_context))
+            return ChatAgentResponse(
                 "Markdown Skill result",
                 token_usage=ModelTokenUsage(input_tokens=3, output_tokens=2, total_tokens=5),
                 budget_usage_accounted=True,
             )
 
     chat_runtime = DeepAgentsChatRuntime()
-    skill_runtime = FakeSkillRuntime(SkillExecutionResult(SkillExecutionStatus.COMPLETED))
-    adapter = SkillRuntimeAgentAdapter(
+    skill_runtime = FakeSkillEngine(SkillExecutionResult(SkillExecutionStatus.COMPLETED))
+    adapter = SkillEngineAgentAdapter(
         chat_runtime,
         skill_runtime,
         FakeSelector(
@@ -131,73 +135,206 @@ def test_selected_deepagents_skill_uses_only_the_chat_skill_entry() -> None:
                 "legacy/meeting-notes",
                 {"message": "summarize"},
                 "markdown_match",
-                execution_mode="deepagents",
+                execution_mode="markdown",
             )
         ),
     )
     request_budget = budget()
     confirmation_provider = object()
+    request = RequestContext(context(), request_budget, confirmation_provider)
 
-    response = asyncio.run(
-        adapter.respond(
-            "summarize",
-            context(),
-            budget=request_budget,
-            confirmation_provider=confirmation_provider,
-        )
-    )
+    response = asyncio.run(adapter.respond("summarize", request))
 
     assert response.content == "Markdown Skill result"
     assert response.budget_usage_accounted is True
     assert request_budget.snapshot().usage.total_tokens == 0
-    assert chat_runtime.selected_skills == [
-        ("summarize", "legacy/meeting-notes", request_budget, confirmation_provider)
-    ]
+    assert chat_runtime.selected_skills == [("summarize", "legacy/meeting-notes", request)]
     assert skill_runtime.requests == []
 
 
-def test_deepagents_failure_falls_back_to_plan_with_reason_and_candidates() -> None:
+def test_markdown_executor_accounts_unmanaged_token_usage_once() -> None:
+    token_usage = ModelTokenUsage(input_tokens=3, output_tokens=2, total_tokens=5)
+
+    class DeepAgentsChatRuntime(FakeChatRuntime):
+        async def respond_with_skill(self, message, request_context, *, skill_id):
+            del message, request_context, skill_id
+            return ChatAgentResponse(
+                "Markdown Skill result",
+                token_usage=token_usage,
+                budget_usage_accounted=False,
+            )
+
+    request_budget = budget()
+    adapter = SkillEngineAgentAdapter(
+        DeepAgentsChatRuntime(),
+        FakeSkillEngine(SkillExecutionResult(SkillExecutionStatus.FAILED)),
+        FakeSelector(
+            SkillSelection(
+                "legacy/meeting-notes",
+                {"message": "summarize"},
+                "markdown_match",
+                execution_mode="markdown",
+            )
+        ),
+    )
+
+    response = asyncio.run(adapter.respond("summarize", RequestContext(context(), request_budget)))
+
+    assert response.content == "Markdown Skill result"
+    assert response.token_usage == token_usage
+    assert response.budget_usage_accounted is True
+    assert request_budget.snapshot().usage.total_tokens == 5
+
+
+def test_yaml_and_markdown_skills_share_the_injected_executor_contract() -> None:
+    class RecordingExecutor:
+        def __init__(self, output: str) -> None:
+            self.output = output
+            self.requests = []
+
+        async def execute(self, request):
+            self.requests.append(request)
+            return SkillExecutionResult(
+                SkillExecutionStatus.COMPLETED,
+                output=self.output,
+            )
+
+    chat_runtime = FakeChatRuntime()
+    yaml_executor = RecordingExecutor("YAML result")
+    markdown_executor = RecordingExecutor("Markdown result")
+    selector = FakeSelector(
+        SkillSelection(
+            "business/notes",
+            {"notes": "private input"},
+            "yaml_selected",
+            execution_mode="yaml",
+        )
+    )
+    adapter = SkillEngineAgentAdapter(
+        chat_runtime,
+        FakeSkillEngine(SkillExecutionResult(SkillExecutionStatus.FAILED)),
+        selector,
+        skill_executors={"yaml": yaml_executor, "markdown": markdown_executor},
+    )
+    request = request_context()
+
+    yaml_response = asyncio.run(adapter.respond("summarize", request))
+    selector.selection = SkillSelection(
+        "legacy/meeting-notes",
+        {"message": "summarize"},
+        "markdown_selected",
+        execution_mode="markdown",
+    )
+    markdown_response = asyncio.run(adapter.respond("summarize", request))
+
+    assert yaml_response.content == "YAML result"
+    assert markdown_response.content == "Markdown result"
+    assert yaml_executor.requests[0].request_context is request
+    assert yaml_executor.requests[0].skill_id == "business/notes"
+    assert markdown_executor.requests[0].request_context is request
+    assert markdown_executor.requests[0].skill_id == "legacy/meeting-notes"
+    assert chat_runtime.responses == []
+
+
+def test_missing_markdown_executor_falls_back_without_running_yaml_executor() -> None:
+    yaml_executor = FakeSkillEngine(
+        SkillExecutionResult(SkillExecutionStatus.COMPLETED, output={"answer": "wrong format"})
+    )
+    selector = FakeSelector(
+        SkillSelection(
+            "legacy/meeting-notes",
+            {"message": "summarize"},
+            "markdown_selected",
+            execution_mode="markdown",
+        )
+    )
+    adapter = SkillEngineAgentAdapter(
+        FakeChatRuntime(),
+        yaml_executor,
+        selector,
+        skill_executors={"yaml": yaml_executor},
+    )
+
+    response = asyncio.run(adapter.respond("summarize", request_context()))
+
+    assert response.route is Route.PLAN_EXECUTE
+    assert "skill_executor_unavailable:markdown" in response.content
+    assert [request.skill_id for request in yaml_executor.requests] == ["builtin/orchestrator_plan"]
+
+
+def test_markdown_runtime_without_skill_hook_falls_back_as_known_unexecuted() -> None:
+    class PlanFallbackRuntime(FakeSkillEngine):
+        async def execute(self, request):
+            self.requests.append(request)
+            if request.skill_id == "builtin/orchestrator_plan":
+                return SkillExecutionResult(
+                    SkillExecutionStatus.COMPLETED,
+                    output={"answer": "Plan result"},
+                )
+            return SkillExecutionResult(SkillExecutionStatus.FAILED)
+
+    skill_engine = PlanFallbackRuntime(SkillExecutionResult(SkillExecutionStatus.FAILED))
+    adapter = SkillEngineAgentAdapter(
+        FakeChatRuntime(),
+        skill_engine,
+        FakeSelector(
+            SkillSelection(
+                "legacy/meeting-notes",
+                {"message": "summarize"},
+                "markdown_selected",
+                execution_mode="markdown",
+            )
+        ),
+    )
+
+    response = asyncio.run(adapter.respond("summarize", request_context()))
+
+    assert response.route is Route.PLAN_EXECUTE
+    assert "skill_executor_unavailable:markdown" in response.content
+    assert skill_engine.requests[0].payload["previous_execution_outcome_uncertain"] is False
+
+
+def test_markdown_failure_falls_back_to_plan_with_reason_and_candidates() -> None:
     class FailingDeepAgentsRuntime(FakeChatRuntime):
         async def respond_with_skill(
             self,
             message,
-            context,
+            request_context,
             *,
             skill_id,
-            budget=None,
-            confirmation_provider=None,
         ):
             raise RuntimeError("graph failed")
 
     chat_runtime = FailingDeepAgentsRuntime()
-    skill_runtime = FakeSkillRuntime(
+    skill_runtime = FakeSkillEngine(
         SkillExecutionResult(SkillExecutionStatus.COMPLETED, output={"answer": "Plan result"})
     )
     selection = SkillSelection(
         "legacy/meeting-notes",
         {"message": "summarize"},
         "markdown_match",
-        execution_mode="deepagents",
+        execution_mode="markdown",
         candidate_skill_ids=("business/notes",),
     )
-    adapter = SkillRuntimeAgentAdapter(chat_runtime, skill_runtime, FakeSelector(selection))
+    adapter = SkillEngineAgentAdapter(chat_runtime, skill_runtime, FakeSelector(selection))
 
-    response = asyncio.run(adapter.respond("summarize", context(), budget=budget()))
+    response = asyncio.run(adapter.respond("summarize", request_context()))
 
     assert response.route is Route.PLAN_EXECUTE
     assert response.content.startswith("Plan result")
-    assert "deepagents_execution_RuntimeError" in response.content
+    assert "markdown_execution_RuntimeError" in response.content
     assert skill_runtime.requests[0].skill_id == "builtin/orchestrator_plan"
     assert skill_runtime.requests[0].payload["evaluation_failure_reason"] == (
-        "deepagents_execution_RuntimeError"
+        "markdown_execution_RuntimeError"
     )
     assert skill_runtime.requests[0].payload["candidate_skill_ids"] == ["business/notes"]
 
 
-def test_deepagents_result_assessment_failure_falls_back_to_read_only_plan() -> None:
+def test_markdown_result_assessment_failure_falls_back_to_read_only_plan() -> None:
     class AssessingSelector(FakeSelector):
-        async def assess_deepagents_result(self, skill_id, goal, result, context, *, budget):
-            del skill_id, goal, result, context, budget
+        async def assess_markdown_result(self, skill_id, goal, result, request_context):
+            self.request_context = request_context
+            del skill_id, goal, result
             return (
                 False,
                 "requested_decisions_missing",
@@ -208,23 +345,22 @@ def test_deepagents_result_assessment_failure_falls_back_to_read_only_plan() -> 
         async def respond_with_skill(
             self,
             message,
-            context,
+            request_context,
             *,
             skill_id,
-            budget=None,
-            confirmation_provider=None,
         ):
-            del message, context, skill_id, budget, confirmation_provider
-            return AgentResponse(
+            del message, skill_id
+            self.request_context = request_context
+            return ChatAgentResponse(
                 "The answer skipped decisions.",
                 token_usage=ModelTokenUsage(input_tokens=8, output_tokens=3, total_tokens=11),
                 budget_usage_accounted=True,
             )
 
-    skill_runtime = FakeSkillRuntime(
+    skill_runtime = FakeSkillEngine(
         SkillExecutionResult(SkillExecutionStatus.COMPLETED, output={"answer": "checked"})
     )
-    adapter = SkillRuntimeAgentAdapter(
+    adapter = SkillEngineAgentAdapter(
         DeepAgentsChatRuntime(),
         skill_runtime,
         AssessingSelector(
@@ -232,15 +368,18 @@ def test_deepagents_result_assessment_failure_falls_back_to_read_only_plan() -> 
                 "legacy/meeting-notes",
                 {"message": "summarize"},
                 "selected",
-                execution_mode="deepagents",
+                execution_mode="markdown",
                 candidate_skill_ids=("business/notes",),
             )
         ),
     )
 
-    response = asyncio.run(adapter.respond("summarize", context(), budget=budget()))
+    request = request_context()
+    response = asyncio.run(adapter.respond("summarize", request))
 
     assert response.route is Route.PLAN_EXECUTE
+    assert adapter.selector.request_context is request
+    assert skill_runtime.requests[0].request_context is request
     assert "requested_decisions_missing" in response.content
     assert skill_runtime.requests[0].payload["previous_execution_outcome_uncertain"] is True
     assert response.token_usage == ModelTokenUsage(
@@ -253,7 +392,7 @@ def test_deepagents_result_assessment_failure_falls_back_to_read_only_plan() -> 
 def test_yaml_execution_failure_falls_back_to_plan() -> None:
     chat_runtime = FakeChatRuntime()
 
-    class PlanFallbackRuntime(FakeSkillRuntime):
+    class PlanFallbackRuntime(FakeSkillEngine):
         async def execute(self, request):
             self.requests.append(request)
             if request.skill_id == "builtin/orchestrator_plan":
@@ -267,7 +406,7 @@ def test_yaml_execution_failure_falls_back_to_plan() -> None:
             )
 
     skill_runtime = PlanFallbackRuntime(SkillExecutionResult(SkillExecutionStatus.FAILED))
-    adapter = SkillRuntimeAgentAdapter(
+    adapter = SkillEngineAgentAdapter(
         chat_runtime,
         skill_runtime,
         FakeSelector(
@@ -280,7 +419,7 @@ def test_yaml_execution_failure_falls_back_to_plan() -> None:
         ),
     )
 
-    response = asyncio.run(adapter.respond("summarize", context(), budget=budget()))
+    response = asyncio.run(adapter.respond("summarize", request_context()))
 
     assert response.route is Route.PLAN_EXECUTE
     assert response.content.startswith("Plan result")
@@ -294,7 +433,7 @@ def test_yaml_execution_failure_falls_back_to_plan() -> None:
 def test_plan_fallback_clarification_uses_clarify_route() -> None:
     prompt = "请补充事件的具体日期和参会人邮箱。"
 
-    class PlanFallbackRuntime(FakeSkillRuntime):
+    class PlanFallbackRuntime(FakeSkillEngine):
         async def execute(self, request):
             self.requests.append(request)
             if request.skill_id == "builtin/orchestrator_plan":
@@ -306,13 +445,13 @@ def test_plan_fallback_clarification_uses_clarify_route() -> None:
             return SkillExecutionResult(SkillExecutionStatus.FAILED)
 
     skill_runtime = PlanFallbackRuntime(SkillExecutionResult(SkillExecutionStatus.FAILED))
-    adapter = SkillRuntimeAgentAdapter(
+    adapter = SkillEngineAgentAdapter(
         FakeChatRuntime(),
         skill_runtime,
         FakeSelector(SkillSelection("business/meeting-minutes", {}, "selected")),
     )
 
-    response = asyncio.run(adapter.respond("Schedule and notify", context(), budget=budget()))
+    response = asyncio.run(adapter.respond("Schedule and notify", request_context()))
 
     assert response.route is Route.CLARIFY
     assert response.clarification_prompt == prompt
@@ -328,12 +467,12 @@ def test_selected_skill_records_safe_child_span() -> None:
             self.events.append(event)
 
     trace_id = uuid4()
-    request_context = context().model_copy(update={"request_id": str(trace_id)})
+    request = RequestContext(context().model_copy(update={"request_id": str(trace_id)}), budget())
     root_span = TraceContext(trace_id=trace_id)
     trace = TraceRecorder()
-    adapter = SkillRuntimeAgentAdapter(
+    adapter = SkillEngineAgentAdapter(
         FakeChatRuntime(),
-        FakeSkillRuntime(
+        FakeSkillEngine(
             SkillExecutionResult(SkillExecutionStatus.COMPLETED, output={"message": "ok"})
         ),
         FakeSelector(
@@ -348,7 +487,7 @@ def test_selected_skill_records_safe_child_span() -> None:
     )
 
     with trace_context_scope(root_span):
-        asyncio.run(adapter.respond("private prompt", request_context, budget=budget()))
+        asyncio.run(adapter.respond("private prompt", request))
 
     assert len(trace.events) == 1
     event = trace.events[0]
@@ -362,20 +501,22 @@ def test_selected_skill_records_safe_child_span() -> None:
 
 def test_unselected_request_uses_existing_chat_runtime() -> None:
     chat_runtime = FakeChatRuntime()
-    skill_runtime = FakeSkillRuntime(SkillExecutionResult(SkillExecutionStatus.COMPLETED))
-    adapter = SkillRuntimeAgentAdapter(chat_runtime, skill_runtime, FakeSelector(None))
+    skill_runtime = FakeSkillEngine(SkillExecutionResult(SkillExecutionStatus.COMPLETED))
+    adapter = SkillEngineAgentAdapter(chat_runtime, skill_runtime, FakeSelector(None))
 
-    response = asyncio.run(adapter.respond("ordinary", context(), budget=budget()))
+    request = request_context()
+    response = asyncio.run(adapter.respond("ordinary", request))
 
     assert response.content == "fallback response"
     assert len(chat_runtime.responses) == 1
+    assert chat_runtime.responses[0][1] is request
     assert skill_runtime.requests == []
 
 
 def test_skill_failure_is_rendered_as_user_facing_status() -> None:
-    adapter = SkillRuntimeAgentAdapter(
+    adapter = SkillEngineAgentAdapter(
         FakeChatRuntime(),
-        FakeSkillRuntime(
+        FakeSkillEngine(
             SkillExecutionResult(
                 SkillExecutionStatus.FAILED,
                 output={"error_code": "budget_exceeded"},
@@ -384,7 +525,7 @@ def test_skill_failure_is_rendered_as_user_facing_status() -> None:
         FakeSelector(SkillSelection("builtin/orchestrator_plan", {}, "plan")),
     )
 
-    response = asyncio.run(adapter.respond("plan this", context(), budget=budget()))
+    response = asyncio.run(adapter.respond("plan this", request_context()))
 
     assert response.content == "Skill 执行失败：budget_exceeded"
 
@@ -399,9 +540,9 @@ def test_adapter_delegates_message_history_and_close() -> None:
             self.closed = True
 
     runtime = ClosableRuntime()
-    adapter = SkillRuntimeAgentAdapter(
+    adapter = SkillEngineAgentAdapter(
         runtime,
-        FakeSkillRuntime(SkillExecutionResult(SkillExecutionStatus.COMPLETED)),
+        FakeSkillEngine(SkillExecutionResult(SkillExecutionStatus.COMPLETED)),
         FakeSelector(None),
     )
 

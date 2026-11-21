@@ -16,6 +16,7 @@ from jsonschema import ValidationError as JsonSchemaValidationError
 
 from hostpilot.budget import BudgetExceededError, RequestBudget
 from hostpilot.contracts import BudgetContext, ContextSnapshot, ModelTokenUsage
+from hostpilot.runtime import RequestContext
 from hostpilot.skills.compensation import (
     CancellationSink,
     CancellationSnapshot,
@@ -209,17 +210,19 @@ class DirectAnswerExecutor:
         message = request.payload.get("message")
         if not isinstance(message, str) or not message.strip():
             raise SkillInputError("direct_answer requires a non-empty message.")
-        completion = await self.llm.complete(message, request.context, budget=request.budget)
+        completion = await self.llm.complete(
+            message, request.request_context.snapshot, budget=request.request_context.budget
+        )
         if isinstance(completion, SingleTurnCompletion):
             answer = completion.text
             token_usage = completion.token_usage
             if token_usage is not None and not completion.budget_usage_accounted:
-                request.budget.consume_tokens(token_usage.total_tokens)
+                request.request_context.budget.consume_tokens(token_usage.total_tokens)
         else:
             answer = completion
             token_usage = None
         if not answer.strip():
-            raise SkillRuntimeError("direct_answer returned an empty response.")
+            raise SkillEngineError("direct_answer returned an empty response.")
         return SkillExecutionResult(
             SkillExecutionStatus.COMPLETED,
             output={"message": answer},
@@ -361,10 +364,8 @@ class BuiltinExecutorRegistry:
 class SkillExecutionRequest:
     skill_id: str
     payload: Mapping[str, Any]
-    context: ContextSnapshot
-    budget: RequestBudget
+    request_context: RequestContext
     idempotency_key: str | None = None
-    confirmation_provider: AsyncConfirmationProvider | None = None
     delegation_depth: int = 0
     original_goal: str | None = None
     candidate_skill_ids: tuple[str, ...] = ()
@@ -387,6 +388,16 @@ class SkillExecutionResult:
     token_usage: ModelTokenUsage | None = None
 
 
+class SkillExecutor(Protocol):
+    """Execute a normalized Skill request behind the Runtime governance boundary."""
+
+    async def execute(self, request: SkillExecutionRequest) -> SkillExecutionResult: ...
+
+
+class SkillExecutorUnavailableError(RuntimeError):
+    """Raised when an adapter cannot start because its execution hook is absent."""
+
+
 class PlanFallbackPort(Protocol):
     async def execute_fallback(
         self,
@@ -397,31 +408,31 @@ class PlanFallbackPort(Protocol):
     ) -> SkillExecutionResult: ...
 
 
-class SkillRuntimeError(RuntimeError):
+class SkillEngineError(RuntimeError):
     """Raised when a Skill contract or runtime dispatch cannot be honored."""
 
 
-class SkillInputError(SkillRuntimeError):
+class SkillInputError(SkillEngineError):
     """Raised when input does not satisfy the Skill's JSON Schema."""
 
 
-class SkillOutputError(SkillRuntimeError):
+class SkillOutputError(SkillEngineError):
     """Raised when output does not satisfy the Skill's JSON Schema."""
 
 
-class UnknownBuiltinExecutorError(SkillRuntimeError):
+class UnknownBuiltinExecutorError(SkillEngineError):
     """Raised when a builtin skill_type has no registered native executor."""
 
 
-class UnknownSkillActionError(SkillRuntimeError):
+class UnknownSkillActionError(SkillEngineError):
     """Raised when a workflow names an unregistered action."""
 
 
-class SkillAdmissionError(SkillRuntimeError):
+class SkillAdmissionError(SkillEngineError):
     """Raised when admission policy rejects or cannot assess a business Skill."""
 
 
-class SkillRuntime:
+class SkillEngine:
     """Execute registered builtins or bounded YAML workflows through adapters."""
 
     def __init__(
@@ -456,7 +467,7 @@ class SkillRuntime:
     async def execute(self, request: SkillExecutionRequest) -> SkillExecutionResult:
         """Validate, assess, and dispatch one Skill invocation."""
         if request.delegation_depth >= self.max_delegation_depth:
-            raise SkillRuntimeError("Skill delegation depth limit exceeded.")
+            raise SkillEngineError("Skill delegation depth limit exceeded.")
         if request.skill_id.startswith("builtin/"):
             definition, executor = self.builtins.get_for_skill(request.skill_id)
             _validate_json_schema(
@@ -501,7 +512,7 @@ class SkillRuntime:
 
         execution = manifest.execution
         if execution.kind == "builtin":
-            raise SkillRuntimeError("User Skill packages cannot select builtin executors.")
+            raise SkillEngineError("User Skill packages cannot select builtin executors.")
         return await self._execute_workflow(package, request)
 
     async def _execute_workflow(
@@ -510,7 +521,7 @@ class SkillRuntime:
         manifest = package.manifest
         steps = manifest.execution.steps
         if len(steps) > self.max_steps:
-            raise SkillRuntimeError("Workflow exceeds the configured step limit.")
+            raise SkillEngineError("Workflow exceeds the configured step limit.")
 
         # Resolve every action and its risk before invoking the first side-effecting step.
         registrations = tuple(self.actions.get(step.action) for step in steps)
@@ -521,34 +532,37 @@ class SkillRuntime:
             if registration.tool_id is not None and registration.tool_id not in declared_tools
         }
         if undeclared_tools:
-            raise SkillRuntimeError(
+            raise SkillEngineError(
                 "Workflow uses undeclared tools: " + ", ".join(sorted(undeclared_tools))
             )
         maximum_risk = max(
             (registration.side_effect_level for registration in registrations), key=_risk_rank
         )
         if _risk_rank(maximum_risk) > _risk_rank(manifest.side_effect_level):
-            raise SkillRuntimeError("Workflow action risk exceeds declared side_effect_level.")
+            raise SkillEngineError("Workflow action risk exceeds declared side_effect_level.")
 
         started_at = datetime.now(UTC)
         snapshot = SkillExecutionSnapshot(
-            request_id=request.context.request_id,
+            request_id=request.request_context.snapshot.request_id,
             skill_id=package.skill_id,
             manifest_hash=package.content_hash,
             manifest_version=manifest.meta.version,
             started_at=started_at,
-            budget=request.budget.snapshot(),
+            budget=request.request_context.budget.snapshot(),
         )
         try:
             admission = await self.admission_assessor.assess(
-                package, request.payload, request.context, budget=request.budget
+                package,
+                request.payload,
+                request.request_context.snapshot,
+                budget=request.request_context.budget,
             )
         except Exception as error:
             snapshot = _replace_snapshot(
                 snapshot,
                 failure_code=f"admission_assessor_{type(error).__name__}",
                 completed_at=datetime.now(UTC),
-                budget=request.budget.snapshot(),
+                budget=request.request_context.budget.snapshot(),
             )
             return SkillExecutionResult(SkillExecutionStatus.HUMAN_REVIEW, snapshot=snapshot)
         snapshot = _replace_snapshot(snapshot, admission=admission)
@@ -569,7 +583,7 @@ class SkillRuntime:
                 snapshot,
                 failure_code=f"admission_rejected_{admission.reason_code}",
                 completed_at=datetime.now(UTC),
-                budget=request.budget.snapshot(),
+                budget=request.request_context.budget.snapshot(),
             )
             return SkillExecutionResult(
                 SkillExecutionStatus.FAILED,
@@ -589,7 +603,7 @@ class SkillRuntime:
             registration = registrations_by_step[step.step_id]
             step_outputs = state["step_outputs"]
             try:
-                request.budget.ensure_available()
+                request.request_context.budget.ensure_available()
             except BudgetExceededError:
                 return {
                     "step_states": {
@@ -613,10 +627,10 @@ class SkillRuntime:
                     step_id=step.step_id,
                     inputs=MappingProxyType(mapped_inputs),
                     params=MappingProxyType(dict(step.params)),
-                    context=request.context,
-                    budget=request.budget,
+                    context=request.request_context.snapshot,
+                    budget=request.request_context.budget,
                     idempotency_key=idempotency_key,
-                    confirmation_provider=request.confirmation_provider,
+                    confirmation_provider=request.request_context.confirmation_provider,
                 )
                 if registration.prepare_compensation is not None:
                     handle = await registration.prepare_compensation(call)
@@ -632,7 +646,9 @@ class SkillRuntime:
                 if action_result.token_usage is not None:
                     step_token_usages[step.step_id] = action_result.token_usage
                     if not action_result.budget_usage_accounted:
-                        request.budget.consume_tokens(action_result.token_usage.total_tokens)
+                        request.request_context.budget.consume_tokens(
+                            action_result.token_usage.total_tokens
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -706,12 +722,12 @@ class SkillRuntime:
             uncertain_effects = tuple(in_flight_effects.values())
             all_effects = (*completed_effects, *uncertain_effects)
             compensation_records = await self.compensation_registry.compensate(
-                request_id=request.context.request_id,
-                context=request.context,
-                budget=request.budget,
+                request_id=request.request_context.snapshot.request_id,
+                context=request.request_context.snapshot,
+                budget=request.request_context.budget,
                 effects=completed_effects,
                 uncertain_effects=uncertain_effects,
-                confirmation_provider=request.confirmation_provider,
+                confirmation_provider=request.request_context.confirmation_provider,
             )
             snapshot = _replace_snapshot(
                 snapshot,
@@ -720,12 +736,12 @@ class SkillRuntime:
                 side_effects=all_effects,
                 compensation_records=compensation_records,
                 step_token_usage=_sum_model_usages(tuple(step_token_usages.values())),
-                budget=request.budget.snapshot(),
+                budget=request.request_context.budget.snapshot(),
             )
             cancellation_snapshot = await persist_cancellation(
                 self.cancellation_sink,
                 CancellationSnapshot(
-                    request_id=request.context.request_id,
+                    request_id=request.request_context.snapshot.request_id,
                     scope=package.skill_id,
                     uncertain_operations=tuple(in_flight_effects),
                     side_effects=all_effects,
@@ -760,7 +776,7 @@ class SkillRuntime:
                 if (tool_id := workflow_state["invoked_tool_ids"].get(step.step_id)) is not None
             ),
             step_token_usage=_sum_model_usages(tuple(step_token_usages.values())),
-            budget=request.budget.snapshot(),
+            budget=request.request_context.budget.snapshot(),
         )
         failed_states = [state for state in step_states if state.status != "completed"]
         if failed_states:
@@ -814,19 +830,19 @@ class SkillRuntime:
                 snapshot,
                 failure_code="output_schema_invalid",
                 completed_at=datetime.now(UTC),
-                budget=request.budget.snapshot(),
+                budget=request.request_context.budget.snapshot(),
             )
             return await self._fallback_or_review(
                 request, snapshot, reason_code="output_schema_invalid"
             )
 
-        snapshot = _replace_snapshot(snapshot, budget=request.budget.snapshot())
+        snapshot = _replace_snapshot(snapshot, budget=request.request_context.budget.snapshot())
         try:
             assessment = await self.result_assessor.assess(
                 package,
                 {"input": dict(request.payload), "output": last_output},
-                request.context,
-                budget=request.budget,
+                request.request_context.snapshot,
+                budget=request.request_context.budget,
                 snapshot=snapshot,
             )
         except Exception as error:
@@ -834,7 +850,7 @@ class SkillRuntime:
                 snapshot,
                 failure_code=f"result_assessor_{type(error).__name__}",
                 completed_at=datetime.now(UTC),
-                budget=request.budget.snapshot(),
+                budget=request.request_context.budget.snapshot(),
             )
             return SkillExecutionResult(
                 SkillExecutionStatus.HUMAN_REVIEW,
@@ -845,7 +861,7 @@ class SkillRuntime:
             snapshot,
             result_assessment=assessment,
             completed_at=datetime.now(UTC),
-            budget=request.budget.snapshot(),
+            budget=request.request_context.budget.snapshot(),
         )
         if assessment.disposition is AssessmentDisposition.ACCEPT:
             return SkillExecutionResult(
@@ -903,7 +919,7 @@ class SkillRuntime:
         if not fallback_safe:
             reason_code = f"{reason_code}_requires_state_reconciliation"
         try:
-            request.budget.ensure_available()
+            request.request_context.budget.ensure_available()
         except BudgetExceededError:
             return SkillExecutionResult(
                 SkillExecutionStatus.FAILED,
@@ -922,23 +938,23 @@ class SkillRuntime:
         if reversible_effects:
             try:
                 compensation_records = await self.compensation_registry.compensate(
-                    request_id=request.context.request_id,
-                    context=request.context,
-                    budget=request.budget,
+                    request_id=request.request_context.snapshot.request_id,
+                    context=request.request_context.snapshot,
+                    budget=request.request_context.budget,
                     effects=reversible_effects,
-                    confirmation_provider=request.confirmation_provider,
+                    confirmation_provider=request.request_context.confirmation_provider,
                 )
             except asyncio.CancelledError as cancellation:
                 cancelled_snapshot = _replace_snapshot(
                     snapshot,
                     failure_code="compensation_cancelled",
                     compensation_records=(),
-                    budget=request.budget.snapshot(),
+                    budget=request.request_context.budget.snapshot(),
                 )
                 cancellation_snapshot = await persist_cancellation(
                     self.cancellation_sink,
                     CancellationSnapshot(
-                        request_id=request.context.request_id,
+                        request_id=request.request_context.snapshot.request_id,
                         scope=snapshot.skill_id,
                         uncertain_operations=tuple(effect.action for effect in reversible_effects),
                         side_effects=snapshot.side_effects,
@@ -1058,7 +1074,7 @@ def _fallback_is_safe(
 def _step_idempotency_key(
     request: SkillExecutionRequest, package: YamlSkillPackage, step: SkillStep
 ) -> str:
-    namespace = request.idempotency_key or request.context.request_id
+    namespace = request.idempotency_key or request.request_context.snapshot.request_id
     return str(
         uuid5(
             NAMESPACE_URL,
@@ -1072,7 +1088,7 @@ def _validate_json_schema(
     value: Any,
     label: str,
     *,
-    error_type: type[SkillRuntimeError] = SkillRuntimeError,
+    error_type: type[SkillEngineError] = SkillEngineError,
 ) -> None:
     try:
         Draft202012Validator(dict(schema)).validate(value)
@@ -1090,7 +1106,7 @@ def _resolve_input_mapping(
             if set(value) == {"$ref"}:
                 reference = value["$ref"]
                 if not isinstance(reference, str):
-                    raise SkillRuntimeError("Step $ref must be a string.")
+                    raise SkillEngineError("Step $ref must be a string.")
                 return _resolve_reference(reference, payload, step_outputs)
             return {key: resolve(item) for key, item in value.items()}
         if isinstance(value, list):
@@ -1107,7 +1123,7 @@ def _resolve_reference(
 ) -> Any:
     parts = reference.split(".")
     if len(parts) < 2 or parts[0] not in {"input", "steps"}:
-        raise SkillRuntimeError(f"Unsupported step reference: {reference}")
+        raise SkillEngineError(f"Unsupported step reference: {reference}")
     source: Any
     if parts[0] == "input":
         source = payload
@@ -1122,7 +1138,7 @@ def _resolve_reference(
             else:
                 raise KeyError(part)
     except (KeyError, IndexError, ValueError) as error:
-        raise SkillRuntimeError(f"Step reference cannot be resolved: {reference}") from error
+        raise SkillEngineError(f"Step reference cannot be resolved: {reference}") from error
     return source
 
 
@@ -1149,9 +1165,10 @@ __all__ = [
     "SkillExecutionResult",
     "SkillExecutionSnapshot",
     "SkillExecutionStatus",
+    "SkillExecutorUnavailableError",
     "SkillInputError",
-    "SkillRuntime",
-    "SkillRuntimeError",
+    "SkillEngine",
+    "SkillEngineError",
     "SkillSideEffect",
     "SkillStepState",
     "StepActionCall",

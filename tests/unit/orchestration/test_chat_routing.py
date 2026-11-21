@@ -6,17 +6,18 @@ from hostpilot.observability import TraceEvent
 from hostpilot.orchestration.chat import ChatService
 from hostpilot.orchestration.skill_runtime import SkillSelection
 from hostpilot.routing import CommandRouter
+from hostpilot.runtime import RequestContext
 
 
 class FakeConversationStore:
-    async def touch(self, conversation_id: str) -> None:
-        self.touched = conversation_id
+    async def touch(self, session_id: str) -> None:
+        self.touched = session_id
 
 
 class FakeContextBuilder:
-    async def build(self, conversation_id: str, *, query: str | None = None) -> ContextSnapshot:
+    async def build(self, session_id: str, *, query: str | None = None) -> ContextSnapshot:
         self.query = query
-        return ContextSnapshot(request_id="request-1", conversation_id=conversation_id)
+        return ContextSnapshot(request_id="request-1", session_id=session_id)
 
 
 class FakeRuntime:
@@ -25,13 +26,13 @@ class FakeRuntime:
 
     async def record_turn(
         self,
-        conversation_id: str,
+        session_id: str,
         user_message: str,
         assistant_message: str,
     ) -> None:
-        self.recorded = (conversation_id, user_message, assistant_message)
+        self.recorded = (session_id, user_message, assistant_message)
 
-    async def respond(self, message: str, context: ContextSnapshot, *, budget=None):
+    async def respond(self, message: str, request_context: RequestContext):
         raise AssertionError("Explicit file commands should use the selected tool path.")
 
 
@@ -68,15 +69,98 @@ def test_chat_service_executes_router_selected_tool_and_records_the_turn() -> No
     asyncio.run(scenario())
 
 
+def test_chat_service_carries_request_context_and_unpacks_legacy_tool_arguments() -> None:
+    async def scenario() -> None:
+        class CapturingChatService(ChatService):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.request_contexts: list[RequestContext] = []
+
+            async def _execute_turn(
+                self,
+                request_context: RequestContext,
+                session_id: str,
+                message: str,
+                started_at: float,
+            ):
+                self.request_contexts.append(request_context)
+                return await super()._execute_turn(
+                    request_context,
+                    session_id,
+                    message,
+                    started_at,
+                )
+
+        class CapturingContextBuilder(FakeContextBuilder):
+            def __init__(self) -> None:
+                self.snapshots: list[ContextSnapshot] = []
+
+            async def build(self, session_id: str, *, query: str | None = None):
+                snapshot = await super().build(session_id, query=query)
+                self.snapshots.append(snapshot)
+                return snapshot
+
+        class ApprovalProvider:
+            pass
+
+        class CapturingToolProvider:
+            def __init__(self) -> None:
+                self.calls: list[tuple[object, object | None]] = []
+
+            async def call_tool(
+                self, name, arguments, *, budget, confirmation_provider=None
+            ) -> str:
+                self.calls.append((budget, confirmation_provider))
+                return "HostPilot workspace"
+
+        builder = CapturingContextBuilder()
+        tools = CapturingToolProvider()
+        service = CapturingChatService(
+            FakeConversationStore(),
+            builder,
+            FakeRuntime(),
+            router=CommandRouter(),
+            tool_provider=tools,
+        )
+        approval = ApprovalProvider()
+
+        await service.send("conversation-1", "/read README.md")
+        await service.send(
+            "conversation-1",
+            "/read README.md",
+            confirmation_provider=approval,
+        )
+
+        assert len(service.request_contexts) == 2
+        assert len(builder.snapshots) == 2
+        assert len(tools.calls) == 2
+        first_context, second_context = service.request_contexts
+        assert first_context.snapshot.request_id == builder.snapshots[0].request_id
+        assert second_context.snapshot.request_id == builder.snapshots[1].request_id
+        assert first_context.snapshot.session_id == "conversation-1"
+        assert second_context.snapshot.session_id == "conversation-1"
+        assert first_context.snapshot.budget is not None
+        assert second_context.snapshot.budget is not None
+        assert first_context.snapshot.budget.usage.total_tokens == 0
+        assert second_context.snapshot.budget.usage.tool_calls == 0
+        assert first_context.confirmation_provider is None
+        assert second_context.confirmation_provider is approval
+        assert first_context.budget is not second_context.budget
+        assert tools.calls[0] == (first_context.budget, None)
+        assert tools.calls[1] == (second_context.budget, approval)
+
+    asyncio.run(scenario())
+
+
 def test_chat_service_records_safe_completion_trace_with_request_id() -> None:
     async def scenario() -> None:
         trace_id = uuid4()
 
         class UUIDContextBuilder(FakeContextBuilder):
-            async def build(self, conversation_id: str, *, query: str | None = None):
+            async def build(self, session_id: str, *, query: str | None = None):
                 return ContextSnapshot(
                     request_id=str(trace_id),
-                    conversation_id=conversation_id,
+                    session_id=session_id,
                 )
 
         class TraceRecorder:
@@ -118,9 +202,9 @@ def test_chat_service_records_safe_completion_trace_with_request_id() -> None:
 def test_route_only_evaluation_selects_skill_without_executing_runtime_or_tools() -> None:
     async def scenario() -> None:
         class Selector:
-            async def select(self, message, context, *, budget):
+            async def select(self, message, request_context):
                 self.message = message
-                self.context = context
+                self.request_context = request_context
                 return SkillSelection(
                     "legacy/office-automation",
                     {"text": "payload must not be returned"},
@@ -145,7 +229,7 @@ def test_route_only_evaluation_selects_skill_without_executing_runtime_or_tools(
         assert result.reason_code == "matched_skill"
         assert runtime.recorded is None
         assert not hasattr(conversations, "touched")
-        assert runtime.selector.context.session_summary is None
-        assert runtime.selector.context.long_term_memory is None
+        assert runtime.selector.request_context.snapshot.session_summary is None
+        assert runtime.selector.request_context.snapshot.long_term_memory is None
 
     asyncio.run(scenario())

@@ -7,7 +7,7 @@ from typing import Literal, TypedDict, cast
 
 import aiosqlite
 
-SkillExecutionMode = Literal["yaml", "deepagents", "both"]
+SkillExecutionMode = Literal["yaml", "markdown", "both"]
 
 
 class SkillExecutionPreference(TypedDict):
@@ -22,16 +22,40 @@ class SQLiteSkillExecutionStore:
         self.database_path = Path(database_path).expanduser()
 
     async def initialize(self) -> None:
-        """Create the execution preference table."""
+        """Create or migrate the execution preference table."""
         async with aiosqlite.connect(self.database_path) as connection:
-            await connection.execute(
-                """CREATE TABLE IF NOT EXISTS skill_execution_preferences (
-                    skill_id TEXT PRIMARY KEY,
-                    execution_mode TEXT NOT NULL
-                      CHECK (execution_mode IN ('yaml', 'deepagents', 'both'))
-                )"""
-            )
-            await connection.commit()
+            await connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'skill_execution_preferences'"
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    await connection.execute(_create_table_sql("skill_execution_preferences"))
+                elif "'deepagents'" in str(row[0]).lower().replace(" ", ""):
+                    await connection.execute(
+                        _create_table_sql("skill_execution_preferences_new")
+                    )
+                    await connection.execute(
+                        """INSERT INTO skill_execution_preferences_new (skill_id, execution_mode)
+                           SELECT skill_id,
+                                  CASE execution_mode
+                                      WHEN 'deepagents' THEN 'markdown'
+                                      ELSE execution_mode
+                                  END
+                           FROM skill_execution_preferences"""
+                    )
+                    await connection.execute("DROP TABLE skill_execution_preferences")
+                    await connection.execute(
+                        "ALTER TABLE skill_execution_preferences_new "
+                        "RENAME TO skill_execution_preferences"
+                    )
+            except Exception:
+                await connection.rollback()
+                raise
+            else:
+                await connection.commit()
 
     async def list(self) -> dict[str, SkillExecutionMode]:
         """Return explicitly saved modes in stable key order."""
@@ -60,6 +84,14 @@ class SQLiteSkillExecutionStore:
                 "DELETE FROM skill_execution_preferences WHERE skill_id = ?", (skill_id,)
             )
             await connection.commit()
+
+
+def _create_table_sql(table_name: str) -> str:
+    return f"""CREATE TABLE {table_name} (
+        skill_id TEXT PRIMARY KEY,
+        execution_mode TEXT NOT NULL
+          CHECK (execution_mode IN ('yaml', 'markdown', 'both'))
+    )"""
 
 
 __all__ = ["SQLiteSkillExecutionStore", "SkillExecutionMode", "SkillExecutionPreference"]

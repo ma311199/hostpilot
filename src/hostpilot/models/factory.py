@@ -9,52 +9,52 @@ from typing import Any
 from hostpilot.config import Settings
 from hostpilot.models.provider import ModelProvider
 
-MODEL_RUNTIME_PLUGIN_API_VERSION = "1.0"
+MODEL_PROVIDER_PLUGIN_API_VERSION = "1.0"
 
 
 @dataclass(frozen=True)
-class ModelRuntime:
+class ModelRuntimeComponents:
     """Provider-neutral client plus the chat-model adapter used by Agent frameworks."""
 
     provider: ModelProvider
     agent_chat_model: Any
 
 
-ModelRuntimeFactory = Callable[[Settings], ModelRuntime]
+ModelRuntimeComponentsFactory = Callable[[Settings], ModelRuntimeComponents]
 
 
-class ModelRuntimeRegistry:
+class ModelProviderRegistry:
     """Create provider and framework adapter pairs from trusted factories."""
 
     def __init__(self) -> None:
-        self._factories: dict[str, tuple[str, ModelRuntimeFactory]] = {}
+        self._factories: dict[str, tuple[str, ModelRuntimeComponentsFactory]] = {}
 
     def register(
         self,
         implementation_id: str,
-        factory: ModelRuntimeFactory,
+        factory: ModelRuntimeComponentsFactory,
         *,
-        api_version: str = MODEL_RUNTIME_PLUGIN_API_VERSION,
+        api_version: str = MODEL_PROVIDER_PLUGIN_API_VERSION,
     ) -> None:
         if not implementation_id or implementation_id.strip() != implementation_id:
             raise ValueError("Model runtime implementation IDs must be non-empty and trimmed.")
-        if api_version != MODEL_RUNTIME_PLUGIN_API_VERSION:
+        if api_version != MODEL_PROVIDER_PLUGIN_API_VERSION:
             raise ValueError(
                 f"Unsupported model runtime plugin API version {api_version!r}; "
-                f"expected {MODEL_RUNTIME_PLUGIN_API_VERSION!r}."
+                f"expected {MODEL_PROVIDER_PLUGIN_API_VERSION!r}."
             )
         if implementation_id in self._factories:
             raise ValueError(f"Model runtime already registered: {implementation_id}.")
         self._factories[implementation_id] = (api_version, factory)
 
-    def create(self, implementation_id: str, settings: Settings) -> ModelRuntime:
+    def create(self, implementation_id: str, settings: Settings) -> ModelRuntimeComponents:
         registered = self._factories.get(implementation_id)
         if registered is None:
             raise ValueError(f"Unknown model runtime implementation: {implementation_id}.")
         _api_version, factory = registered
         runtime = factory(settings)
-        if not isinstance(runtime, ModelRuntime):
-            raise TypeError("Model runtime plugin factory must return ModelRuntime.")
+        if not isinstance(runtime, ModelRuntimeComponents):
+            raise TypeError("Model runtime plugin factory must return ModelRuntimeComponents.")
         if not callable(getattr(runtime.provider, "complete", None)):
             raise TypeError("Model runtime provider must implement complete().")
         if runtime.agent_chat_model is None:
@@ -66,22 +66,22 @@ class ModelRuntimeRegistry:
         return tuple(sorted(self._factories))
 
 
-def create_default_model_runtime_registry() -> ModelRuntimeRegistry:
+def create_default_model_provider_registry() -> ModelProviderRegistry:
     """Register the current OpenAI-compatible model runtime implementation."""
-    registry = ModelRuntimeRegistry()
+    registry = ModelProviderRegistry()
     registry.register("builtin.openai-compatible", _create_openai_compatible_runtime)
     return registry
 
 
-def create_model_runtime(
-    settings: Settings, *, registry: ModelRuntimeRegistry | None = None
-) -> ModelRuntime:
+def create_model_runtime_components(
+    settings: Settings, *, registry: ModelProviderRegistry | None = None
+) -> ModelRuntimeComponents:
     """Create the configured provider and its framework-facing model adapter."""
-    runtime_registry = registry or create_default_model_runtime_registry()
+    runtime_registry = registry or create_default_model_provider_registry()
     return runtime_registry.create(settings.model_provider_plugin, settings)
 
 
-def _create_openai_compatible_runtime(settings: Settings) -> ModelRuntime:
+def _create_openai_compatible_runtime(settings: Settings) -> ModelRuntimeComponents:
     """Create the built-in OpenAI-compatible provider and LangChain adapter."""
     if not settings.model_name or not settings.model_api_key:
         raise ValueError("Model name and API key must be configured before creating the runtime.")
@@ -108,13 +108,13 @@ def _create_openai_compatible_runtime(settings: Settings) -> ModelRuntime:
     )
     provider = OpenAICompatibleChatProvider(agent_chat_model, model_id=settings.model_name)
     framework_model = ProviderChatModel(provider=provider, model_id=settings.model_name)
-    return ModelRuntime(provider=provider, agent_chat_model=framework_model)
+    return ModelRuntimeComponents(provider=provider, agent_chat_model=framework_model)
 
 
 __all__ = [
-    "MODEL_RUNTIME_PLUGIN_API_VERSION",
-    "ModelRuntime",
-    "ModelRuntimeRegistry",
-    "create_default_model_runtime_registry",
-    "create_model_runtime",
+    "MODEL_PROVIDER_PLUGIN_API_VERSION",
+    "ModelRuntimeComponents",
+    "ModelProviderRegistry",
+    "create_default_model_provider_registry",
+    "create_model_runtime_components",
 ]

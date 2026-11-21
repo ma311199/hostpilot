@@ -1,4 +1,4 @@
-# ADR-0009：Skill Runtime 与 YAML 执行契约
+# ADR-0009：SkillEngine 与 YAML 执行契约
 
 - 状态：已采纳为目标架构；实现分阶段迁移
 - 日期：2026-11-02
@@ -11,9 +11,10 @@
 
 ## 决定
 
-- Router 只从注册的业务 Skill 和内置 Skill 中选择 `skill_id`；Skill Runtime 按 ID 加载、校验并执行。
+- Router 只从注册的业务 Skill 和内置 Skill 中选择 `skill_id`；SkillEngine 按 ID 加载、校验并执行。
 - 保留三个内置 Skill：`direct_answer`、`clarify`、`orchestrator_plan`。`direct_answer` 是不含 ReAct 工具循环的单轮 LLM 回答；高置信命中单一业务 Skill 可走经过评估的快速路径；需要规划的复杂、多意图或无业务 Skill 匹配的执行任务由 `orchestrator_plan` 接管；信息不足时使用 `clarify`。路由与副作用安全细节以 ADR-0012 为准。
-- YAML 业务 Skill 的机器契约为 `skill.yaml`，声明路由元数据、输入/输出 schema 和 steps。特殊控制流通过内置 Executor 插件实现，YAML 壳通过 `skill_type` 选择插件。DeepAgents Markdown Skill 也是正式支持的执行形式；两者的选择规则见 [ADR-0013](0013-dual-skill-formats-and-execution-selection.md)。
+- YAML 业务 Skill 的机器契约为 `skill.yaml`，声明路由元数据、输入/输出 schema 和 steps。特殊控制流通过内置 Executor 插件实现，YAML 壳通过 `skill_type` 选择插件。Markdown `SKILL.md` 是另一种正式支持的 Skill 格式；两者的选择规则见 [ADR-0013](0013-dual-skill-formats-and-execution-selection.md)。
+- Runtime Chat 提供统一 Skill 执行契约；格式适配器负责发现、解析和验证 Markdown/YAML 包，再交付规范请求。Runtime 统一管理 RequestContext、预算、授权、审批、取消、状态、恢复和结果校验；DeepAgents、LangGraph 或 HostPilot 原生执行器均只能作为受治理后端接入。
 - `YamlSkillRegistry` 负责解析和校验契约；Runtime 将 `depends_on` 编译为 LangGraph DAG。未声明 `depends_on` 的旧式 step 默认依赖前一步；显式空列表表示根节点，可与其他就绪节点并行。并行节点输出由 reducer 合并，汇聚节点等待全部依赖完成。LangGraph 通过适配器隔离，未安装可选 agents 依赖时使用遵循依赖关系的顺序执行器。
 - `SKILL.md` 可由 DeepAgents 执行，也可作为 UI 展示材料；当 YAML Runtime 执行 Skill 时，它不是执行输入。两种格式的路由和默认选择规则见 ADR-0013。
 - 业务 Skill 的 `dependencies.skills` 必须通过注册表预检；当该 Skill 的评估或执行失败转入 Plan 时，同一列表限定可选择的子 Skill 候选，空列表默认拒绝委派。顶层内置 `orchestrator_plan` 可在已启用且通过校验的业务 Skill 中选择；Plan 若源自某个业务 Skill，则只能选择该父 Skill 声明的依赖。Plan Validator 在任何子 Skill task 执行前重新检查授权。
@@ -21,7 +22,7 @@
 
 ## 影响
 
-- DeepAgents Markdown Skill 与 YAML Skill Runtime 长期并行支持；默认根据包内文件选择执行入口，具体规则见 ADR-0013。
+- Markdown Skill 与 YAML Skill 长期并行支持并走统一 Runtime 执行契约；当前 DeepAgents Markdown 适配器和 YAML SkillEngine 是可替换的执行后端实现。
 - `skill.yaml` 的完整 schema、条件/错误 step 语义、上下文快照与回滚格式需在 Runtime 实现前细化。
 - 核心 Skill 契约和 Runtime ports 不依赖 LangGraph 专有类型；LangGraph DAG 编译器是当前 steps 执行后端，仍由适配器封装。
 - 需要覆盖 Router 选择、三个内置 Skill、steps、子 Skill 循环限制、预算传播、失败回滚及不可信 Skill 声明的安全测试。

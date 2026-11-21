@@ -3,15 +3,15 @@
 from hostpilot.persistence.audits import SQLiteAuditStore
 from hostpilot.persistence.cancellations import CancellationAuditEntry, SQLiteCancellationStore
 from hostpilot.persistence.checkpointer import (
-    conversation_thread_config,
     open_sqlite_checkpointer,
+    session_thread_config,
 )
 from hostpilot.persistence.conversations import (
     ConversationNotFoundError,
     SQLiteConversationStore,
 )
 from hostpilot.persistence.harness_configuration import (
-    HarnessRuntimeConfiguration,
+    HarnessConfiguration,
     SQLiteHarnessConfigurationStore,
 )
 from hostpilot.persistence.markdown_memory import MarkdownMemoryStore
@@ -91,7 +91,7 @@ __all__ = [
     "SQLiteAuditStore",
     "SQLiteCancellationStore",
     "MarkdownMemoryStore",
-    "HarnessRuntimeConfiguration",
+    "HarnessConfiguration",
     "SQLiteHarnessConfigurationStore",
     "SQLiteConversationStore",
     "SQLiteModelConfigurationStore",
@@ -108,5 +108,5 @@ __all__ = [
     "SQLiteMCPConfigurationStore",
     "SQLiteWorkspaceConfigurationStore",
     "open_sqlite_checkpointer",
-    "conversation_thread_config",
+    "session_thread_config",
 ]

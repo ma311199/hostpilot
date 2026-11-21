@@ -20,6 +20,7 @@ from hostpilot.contracts import (
     TrustLevel,
 )
 from hostpilot.models import ModelResponse, ModelToolCall
+from hostpilot.runtime import RequestContext
 from hostpilot.skills.llm_actions import register_llm_completion_action
 from hostpilot.skills.model_plan import (
     GovernedPlanTaskExecutor,
@@ -27,7 +28,7 @@ from hostpilot.skills.model_plan import (
     LLMPlanVerifier,
     LLMSkillAssessor,
     ModelPlanFallback,
-    RuntimePlanValidator,
+    PlanExecutionValidator,
     _decode_json_object,
     _rank_tool_candidates,
     build_model_plan_executor,
@@ -46,11 +47,11 @@ from hostpilot.skills.runtime import (
     AssessmentDisposition,
     BuiltinExecutorRegistry,
     SkillAssessment,
+    SkillEngine,
     SkillExecutionRequest,
     SkillExecutionResult,
     SkillExecutionSnapshot,
     SkillExecutionStatus,
-    SkillRuntime,
     SkillStepState,
     StepActionRegistry,
 )
@@ -63,16 +64,18 @@ def request(
     return SkillExecutionRequest(
         skill_id,
         {"task_description": "Summarize these notes"},
-        ContextSnapshot(request_id="plan-test", conversation_id="conversation-1"),
-        RequestBudget.start(
-            BudgetContext(
-                limits=BudgetLimits(
-                    total_tokens=total_tokens,
-                    tool_calls=5,
-                    retrieval_calls=2,
-                    timeout_seconds=30,
+        RequestContext(
+            ContextSnapshot(request_id="plan-test", session_id="conversation-1"),
+            RequestBudget.start(
+                BudgetContext(
+                    limits=BudgetLimits(
+                        total_tokens=total_tokens,
+                        tool_calls=5,
+                        retrieval_calls=2,
+                        timeout_seconds=30,
+                    )
                 )
-            )
+            ),
         ),
     )
 
@@ -223,7 +226,7 @@ def test_planner_receives_registered_tool_and_enabled_skill_catalogue() -> None:
             model.system_instruction
         )
         assert plan.tasks[0].execution_type is PlanExecutionType.BUSINESS_SKILL_TASK
-        assert plan_request.budget.snapshot().usage.total_tokens == 6
+        assert plan_request.request_context.budget.snapshot().usage.total_tokens == 6
 
     asyncio.run(scenario())
 
@@ -336,12 +339,12 @@ def test_model_plan_fallback_carries_failure_evidence_without_task_payloads() ->
         candidate_skill_ids=("business/notes", "business/decisions"),
     )
     snapshot = SkillExecutionSnapshot(
-        request_id=original.context.request_id,
+        request_id=original.request_context.snapshot.request_id,
         skill_id=original.skill_id,
         manifest_hash="manifest-hash",
         manifest_version="1.0",
         started_at=datetime.now(UTC),
-        budget=original.budget.snapshot(),
+        budget=original.request_context.budget.snapshot(),
         step_states=(SkillStepState("summarize", "failed", error_code="result_mismatch"),),
     )
     plan_executor = FakePlanExecutor()
@@ -898,7 +901,7 @@ def test_plan_and_parallel_yaml_steps_share_budget_and_stop_after_exhaustion(
         model = SharedBudgetModel()
         actions = StepActionRegistry()
         register_llm_completion_action(actions, model)
-        skill_runtime = SkillRuntime(
+        skill_runtime = SkillEngine(
             registry,
             actions,
             BuiltinExecutorRegistry(),
@@ -920,8 +923,8 @@ def test_plan_and_parallel_yaml_steps_share_budget_and_stop_after_exhaustion(
         assert result.output["error_code"] == "budget_exceeded"
         assert len(model.requests) == 3
         assert [item.max_output_tokens for item in model.requests] == [10, 8, 5]
-        assert plan_request.budget.snapshot().usage.total_tokens == 5
-        assert plan_request.budget.remaining_tokens == 0
+        assert plan_request.request_context.budget.snapshot().usage.total_tokens == 5
+        assert plan_request.request_context.budget.remaining_tokens == 0
 
     asyncio.run(scenario())
 
@@ -975,7 +978,7 @@ def test_plan_verifier_parses_json_chat_response() -> None:
         assert result.accepted is True
         assert result.reason_code == "goal_satisfied"
         assert result.final_output == {"answer": "done"}
-        assert plan_request.budget.snapshot().usage.total_tokens == 6
+        assert plan_request.request_context.budget.snapshot().usage.total_tokens == 6
 
     asyncio.run(scenario())
 
@@ -987,7 +990,7 @@ def test_plan_validator_rejects_unregistered_tools_and_skills(tmp_path: Path) ->
         tmp_path, "business/parent", dependencies=["business/summary"], tools=["search"]
     )
     write_skill_package(tmp_path, "business/no-tools")
-    validator = RuntimePlanValidator(
+    validator = PlanExecutionValidator(
         YamlSkillRegistry(tmp_path, registered_tool_ids=("search",)), ("search",)
     )
 
@@ -1080,7 +1083,7 @@ def test_plan_validator_rejects_unregistered_tools_and_skills(tmp_path: Path) ->
 def test_plan_validator_rejects_overdecomposition_and_duplicate_objectives(
     tmp_path: Path,
 ) -> None:
-    validator = RuntimePlanValidator(YamlSkillRegistry(tmp_path), ())
+    validator = PlanExecutionValidator(YamlSkillRegistry(tmp_path), ())
 
     async def scenario() -> None:
         def reasoning(task_id: str, description: str) -> PlanTask:
@@ -1156,7 +1159,7 @@ def test_unauthorized_child_skill_is_rejected_before_task_execution(tmp_path: Pa
     task_executor = CapturingTaskExecutor()
     executor = OrchestratorPlanExecutor(
         FixedPlanner(),
-        RuntimePlanValidator(YamlSkillRegistry(tmp_path), ()),
+        PlanExecutionValidator(YamlSkillRegistry(tmp_path), ()),
         task_executor,
         AcceptingVerifier(),
         FixedPlanner(),
@@ -1223,15 +1226,15 @@ def test_model_skill_assessor_uses_execution_evidence_and_accounts_budget(tmp_pa
             skill_id="business/summary",
             manifest_hash=package.content_hash,
             manifest_version="1.0",
-            started_at=assessment_request.context.captured_at,
-            budget=assessment_request.budget.snapshot(),
+            started_at=assessment_request.request_context.snapshot.captured_at,
+            budget=assessment_request.request_context.budget.snapshot(),
             step_states=(SkillStepState("draft", "completed", output={"summary": "Done"}),),
         )
         result = await assessor.assess(
             package,
             {"input": {"notes": "Meeting notes"}, "output": {"summary": "Done"}},
-            assessment_request.context,
-            budget=assessment_request.budget,
+            assessment_request.request_context.snapshot,
+            budget=assessment_request.request_context.budget,
             snapshot=snapshot,
         )
         return result
@@ -1240,7 +1243,7 @@ def test_model_skill_assessor_uses_execution_evidence_and_accounts_budget(tmp_pa
 
     assert result.disposition is AssessmentDisposition.ACCEPT
     assert result.token_usage is not None and result.token_usage.total_tokens == 12
-    assert assessment_request.budget.snapshot().usage.total_tokens == 12
+    assert assessment_request.request_context.budget.snapshot().usage.total_tokens == 12
     assert model.data["execution_evidence"]["steps"][0]["output"] == {"summary": "Done"}
     assert model.data["request"]["output"] == {"summary": "Done"}
 
@@ -1278,8 +1281,8 @@ def test_model_skill_assessor_routes_low_confidence_acceptance_to_plan(tmp_path:
         assessor.assess(
             package,
             {"notes": "Meeting notes"},
-            request().context,
-            budget=request().budget,
+            request().request_context.snapshot,
+            budget=request().request_context.budget,
         )
     )
 

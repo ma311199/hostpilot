@@ -57,7 +57,7 @@ def test_raw_memory_archive_round_trips_and_filters_other_sessions(tmp_path: Pat
         archive_id=uuid4(),
         proposal_id="proposal-first",
         scope=MemoryScope.SESSION_SUMMARY,
-        conversation_id="b1e1a2f4-a333-4f47-93fb-88936298d70c",
+        session_id="b1e1a2f4-a333-4f47-93fb-88936298d70c",
         importance_score=55,
         content="Original private detail",
     )
@@ -71,13 +71,14 @@ def test_raw_memory_archive_round_trips_and_filters_other_sessions(tmp_path: Pat
     memory.archive_raw_memory(first)
     memory.archive_raw_memory(second)
 
-    visible = memory.list_raw_memory_archives(first.conversation_id, limit=10)
+    visible = memory.list_raw_memory_archives(first.session_id, limit=10)
 
     assert {item.archive_id for item in visible} == {first.archive_id, second.archive_id}
     assert memory.read_raw_memory_archive(first.archive_id) == first
-    assert b"Original private detail" in (
-        memory.archives_directory / f"{first.archive_id}.json"
-    ).read_bytes()
+    assert (
+        b"Original private detail"
+        in (memory.archives_directory / f"{first.archive_id}.json").read_bytes()
+    )
 
 
 def test_raw_memory_archive_rejects_other_session_and_enforces_limit(tmp_path: Path) -> None:
@@ -86,7 +87,7 @@ def test_raw_memory_archive_rejects_other_session_and_enforces_limit(tmp_path: P
         archive_id=uuid4(),
         proposal_id="proposal-first",
         scope=MemoryScope.SESSION_SUMMARY,
-        conversation_id="b1e1a2f4-a333-4f47-93fb-88936298d70c",
+        session_id="b1e1a2f4-a333-4f47-93fb-88936298d70c",
         importance_score=55,
         content="Private original detail",
     )

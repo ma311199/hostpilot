@@ -37,6 +37,7 @@ from hostpilot.routing.hybrid_retrieval import (
     reciprocal_rank_fusion,
 )
 from hostpilot.routing.query_resolution import resolve_query
+from hostpilot.runtime import RequestContext
 from hostpilot.skills.registry import SkillRegistry
 from hostpilot.skills.yaml_registry import YamlSkillCatalog, YamlSkillPackage, YamlSkillRegistry
 
@@ -83,7 +84,7 @@ class SkillClassification(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision: Literal[
-        "direct_answer", "clarify", "orchestrator_plan", "business_skill", "deepagents_skill"
+        "direct_answer", "clarify", "orchestrator_plan", "business_skill", "markdown_skill"
     ]
     skill_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -154,8 +155,8 @@ class ModelProviderSkillSelector:
         max_business_candidates: int = 32,
         minimum_plan_candidate_confidence: float = 0.50,
         max_plan_candidates: int = 5,
-        deepagents_registry: SkillRegistry | None = None,
-        deepagents_skill_ids_by_name: Mapping[str, str] | None = None,
+        markdown_registry: SkillRegistry | None = None,
+        markdown_skill_ids_by_name: Mapping[str, str] | None = None,
         execution_modes: Mapping[str, str] | None = None,
         trace_sink: TraceSink | None = None,
     ) -> None:
@@ -182,8 +183,8 @@ class ModelProviderSkillSelector:
         self.max_business_candidates = max_business_candidates
         self.minimum_plan_candidate_confidence = minimum_plan_candidate_confidence
         self.max_plan_candidates = max_plan_candidates
-        self.deepagents_registry = deepagents_registry
-        self.deepagents_skill_ids_by_name = deepagents_skill_ids_by_name or {}
+        self.markdown_registry = markdown_registry
+        self.markdown_skill_ids_by_name = markdown_skill_ids_by_name or {}
         self.execution_modes = execution_modes or {}
         self.trace_sink = trace_sink
 
@@ -214,10 +215,10 @@ class ModelProviderSkillSelector:
     async def select(
         self,
         message: str,
-        context: ContextSnapshot,
-        *,
-        budget: RequestBudget,
+        request_context: RequestContext,
     ) -> SkillSelection:
+        context = request_context.snapshot
+        budget = request_context.budget
         resolved = resolve_query(message, context)
         reference_usage: ModelTokenUsage | None = None
         if resolved.retrieval_query is None:
@@ -262,8 +263,8 @@ class ModelProviderSkillSelector:
         packages = {package.skill_id: package for package in catalog.skills}
         requested_skill_id = _explicitly_requested_skill_id(message)
         if requested_skill_id and requested_skill_id not in packages:
-            deepagents_ids = {item["skill_id"] for item in self._deepagents_candidates()}
-            if requested_skill_id not in deepagents_ids:
+            markdown_ids = {item["skill_id"] for item in self._markdown_candidates()}
+            if requested_skill_id not in markdown_ids:
                 self._record_trace(
                     "skill.explicit_request",
                     {"skill_id": requested_skill_id, "status": "unavailable"},
@@ -282,17 +283,17 @@ class ModelProviderSkillSelector:
                 "model_not_configured",
             )
 
-        deepagents_candidates = self._deepagents_candidates()
-        candidates, deepagents_candidates = await self._retrieve_candidates(
+        markdown_candidates = self._markdown_candidates()
+        candidates, markdown_candidates = await self._retrieve_candidates(
             catalog,
             retrieval_query,
             budget,
-            deepagents_candidates,
+            markdown_candidates,
         )
         prompt_data = {
             "builtins": self.BUILTINS,
             "business_skills": candidates,
-            "deepagents_skills": deepagents_candidates,
+            "markdown_skills": markdown_candidates,
         }
         classification_schema = json.dumps(
             SkillClassification.model_json_schema(), ensure_ascii=False
@@ -370,8 +371,8 @@ class ModelProviderSkillSelector:
                                     "For code review requests, choose the matching review Skill "
                                     "and place any supplied snippet or diff in its "
                                     "code_or_diff field. "
-                                    "Select deepagents_skill only for a matching Markdown Skill "
-                                    "listed in deepagents_skills. Never select the same Skill "
+                                    "Select markdown_skill only for a matching Markdown Skill "
+                                    "listed in markdown_skills. Never select the same Skill "
                                     "through both "
                                     "entries for one request. Routing "
                                     "never grants tool permission. Return exactly one JSON object; "
@@ -444,7 +445,7 @@ class ModelProviderSkillSelector:
                 reason_code="skill_selection_unavailable",
             )
 
-        available_skill_ids = {item["skill_id"] for item in (*candidates, *deepagents_candidates)}
+        available_skill_ids = {item["skill_id"] for item in (*candidates, *markdown_candidates)}
         scores = {
             skill_id: score
             for skill_id, score in classification.candidate_scores.items()
@@ -468,7 +469,7 @@ class ModelProviderSkillSelector:
         )
         selected_candidate_id = (
             classification.skill_id
-            if classification.decision in {"business_skill", "deepagents_skill"}
+            if classification.decision in {"business_skill", "markdown_skill"}
             else None
         )
         self._record_trace(
@@ -494,7 +495,7 @@ class ModelProviderSkillSelector:
             )
         if classification.decision in {
             "business_skill",
-            "deepagents_skill",
+            "markdown_skill",
         } and _has_compound_action_request(message):
             return self._plan_selection(
                 message,
@@ -503,7 +504,7 @@ class ModelProviderSkillSelector:
                 plan_candidate_ids,
             )
         if (
-            classification.decision in {"business_skill", "deepagents_skill"}
+            classification.decision in {"business_skill", "markdown_skill"}
             and not classification.covers_full_request
         ):
             skill_package = packages.get(classification.skill_id or "")
@@ -564,18 +565,18 @@ class ModelProviderSkillSelector:
                 message, classification.reason_code, usage, plan_candidate_ids
             )
 
-        if classification.decision == "deepagents_skill":
-            deepagents_by_id = {item["skill_id"]: item for item in deepagents_candidates}
-            if classification.skill_id not in deepagents_by_id:
+        if classification.decision == "markdown_skill":
+            markdown_by_id = {item["skill_id"]: item for item in markdown_candidates}
+            if classification.skill_id not in markdown_by_id:
                 return self._clarification(
                     "我无法确认一个可用的 Markdown Skill 来处理这项请求。请补充目标或约束。",
-                    reason_code="deepagents_skill_not_available",
+                    reason_code="markdown_skill_not_available",
                     token_usage=usage,
                 )
             if classification.confidence < self.minimum_business_confidence:
                 return self._plan_selection(
                     message,
-                    "deepagents_skill_confidence_below_threshold",
+                    "markdown_skill_confidence_below_threshold",
                     usage,
                     plan_candidate_ids,
                 )
@@ -586,7 +587,7 @@ class ModelProviderSkillSelector:
             ):
                 return self._plan_selection(
                     message,
-                    "deepagents_skill_not_uniquely_high_confidence",
+                    "markdown_skill_not_uniquely_high_confidence",
                     usage,
                     plan_candidate_ids,
                 )
@@ -595,20 +596,20 @@ class ModelProviderSkillSelector:
                 {"message": message},
                 classification.reason_code,
                 usage,
-                execution_mode="deepagents",
+                execution_mode="markdown",
                 candidate_skill_ids=plan_candidate_ids,
             )
 
         # The classifier can confuse a Markdown package with a YAML business Skill.
         # Accept that choice only when the ID is present in the current, enabled
-        # DeepAgents candidate list and absent from the YAML registry.
+        # Markdown candidate list and absent from the YAML registry.
         if classification.skill_id not in packages:
-            deepagents_by_id = {item["skill_id"]: item for item in deepagents_candidates}
-            if classification.skill_id in deepagents_by_id:
+            markdown_by_id = {item["skill_id"]: item for item in markdown_candidates}
+            if classification.skill_id in markdown_by_id:
                 if classification.confidence < self.minimum_business_confidence:
                     return self._plan_selection(
                         message,
-                        "deepagents_skill_confidence_below_threshold",
+                        "markdown_skill_confidence_below_threshold",
                         usage,
                         plan_candidate_ids,
                     )
@@ -619,7 +620,7 @@ class ModelProviderSkillSelector:
                 ):
                     return self._plan_selection(
                         message,
-                        "deepagents_skill_not_uniquely_high_confidence",
+                        "markdown_skill_not_uniquely_high_confidence",
                         usage,
                         plan_candidate_ids,
                     )
@@ -628,7 +629,7 @@ class ModelProviderSkillSelector:
                     {"message": message},
                     "markdown_skill_selected_as_business",
                     usage,
-                    execution_mode="deepagents",
+                    execution_mode="markdown",
                     candidate_skill_ids=plan_candidate_ids,
                 )
 
@@ -718,25 +719,25 @@ class ModelProviderSkillSelector:
                 providers.append(provider)
         return tuple(providers)
 
-    async def assess_deepagents_result(
+    async def assess_markdown_result(
         self,
         skill_id: str,
         goal: str,
         result: str,
-        context: ContextSnapshot,
-        *,
-        budget: RequestBudget,
+        request_context: RequestContext,
     ) -> tuple[bool, str, ModelTokenUsage | None]:
         """Check whether a Markdown Skill response fulfilled the requested goal."""
+        context = request_context.snapshot
+        budget = request_context.budget
         candidate = next(
-            (item for item in self._deepagents_candidates() if item["skill_id"] == skill_id),
+            (item for item in self._markdown_candidates() if item["skill_id"] == skill_id),
             None,
         )
         if candidate is None:
-            return False, "deepagents_skill_disappeared_before_assessment", None
+            return False, "markdown_skill_disappeared_before_assessment", None
         providers = self._classification_providers()
         if not providers:
-            return False, "deepagents_result_assessor_unavailable", None
+            return False, "markdown_result_assessor_unavailable", None
         schema = json.dumps(SkillResultAssessment.model_json_schema(), ensure_ascii=False)
         data = json.dumps(
             {
@@ -790,7 +791,7 @@ class ModelProviderSkillSelector:
                 last_error = error
         return (
             False,
-            f"deepagents_result_assessor_{type(last_error).__name__}",
+            f"markdown_result_assessor_{type(last_error).__name__}",
             None,
         )
 
@@ -937,13 +938,13 @@ class ModelProviderSkillSelector:
         catalog: YamlSkillCatalog,
         message: str,
         budget: RequestBudget,
-        deepagents_candidates: list[dict[str, Any]],
+        markdown_candidates: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Rank YAML and Markdown Skills together, then return format-specific top-k lists."""
         enabled = [package for package in catalog.skills if package.manifest.meta.enabled]
         yaml_by_id = {package.skill_id: package for package in enabled}
-        deepagents_by_id = {
-            str(candidate["skill_id"]): candidate for candidate in deepagents_candidates
+        markdown_by_id = {
+            str(candidate["skill_id"]): candidate for candidate in markdown_candidates
         }
         fields_by_id: dict[str, dict[str, tuple[str, ...]]] = {}
         for package in enabled:
@@ -956,7 +957,7 @@ class ModelProviderSkillSelector:
                 "examples": tuple(manifest.examples),
                 "aliases": (),
             }
-        for skill_id, candidate in deepagents_by_id.items():
+        for skill_id, candidate in markdown_by_id.items():
             markdown_fields = {
                 "name": _metadata_values(candidate.get("name")),
                 "description": _metadata_values(candidate.get("description")),
@@ -1094,7 +1095,7 @@ class ModelProviderSkillSelector:
         retrieval_by_id = {item.skill_id: item for item in retrieval_documents}
         semantic_scores = {item.skill_id: item.similarity for item in semantic_matches}
         selected_yaml = [skill_id for skill_id in selected_ids if skill_id in yaml_by_id]
-        selected_markdown = [skill_id for skill_id in selected_ids if skill_id in deepagents_by_id]
+        selected_markdown = [skill_id for skill_id in selected_ids if skill_id in markdown_by_id]
         business_candidates = [
             {
                 "skill_id": skill_id,
@@ -1113,7 +1114,7 @@ class ModelProviderSkillSelector:
         ]
         markdown_candidates = [
             {
-                **deepagents_by_id[skill_id],
+                **markdown_by_id[skill_id],
                 "triggers": list(retrieval_by_id[skill_id].values("triggers")),
                 "tags": list(retrieval_by_id[skill_id].values("tags")),
                 "examples": list(retrieval_by_id[skill_id].values("examples")),
@@ -1128,24 +1129,24 @@ class ModelProviderSkillSelector:
         ]
         return business_candidates, markdown_candidates
 
-    def _deepagents_candidates(self) -> list[dict[str, Any]]:
+    def _markdown_candidates(self) -> list[dict[str, Any]]:
         """Return only enabled Markdown Skills whose configured entry permits execution."""
-        if self.deepagents_registry is None:
+        if self.markdown_registry is None:
             return []
         candidates: list[dict[str, Any]] = []
-        for package in self.deepagents_registry.discover().skills:
+        for package in self.markdown_registry.discover().skills:
             if not package.enabled:
                 continue
             has_yaml_manifest = (package.source_directory / "skill.yaml").exists()
-            skill_id = self.deepagents_skill_ids_by_name.get(
+            skill_id = self.markdown_skill_ids_by_name.get(
                 package.name,
                 f"legacy/{package.name}",
             )
             mode = self.execution_modes.get(
                 skill_id,
-                "yaml" if has_yaml_manifest else "deepagents",
+                "yaml" if has_yaml_manifest else "markdown",
             )
-            if mode not in {"deepagents", "both"}:
+            if mode not in {"markdown", "both"}:
                 continue
             candidates.append(
                 {

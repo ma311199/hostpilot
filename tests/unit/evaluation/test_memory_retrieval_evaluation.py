@@ -9,9 +9,7 @@ from hostpilot.evaluation.memory_retrieval import (
     split_markdown_chunks,
 )
 
-DATASET = (
-    Path(__file__).resolve().parents[3] / "docs/evaluations/memory-retrieval-v1.yaml"
-)
+DATASET = Path(__file__).resolve().parents[3] / "docs/evaluations/memory-retrieval-v1.yaml"
 
 
 def test_memory_evaluation_dataset_is_scoped_and_produces_retrieval_metrics() -> None:
@@ -44,7 +42,7 @@ def test_lexical_ranker_finds_paraphrased_model_key_question_without_other_sessi
     ranked = rank_memory_entries(
         case.query,
         entries,
-        conversation_id=case.conversation_id,
+        session_id=case.session_id,
     )
 
     assert ranked[0].entry_id == "model-credential-lifecycle"
@@ -58,7 +56,7 @@ def test_lexical_ranker_exposes_true_synonym_gap_for_manual_evaluation() -> None
     ranked = rank_memory_entries(
         case.query,
         entries,
-        conversation_id=case.conversation_id,
+        session_id=case.session_id,
     )
 
     assert ranked == ()
@@ -94,11 +92,11 @@ def test_dataset_rejects_relevance_labels_from_another_session(tmp_path) -> None
 entries:
   - entry_id: private
     scope: session_summary
-    conversation_id: conversation-a
+    session_id: conversation-a
     content: secret
 cases:
   - case_id: leaked-label
-    conversation_id: conversation-b
+    session_id: conversation-b
     query: secret
     relevant_ids: [private]
 """,

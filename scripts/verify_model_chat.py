@@ -66,12 +66,12 @@ def verify_model_chat() -> None:
 def _create_conversation(client: TestClient) -> str:
     response = client.post("/api/v1/conversations", json={"title": "Model smoke check"})
     response.raise_for_status()
-    return response.json()["conversation_id"]
+    return response.json()["session_id"]
 
 
-def _send_message(client: TestClient, conversation_id: str, message: str) -> str:
+def _send_message(client: TestClient, session_id: str, message: str) -> str:
     response = client.post(
-        f"/api/v1/conversations/{conversation_id}/messages",
+        f"/api/v1/conversations/{session_id}/messages",
         json={"message": message},
     )
     response.raise_for_status()

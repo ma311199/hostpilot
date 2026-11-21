@@ -13,8 +13,8 @@ Plan 的 Planner、Validator、任务执行器、Verifier 和 Replanner 需要�
 - Plan Orchestrator 保持核心实现；五种组件通过既有 Port 契约注入。
 - 使用显式 `PlanComponentRegistry` 按组件角色和实现 ID 注册工厂；接口版本固定为 `1.0`，未知版本、重复注册、未知实现和缺少角色方法均在启动组装时拒绝。
 - 内置实现注册在 `builtin.llm`、`builtin.runtime` 和 `builtin.governed` 名称下。环境配置分别用 `HOSTPILOT_PLAN_PLANNER_PLUGIN`、`HOSTPILOT_PLAN_VALIDATOR_PLUGIN`、`HOSTPILOT_PLAN_TASK_EXECUTOR_PLUGIN`、`HOSTPILOT_PLAN_VERIFIER_PLUGIN` 和 `HOSTPILOT_PLAN_REPLANNER_PLUGIN` 选择。
-- 自定义工厂由应用启动代码注册，并通过 `create_app(..., plan_component_registry=...)` 或 `create_configured_runtime(..., plan_component_registry=...)` 注入。当前不支持从任意路径导入、下载或热加载插件。
-- 插件应使用 HostPilot 注入的 Skill Runtime 和 Tool Provider，并遵守预算、授权、审批、取消、补偿及审计契约。Python 插件能访问进程内依赖，注册表本身不构成安全隔离，因此只允许受信任代码。
+- 自定义工厂由应用启动代码注册，并通过 `create_app(..., plan_component_registry=...)` 或 `create_configured_chat_agent_runtime(..., plan_component_registry=...)` 注入。当前不支持从任意路径导入、下载或热加载插件。
+- 插件应使用 HostPilot 注入的 SkillEngine 和 Tool Provider，并遵守预算、授权、审批、取消、补偿及审计契约。Python 插件能访问进程内依赖，注册表本身不构成安全隔离，因此只允许受信任代码。
 
 ## 影响
 

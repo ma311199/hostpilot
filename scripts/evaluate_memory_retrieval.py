@@ -11,9 +11,7 @@ from hostpilot.evaluation.memory_retrieval import (
     load_memory_evaluation_dataset,
 )
 
-DEFAULT_DATASET = (
-    Path(__file__).resolve().parents[1] / "docs/evaluations/memory-retrieval-v1.yaml"
-)
+DEFAULT_DATASET = Path(__file__).resolve().parents[1] / "docs/evaluations/memory-retrieval-v1.yaml"
 
 
 def main() -> None:

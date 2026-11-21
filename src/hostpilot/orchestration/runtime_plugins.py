@@ -6,31 +6,37 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-CHAT_RUNTIME_PLUGIN_API_VERSION = "1.0"
+from hostpilot.models import ModelToolDefinition
+from hostpilot.runtime import RuntimeExecutionLoop
+
+CHAT_AGENT_RUNTIME_PLUGIN_API_VERSION = "2.0"
 
 
 @dataclass(frozen=True)
-class ChatRuntimePluginContext:
+class ChatAgentRuntimePluginContext:
     """Framework-facing dependencies supplied to a chat runtime factory."""
 
     model: Any
     checkpointer: Any
     skills: Any
     tools: Sequence[Any]
+    runtime_execution_loop: RuntimeExecutionLoop | None = None
+    runtime_tool_definitions: tuple[ModelToolDefinition, ...] = ()
+    runtime_allowed_tool_ids: frozenset[str] = frozenset()
 
 
-ChatRuntimeFactory = Callable[[ChatRuntimePluginContext], Any]
+ChatAgentRuntimeFactory = Callable[[ChatAgentRuntimePluginContext], Any]
 
 
 @dataclass(frozen=True)
 class _Registration:
     implementation_id: str
     api_version: str
-    factory: ChatRuntimeFactory
+    factory: ChatAgentRuntimeFactory
 
 
-class ChatRuntimeRegistry:
-    """Create a runtime that satisfies HostPilot's stable AgentRuntime contract."""
+class ChatAgentRuntimeRegistry:
+    """Create a runtime that satisfies HostPilot's stable ChatAgentRuntime contract."""
 
     def __init__(self) -> None:
         self._registrations: dict[str, _Registration] = {}
@@ -38,16 +44,16 @@ class ChatRuntimeRegistry:
     def register(
         self,
         implementation_id: str,
-        factory: ChatRuntimeFactory,
+        factory: ChatAgentRuntimeFactory,
         *,
-        api_version: str = CHAT_RUNTIME_PLUGIN_API_VERSION,
+        api_version: str = CHAT_AGENT_RUNTIME_PLUGIN_API_VERSION,
     ) -> None:
         if not implementation_id or implementation_id.strip() != implementation_id:
             raise ValueError("Chat runtime implementation IDs must be non-empty and trimmed.")
-        if api_version != CHAT_RUNTIME_PLUGIN_API_VERSION:
+        if api_version != CHAT_AGENT_RUNTIME_PLUGIN_API_VERSION:
             raise ValueError(
                 f"Unsupported chat runtime plugin API version {api_version!r}; "
-                f"expected {CHAT_RUNTIME_PLUGIN_API_VERSION!r}."
+                f"expected {CHAT_AGENT_RUNTIME_PLUGIN_API_VERSION!r}."
             )
         if implementation_id in self._registrations:
             raise ValueError(f"Chat runtime already registered: {implementation_id}.")
@@ -55,7 +61,7 @@ class ChatRuntimeRegistry:
             implementation_id, api_version, factory
         )
 
-    def create(self, implementation_id: str, context: ChatRuntimePluginContext) -> Any:
+    def create(self, implementation_id: str, context: ChatAgentRuntimePluginContext) -> Any:
         registration = self._registrations.get(implementation_id)
         if registration is None:
             raise ValueError(f"Unknown chat runtime implementation: {implementation_id}.")
@@ -77,7 +83,7 @@ class ChatRuntimeRegistry:
 
 
 __all__ = [
-    "CHAT_RUNTIME_PLUGIN_API_VERSION",
-    "ChatRuntimePluginContext",
-    "ChatRuntimeRegistry",
+    "CHAT_AGENT_RUNTIME_PLUGIN_API_VERSION",
+    "ChatAgentRuntimePluginContext",
+    "ChatAgentRuntimeRegistry",
 ]

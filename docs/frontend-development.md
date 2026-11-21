@@ -36,6 +36,9 @@ pnpm build
 ## 代码约定
 
 - Vue 组件使用 <script setup lang="ts"> 和 Composition API。
+- Vue 组件文件和组件类型使用 PascalCase；TypeScript 类型使用 PascalCase，函数和局部变量使用 camelCase。
+- API 字段保留后端 JSON 的 snake_case；会话标识字段统一为 `session_id`，前端局部变量使用 `sessionId`。Conversation 仍是界面资源名，不能把普通会话 UI 文案或 `/conversations` 路径机械改为 Session。
+- 组件、API 函数和数据类型按职责命名；避免使用缺少领域限定的 `Runtime`、`Manager` 等宽泛名称。
 - 页面、API 客户端、阶段数据分别放在 App、src/api/ 和 src/data/。
 - 共享 API 数据定义 TypeScript 类型；API 失败显示明确状态，不伪装为成功。
 - 阶段数据更新时同时检查 docs/roadmap.md，避免看板与项目文档不一致。

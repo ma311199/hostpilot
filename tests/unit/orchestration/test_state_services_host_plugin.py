@@ -51,9 +51,7 @@ def test_state_plugin_registers_and_unregisters_injected_store_ports(tmp_path) -
         host.register_plugin(plugin)
         await host.start()
 
-        assert (
-            context.services.resolve(plugin.conversation_store_service_id) is conversations
-        )
+        assert context.services.resolve(plugin.conversation_store_service_id) is conversations
         assert context.services.resolve(plugin.checkpointer_service_id) is checkpointer
         await host.close()
         return conversations, checkpointer, context, checkpointer_context

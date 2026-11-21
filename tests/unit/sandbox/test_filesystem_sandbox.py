@@ -36,15 +36,11 @@ def test_danger_mode_mounts_only_requested_file_or_directory(tmp_path) -> None:
     workspace.set_sandbox_mode(SandboxMode.DANGER_FULL_ACCESS)
     sandbox = LinuxWorkspaceSandbox()
 
-    _, read_mounts = sandbox._request(
-        workspace, "read_text_file", {"path": str(file_path)}
-    )
+    _, read_mounts = sandbox._request(workspace, "read_text_file", {"path": str(file_path)})
     _, write_mounts = sandbox._request(
         workspace, "write_text_file", {"path": str(file_path), "content": "updated"}
     )
-    _, list_mounts = sandbox._request(
-        workspace, "list_directory", {"path": str(tmp_path)}
-    )
+    _, list_mounts = sandbox._request(workspace, "list_directory", {"path": str(tmp_path)})
 
     assert read_mounts == (("--ro-bind", str(file_path), "/grant"),)
     assert write_mounts == (("--bind", str(tmp_path), "/grant-parent"),)
@@ -84,9 +80,7 @@ def test_file_sandbox_rejects_symlink_escape_and_keeps_outside_file_hidden(tmp_p
         workspace.validate_read_path("escape.txt")
 
     with pytest.raises(WorkspaceFileError, match="Sandboxed file operation failed"):
-        asyncio.run(
-            sandbox.execute(workspace, "read_text_file", {"path": "escape.txt"})
-        )
+        asyncio.run(sandbox.execute(workspace, "read_text_file", {"path": "escape.txt"}))
 
 
 @pytest.mark.skipif(
@@ -102,10 +96,9 @@ def test_danger_file_sandbox_mounts_only_requested_file(tmp_path) -> None:
     workspace.set_sandbox_mode(SandboxMode.DANGER_FULL_ACCESS)
     sandbox = LinuxWorkspaceSandbox()
 
-    assert asyncio.run(
-        sandbox.execute(workspace, "read_text_file", {"path": str(authorized_file)})
-    ) == "authorized"
-    _, mounts = sandbox._request(
-        workspace, "read_text_file", {"path": str(authorized_file)}
+    assert (
+        asyncio.run(sandbox.execute(workspace, "read_text_file", {"path": str(authorized_file)}))
+        == "authorized"
     )
+    _, mounts = sandbox._request(workspace, "read_text_file", {"path": str(authorized_file)})
     assert mounts == (("--ro-bind", str(authorized_file), "/grant"),)

@@ -465,6 +465,7 @@ class LinuxShellSandbox(LinuxPythonSandbox):
     def _probe_source(self) -> str:
         return ":"
 
+
 __all__ = [
     "LinuxJavaScriptSandbox",
     "LinuxPythonSandbox",

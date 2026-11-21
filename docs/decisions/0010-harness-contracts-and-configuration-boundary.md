@@ -6,7 +6,7 @@
 
 ## 背景
 
-新架构需要先稳定 Skill Runtime 使用的模型、工具和记忆边界，避免业务 Skill 依赖 LangChain、MCP Transport、SQLite 或 Markdown 等具体实现。模型 Provider 首轮实现见[Stage D Provider 验证](../test-results/2026-11-06-stage-d-model-provider.md)；Tool Facade 与 Memory Controller 首轮实现见[Stage D Facade 与记忆控制器验证](../test-results/2026-11-06-stage-d-facade-memory-controller.md)。
+新架构需要先稳定 SkillEngine 使用的模型、工具和记忆边界，避免业务 Skill 依赖 LangChain、MCP Transport、SQLite 或 Markdown 等具体实现。模型 Provider 首轮实现见[Stage D Provider 验证](../test-results/2026-11-06-stage-d-model-provider.md)；Tool Facade 与 Memory Controller 首轮实现见[Stage D Facade 与记忆控制器验证](../test-results/2026-11-06-stage-d-facade-memory-controller.md)。
 
 ## 决定
 
@@ -37,7 +37,7 @@
 - Skill、Executor 和 steps 解释器只通过 Memory Controller 请求记忆召回或提交归档候选，不直接读写 SQLite、Markdown 或未来的检索存储。
 - 召回结果是有范围、有来源且受大小限制的记忆片段；入口预召回和子任务按需召回使用同一接口。
 - 写入接口提交候选内容和来源元数据。Controller 负责过滤、摘要、权限范围、审计和审批流程；提交候选不等于立即持久化。现有显式用户批准要求继续有效。
-- 当前 Markdown 后端仅支持按 conversation_id 读取会话摘要和读取本地用户共享记忆，并受总字符预算限制；不提供语义相关性排序。首轮 archive 将来源 Skill ID 和内容作为提案提交既有审批队列，未经批准不得写入。
+- 当前 Markdown 后端仅支持按 session_id 读取会话摘要和读取本地用户共享记忆，并受总字符预算限制；不提供语义相关性排序。首轮 archive 将来源 Skill ID 和内容作为提案提交既有审批队列，未经批准不得写入。
 - ContextBuilder 入口与 Plan 子任务使用相同 recall 接口；Recall/archive Trace 仅包含操作状态、耗时、字符数、chunk 数和来源 Skill ID 等白名单元数据，不记录 query 或记忆正文。Trace Sink 故障不改变记忆访问或审批行为。
 - 先保留 SQLite 会话检查点与 Markdown 记忆。是否需要向量召回及其存储由检索质量和规模需求驱动，不作为 Stage A 的前置依赖。
 

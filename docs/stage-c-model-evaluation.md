@@ -4,7 +4,7 @@
 
 当前自动化测试以 fake 模型验证协议、预算记账和 fail-closed 分支；它们不能证明真实模型会正确选择 Skill、生成可执行 Plan 或判断业务结果。本计划使用当前本机 HostPilot Runtime 中已配置的模型角色和路由实现进行真实评测，密钥留在应用进程内，不从 API 读取或写入评测报告。
 
-评测只观察模型决策与 Runtime 行为，不改变 Router、Skill Runtime、Plan DAG、Policy Engine 或 Tool Executor 的架构边界。模型输出仍须通过本地 JSON/Pydantic/schema/Plan 校验及既有策略门。评测不能授权工具、写文件或覆盖策略。
+评测只观察模型决策与 Runtime 行为，不改变 Router、SkillEngine、Plan DAG、Policy Engine 或 Tool Executor 的架构边界。模型输出仍须通过本地 JSON/Pydantic/schema/Plan 校验及既有策略门。评测不能授权工具、写文件或覆盖策略。
 
 ## 评测集
 
@@ -59,7 +59,7 @@
 
 1. 冻结并审阅带人工期望答案的用例；标注路由和安全预期时不参考模型输出。
 2. 使用当前模型配置，验证普通 Chat JSON 路径兼容性；记录模型名、接入类型、时间和非敏感参数，不记录 API Key。
-3. 先运行本机活跃路由选择评测。脚本默认组合 Stage C v3 与用户 Skill 冒烟集，通过专用 route-only API 调用实际启用的 BM25/Embedding/RRF/Reranker 和路由模型；它只返回选中的路由/Skill ID，不运行 Skill、Plan、工具或回答生成，也不把共享长期记忆注入评测上下文。脚本不读取 API Key、不保存请求正文，完成后删除临时会话；未启用 Skill 的用例会跳过，未覆盖的启用 Skill 会阻止结果成为完整基线。该评测衡量路由选择，不替代 Chat Runtime 端到端验收。
+3. 先运行本机活跃路由选择评测。脚本默认组合 Stage C v3 与用户 Skill 冒烟集，通过专用 route-only API 调用实际启用的 BM25/Embedding/RRF/Reranker 和路由模型；它只返回选中的路由/Skill ID，不运行 Skill、Plan、工具或回答生成，也不把共享长期记忆注入评测上下文。脚本不读取 API Key、不保存请求正文，完成后删除临时会话；未启用 Skill 的用例会跳过，未覆盖的启用 Skill 会阻止结果成为完整基线。该评测衡量路由选择，不替代 Chat Agent Runtime 端到端验收。
 4. 对写文件、外发请求等副作用场景，只用隔离临时目录和专用测试 Server；需要用户确认的操作仍走审批流程。禁止把真实业务文件或生产工具接入首轮自动评测。
 5. 每条按标注比对路由、JSON/schema、Plan、评估结果和执行轨迹。至少两人复核边界/安全失败；分歧记为待确认，不计作模型正确。
 6. 汇总指标、失败案例、Token 与耗时，提出阈值调整建议；调整后重跑完整集合并更新评测记录。
@@ -141,8 +141,8 @@ review_notes: "标注理由及允许的合理变体"
 
 每轮结果记录到 `docs/test-results/`，包含评测集版本、模型非敏感标识、环境、样本数量、各项分子/分母、失败案例、Token/延迟、人工复核意见和阈值变更。凭证、原始私密对话和工具返回的敏感内容不得进入报告。
 
-最新完整活跃 Chat Runtime 路由基线：[2026-11-12 字段化 BM25 + RRF 首轮评测与复测](test-results/2026-11-12-fielded-bm25-rrf-live-baseline.md)。2026-11-14 首次完整 Chat 评测因误路由执行评测集外 Skill 并触发 20,000 Token 预算而中止，该次不作为质量指标。随后新增 route-only API，并完成当前启用 Skill 的组合路由评测：结果和边界见[route-only 实测报告](test-results/2026-11-14-live-routing-route-only.md)，中断及隔离实现见[诊断记录](test-results/2026-11-14-live-routing-retry.md)。针对“高置信 YAML 候选却被判为顶层澄清”的缺口补了 Plan 兜底及 48 项定向回归测试；重启后复测为 18/20（90%）。route-only 是路由选择基线，不替代 Chat Runtime 端到端评测。v2 与 v3 的澄清标注不同，不进行直接百分比比较。
+最新完整活跃 Chat Agent Runtime 路由基线：[2026-11-12 字段化 BM25 + RRF 首轮评测与复测](test-results/2026-11-12-fielded-bm25-rrf-live-baseline.md)。2026-11-14 首次完整 Chat 评测因误路由执行评测集外 Skill 并触发 20,000 Token 预算而中止，该次不作为质量指标。随后新增 route-only API，并完成当前启用 Skill 的组合路由评测：结果和边界见[route-only 实测报告](test-results/2026-11-14-live-routing-route-only.md)，中断及隔离实现见[诊断记录](test-results/2026-11-14-live-routing-retry.md)。针对“高置信 YAML 候选却被判为顶层澄清”的缺口补了 Plan 兜底及 48 项定向回归测试；重启后复测为 18/20（90%）。route-only 是路由选择基线，不替代 Chat Agent Runtime 端到端评测。v2 与 v3 的澄清标注不同，不进行直接百分比比较。
 
 此前 Runtime 评测记录：[2026-11-05 Plan 定向复测](test-results/2026-11-05-stage-c-plan-recheck.md)。`plan-001` 在提案级目标下已通过路由、Plan 执行、Verifier 和审批提案流程；Runtime 完成且没有重规划。写入仍由内存 stub 记录，真实文件副作用为 0，因此结果不代表磁盘写入已验证。后续 `skill-meeting-001` 修复输入映射后已通过路由、准入、step 执行和结果评估，但使用合成的 `evaluation_noop` action，只验证数据映射与评测链路，不代表会议纪要生成质量。随包代码审查 Skill 的真实模型定向评测也通过了路由、准入、执行和结果评估；人工复核发现 `skill-code-001` 答复偏保守，未给出条件性授权风险，且英文答复与中文请求不一致。`safety-002` 未泄露环境变量，提示注入安全目标通过。2026-11-15 的 Plan Runtime 多轮失败诊断与 `plan-001` 至 `plan-003` 最终结果见[复测诊断](test-results/2026-11-15-stage-c-runtime-rerun-diagnostic.md)；2026-11-16 `plan-004` 路由匹配澄清，但未具体追问缺失的参会人和日历字段，且评测数据的期望 skill 标签冲突，详见[`plan-004` Runtime 结果](test-results/2026-11-16-stage-c-plan-004-runtime.md)。
 
-2026-11-14 Skill 格式分流复测及真实 Chat Runtime 的代码审查缺参澄清见[Skill 分流测试记录](test-results/2026-11-14-skill-format-plan-fallback.md)。选择器、DeepAgents/Plan 兜底和工具边界的隔离替身测试通过。真实模型 `plan-001` 已进入 Plan 并生成两版任务图，但 3 个工具任务均未解析到可执行工具；诊断定位为中文任务与英文工具元数据不匹配导致候选召回为空。现已把工具 `access_summary` 纳入召回及子能力选择，并增加回归测试；真实模型 Plan 执行尚待复测。
+2026-11-14 Skill 格式分流复测及真实 Chat Agent Runtime 的代码审查缺参澄清见[Skill 分流测试记录](test-results/2026-11-14-skill-format-plan-fallback.md)。选择器、DeepAgents/Plan 兜底和工具边界的隔离替身测试通过。真实模型 `plan-001` 已进入 Plan 并生成两版任务图，但 3 个工具任务均未解析到可执行工具；诊断定位为中文任务与英文工具元数据不匹配导致候选召回为空。现已把工具 `access_summary` 纳入召回及子能力选择，并增加回归测试；真实模型 Plan 执行尚待复测。

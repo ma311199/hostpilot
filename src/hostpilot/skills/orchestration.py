@@ -253,7 +253,7 @@ class OrchestratorPlanExecutor:
         completed_effects: list[SkillSideEffect] = []
         in_flight_operations: set[str] = set()
         try:
-            request.budget.ensure_available()
+            request.request_context.budget.ensure_available()
         except BudgetExceededError:
             return _failed_result("budget_exceeded", blackboard=BlackboardSnapshot(()))
         try:
@@ -275,7 +275,7 @@ class OrchestratorPlanExecutor:
                     )
                 board = BlackboardSnapshot(tuple(states.values()))
                 try:
-                    request.budget.ensure_available()
+                    request.request_context.budget.ensure_available()
                 except BudgetExceededError:
                     return _failed_result("budget_exceeded", blackboard=board)
                 try:
@@ -299,7 +299,7 @@ class OrchestratorPlanExecutor:
                 if replan_count == self.max_replans:
                     return _failed_result(validation.reason_code, validation.message, board)
                 try:
-                    request.budget.ensure_available()
+                    request.request_context.budget.ensure_available()
                 except BudgetExceededError:
                     return _failed_result("budget_exceeded", blackboard=board)
                 try:
@@ -359,7 +359,7 @@ class OrchestratorPlanExecutor:
                 if failure_reason is not None:
                     break
                 try:
-                    request.budget.ensure_available()
+                    request.request_context.budget.ensure_available()
                 except BudgetExceededError:
                     return _failed_result("budget_exceeded", blackboard=wave_board)
 
@@ -391,7 +391,7 @@ class OrchestratorPlanExecutor:
                     async with concurrency_gate:
                         operation_started = False
                         try:
-                            request.budget.ensure_available()
+                            request.request_context.budget.ensure_available()
                             operation_started = True
                             in_flight_operations.add(task_item.task_id)
                             with trace_context_scope(task_trace):
@@ -452,16 +452,16 @@ class OrchestratorPlanExecutor:
                         execution_task.cancel()
                     await asyncio.gather(*execution_tasks, return_exceptions=True)
                     compensation_records = await self.compensation_registry.compensate(
-                        request_id=request.context.request_id,
-                        context=request.context,
-                        budget=request.budget,
+                        request_id=request.request_context.snapshot.request_id,
+                        context=request.request_context.snapshot,
+                        budget=request.request_context.budget,
                         effects=completed_effects,
-                        confirmation_provider=request.confirmation_provider,
+                        confirmation_provider=request.request_context.confirmation_provider,
                     )
                     cancellation_snapshot = await persist_cancellation(
                         self.cancellation_sink,
                         CancellationSnapshot(
-                            request_id=request.context.request_id,
+                            request_id=request.request_context.snapshot.request_id,
                             scope="builtin/orchestrator_plan",
                             uncertain_operations=tuple(sorted(in_flight_operations)),
                             side_effects=tuple(completed_effects),
@@ -523,7 +523,7 @@ class OrchestratorPlanExecutor:
             board = BlackboardSnapshot(tuple(states.values()))
             if failure_reason is None:
                 try:
-                    request.budget.ensure_available()
+                    request.request_context.budget.ensure_available()
                 except BudgetExceededError:
                     return _failed_result("budget_exceeded", blackboard=board)
                 try:
@@ -539,7 +539,7 @@ class OrchestratorPlanExecutor:
             if replan_count == self.max_replans:
                 return _failed_result(failure_reason, blackboard=board)
             try:
-                request.budget.ensure_available()
+                request.request_context.budget.ensure_available()
             except BudgetExceededError:
                 return _failed_result("budget_exceeded", blackboard=board)
             try:
@@ -671,7 +671,7 @@ def _idempotency_key(request: SkillExecutionRequest, task: PlanTask) -> str:
     return str(
         uuid5(
             NAMESPACE_URL,
-            f"{request.context.request_id}:builtin/orchestrator_plan:{signature}",
+            f"{request.request_context.snapshot.request_id}:builtin/orchestrator_plan:{signature}",
         )
     )
 

@@ -4,14 +4,14 @@ import pytest
 from pydantic import ValidationError
 
 from hostpilot.persistence.harness_configuration import (
-    HarnessRuntimeConfiguration,
+    HarnessConfiguration,
     SQLiteHarnessConfigurationStore,
 )
 
 
 def test_harness_configuration_store_persists_validated_settings(tmp_path) -> None:
     store = SQLiteHarnessConfigurationStore(tmp_path / "data" / "hostpilot.sqlite3")
-    configuration = HarnessRuntimeConfiguration(
+    configuration = HarnessConfiguration(
         max_context_messages=25,
         request_token_budget=12_000,
         request_timeout_seconds=45,
@@ -25,7 +25,7 @@ def test_harness_configuration_store_persists_validated_settings(tmp_path) -> No
         routing_max_business_candidates=24,
     )
 
-    async def save_and_reload() -> HarnessRuntimeConfiguration | None:
+    async def save_and_reload() -> HarnessConfiguration | None:
         await store.initialize()
         assert await store.get() is None
         await store.save(configuration)
@@ -37,11 +37,11 @@ def test_harness_configuration_store_persists_validated_settings(tmp_path) -> No
 
 def test_harness_configuration_rejects_out_of_range_budgets() -> None:
     with pytest.raises(ValidationError):
-        HarnessRuntimeConfiguration(request_tool_call_budget=101)
+        HarnessConfiguration(request_tool_call_budget=101)
     with pytest.raises(ValidationError):
-        HarnessRuntimeConfiguration(routing_minimum_business_confidence=0.49)
+        HarnessConfiguration(routing_minimum_business_confidence=0.49)
     with pytest.raises(ValidationError):
-        HarnessRuntimeConfiguration(routing_minimum_plan_candidate_confidence=0.49)
+        HarnessConfiguration(routing_minimum_plan_candidate_confidence=0.49)
 
 
 def test_harness_configuration_store_rejects_database_symlink(tmp_path) -> None:

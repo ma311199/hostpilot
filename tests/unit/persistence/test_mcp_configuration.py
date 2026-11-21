@@ -12,19 +12,21 @@ def test_mcp_description_persists_across_store_instances(tmp_path) -> None:
     async def scenario() -> None:
         store = SQLiteMCPConfigurationStore(database_path)
         await store.initialize()
-        await store.save({
-            "name": "research",
-            "transport": "streamable_http",
-            "url": "https://mcp.example/mcp",
-            "command": None,
-            "args": (),
-            "cwd": None,
-            "timeout_seconds": 15,
-            "enabled": True,
-            "api_key_header": None,
-            "api_key_env": None,
-            "description": "Searches the internal research collection.",
-        })
+        await store.save(
+            {
+                "name": "research",
+                "transport": "streamable_http",
+                "url": "https://mcp.example/mcp",
+                "command": None,
+                "args": (),
+                "cwd": None,
+                "timeout_seconds": 15,
+                "enabled": True,
+                "api_key_header": None,
+                "api_key_env": None,
+                "description": "Searches the internal research collection.",
+            }
+        )
 
         restarted = SQLiteMCPConfigurationStore(database_path)
         await restarted.initialize()

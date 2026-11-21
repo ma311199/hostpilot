@@ -22,6 +22,9 @@
 
 - 遵循 PEP 8；使用类型标注描述公共接口和跨模块数据。
 - 使用 snake_case 命名模块、函数和变量，PascalCase 命名类型，常量使用 UPPER_SNAKE_CASE。
+- 类名按职责选用明确的角色词：`*Host`/`*Context`/`*Plugin` 专指进程级 Runtime Host 生命周期；聊天执行边界使用 `ChatAgentRuntime`；Skill 执行核心称 `SkillEngine`；模型创建结果称 `ModelRuntimeComponents`，其选择注册表称 `ModelProviderRegistry`。避免用裸 `Runtime` 表达多个领域职责。
+- 同一实体的标识在 Python、JSON、WebSocket、TypeScript 和持久化层使用 `session_id`；TypeScript 局部变量使用 `sessionId`。保留 Conversation 作为资源名，因此资源路由仍为 `/conversations/{session_id}`。
+- Protocol、Service、Adapter、Plugin、Store、Registry、Factory 等后缀仅用于对应角色；实现和适配器名称应包含被适配的领域对象，避免泛化的 `Runtime` 或 `Manager`。
 - 公共类、函数和复杂安全逻辑应写清用途、约束、异常与副作用；注释解释原因，不复述代码。
 - 避免模块循环依赖、重复策略实现和隐式全局状态；配置通过显式对象注入。
 - 日志使用结构化字段，禁止记录密钥、个人会话敏感数据或不必要的完整提示词。
@@ -71,7 +74,7 @@ HOSTPILOT_PLAN_VERIFIER_PLUGIN=builtin.llm
 HOSTPILOT_PLAN_REPLANNER_PLUGIN=builtin.llm
 ```
 
-自定义工厂由应用启动代码注册，再将注册表传给 `create_app` 或 `create_configured_runtime`。插件接口版本当前为 `1.0`。插件可访问启动时注入的依赖，因此必须是受信任的 Python 代码并遵守 HostPilot 的策略、预算、审批、取消、补偿和审计契约；注册表不提供进程隔离。当前不支持任意模块路径导入或热加载。
+自定义工厂由应用启动代码注册，再将注册表传给 `create_app` 或 `create_configured_chat_agent_runtime`。插件接口版本当前为 `1.0`。插件可访问启动时注入的依赖，因此必须是受信任的 Python 代码并遵守 HostPilot 的策略、预算、审批、取消、补偿和审计契约；注册表不提供进程隔离。当前不支持任意模块路径导入或热加载。
 
 应用集成代码可从默认注册表派生，并只替换需要的角色：
 
@@ -86,17 +89,17 @@ app = create_app(settings, plan_component_registry=registry)
 
 ## 可替换对话运行时
 
-底层 Chat Runtime 也通过版本 `1.0` 的 `ChatRuntimeRegistry` 替换，默认实现为 `builtin.deepagents`。用 `HOSTPILOT_CHAT_RUNTIME_PLUGIN` 选择实现；自定义工厂接收模型适配器、checkpointer、Skill 适配器和工具列表，并返回实现 `AgentRuntime` 接口的对象。
+底层 Chat Agent Runtime 也通过版本 `2.0` 的 `ChatAgentRuntimeRegistry` 替换，默认实现为 `builtin.runtime-chat`。用 `HOSTPILOT_CHAT_RUNTIME_PLUGIN` 选择实现；需要兼容回退时可显式设置为 `builtin.deepagents`。自定义工厂接收模型适配器、checkpointer、Skill 适配器和工具列表，并返回实现 `ChatAgentRuntime` 接口的对象。
 
-应用代码通过 `create_default_chat_runtime_registry()` 获取默认注册表，注册自定义工厂后传给 `create_app(..., chat_runtime_registry=registry)`。HostPilot 的 Skill 路由和外层 Runtime Adapter 仍由应用组装。
+应用代码通过 `create_default_chat_agent_runtime_registry()` 获取默认注册表，注册自定义工厂后传给 `create_app(..., chat_agent_runtime_registry=registry)`。HostPilot 的 Skill 路由和外层适配器仍由应用组装。
 
 详见 [ADR-0019](decisions/0019-versioned-chat-runtime-plugins.md)。
 
 ## 可替换模型 Provider
 
-`ModelRuntimeRegistry` 按 Provider 实现 ID 注册 `ModelRuntime` 工厂，接口版本为 `1.0`，默认实现为 `builtin.openai-compatible`。使用 `HOSTPILOT_MODEL_PROVIDER_PLUGIN` 选择实现。工厂需返回统一 `ModelProvider` 和 Agent 框架模型适配器；`ModelProvider.complete` 必须遵守 HostPilot 请求/响应及 Token usage 契约。
+`ModelProviderRegistry` 按 Provider 实现 ID 注册 `ModelRuntimeComponents` 工厂，接口版本为 `1.0`，默认实现为 `builtin.openai-compatible`。使用 `HOSTPILOT_MODEL_PROVIDER_PLUGIN` 选择实现。工厂需返回统一 `ModelProvider` 和 Agent 框架模型适配器；`ModelProvider.complete` 必须遵守 HostPilot 请求/响应及 Token usage 契约。
 
-应用可通过 `create_default_model_runtime_registry()` 派生注册表并注册受信任的自定义工厂，再传给 `create_app(..., model_runtime_registry=registry)`。工厂接收完整 Settings（包括 SecretStr API Key），必须遵守凭证生命周期；注册表不隔离 Python 代码。
+应用可通过 `create_default_model_provider_registry()` 派生注册表并注册受信任的自定义工厂，再传给 `create_app(..., model_provider_registry=registry)`。工厂接收完整 Settings（包括 SecretStr API Key），必须遵守凭证生命周期；注册表不隔离 Python 代码。
 
 详见 [ADR-0020](decisions/0020-versioned-model-provider-plugins.md)。
 
@@ -104,7 +107,7 @@ app = create_app(settings, plan_component_registry=registry)
 
 会话元数据通过 `ConversationStore` Protocol 注入，LangGraph Checkpointer 使用单独的 `CheckpointerFactory`。默认 `create_app` 仍使用 `SQLiteConversationStore` 和 SQLite Checkpointer，它们继续共用同一数据库文件；调用方可分别注入 `conversation_store_factory` 与 `checkpointer_factory`。两者不要求通过插件 ID 选择。
 
-自定义会话 Store 必须实现初始化、创建/查询/列表、活动更新时间、删除和沙箱级别单向升级。替换 Checkpointer 时还须支持会话 thread ID 的图状态生命周期；ID 映射使用 `conversation_thread_config`。
+自定义会话 Store 必须实现初始化、创建/查询/列表、活动更新时间、删除和沙箱级别单向升级。替换 Checkpointer 时还须支持会话 thread ID 的图状态生命周期；ID 映射使用 `session_thread_config`。
 
 详见 [ADR-0021](decisions/0021-conversation-store-and-checkpointer-ports.md)。
 

@@ -18,6 +18,7 @@ from hostpilot.models import ModelResponse
 from hostpilot.observability import TraceContext, TraceEvent, trace_context_scope
 from hostpilot.routing.models import RerankBatch
 from hostpilot.routing.skill_selector import ModelProviderSkillSelector
+from hostpilot.runtime import RequestContext
 from hostpilot.skills.registry import SkillRegistry
 from hostpilot.skills.yaml_registry import YamlSkillRegistry
 
@@ -35,6 +36,10 @@ def budget() -> RequestBudget:
             )
         )
     )
+
+
+def select(selector, message, context, *, budget):
+    return selector.select(message, RequestContext(context, budget))
 
 
 def package_manifest() -> dict[str, Any]:
@@ -118,7 +123,8 @@ def test_selector_routes_direct_and_accounts_classifier_usage(tmp_path: Path) ->
     request_budget = budget()
 
     selection = asyncio.run(
-        selector.select(
+        select(
+            selector,
             "Explain quantum computing",
             ContextSnapshot(request_id="request-1"),
             budget=request_budget,
@@ -157,7 +163,8 @@ def test_selector_traces_business_scores_when_classifier_selects_direct(tmp_path
 
     with trace_context_scope(TraceContext()):
         selection = asyncio.run(
-            selector.select(
+            select(
+                selector,
                 "Review this code: def check(value): return eval(value)",
                 ContextSnapshot(request_id="classification-trace"),
                 budget=budget(),
@@ -203,7 +210,8 @@ def test_selector_parses_json_from_plain_chat_completion(tmp_path: Path) -> None
     request_budget = budget()
 
     selection = asyncio.run(
-        selector.select(
+        select(
+            selector,
             "What does photosynthesis mean?",
             ContextSnapshot(request_id="request-plain"),
             budget=request_budget,
@@ -224,7 +232,7 @@ def test_unparseable_query_is_clarified_before_skill_retrieval(tmp_path: Path) -
 
     selector._retrieve_candidates = retrieval_must_not_run
     selection = asyncio.run(
-        selector.select("???", ContextSnapshot(request_id="unparseable"), budget=budget())
+        select(selector, "???", ContextSnapshot(request_id="unparseable"), budget=budget())
     )
 
     assert selection.skill_id == "builtin/clarify"
@@ -239,7 +247,8 @@ def test_explicitly_requested_unavailable_skill_clarifies_before_model_or_plan(
     selector = ModelProviderSkillSelector(YamlSkillRegistry(tmp_path), model)
 
     selection = asyncio.run(
-        selector.select(
+        select(
+            selector,
             "请调用 `business/payroll-adjust` Skill，把小王工资改成 50000 元并保存。",
             ContextSnapshot(request_id="unknown-explicit-skill"),
             budget=budget(),
@@ -261,7 +270,8 @@ def test_reference_without_context_candidates_clarifies_before_retrieval(tmp_pat
 
     selector._retrieve_candidates = retrieval_must_not_run
     selection = asyncio.run(
-        selector.select(
+        select(
+            selector,
             "把这段内容整理一下。",
             ContextSnapshot(request_id="empty-reference-context"),
             budget=budget(),
@@ -306,7 +316,7 @@ def test_reference_is_resolved_only_from_memory_candidates_before_skill_retrieva
     )
 
     selection = asyncio.run(
-        selector.select("把这段关于回归测试的内容整理一下。", context, budget=budget())
+        select(selector, "把这段关于回归测试的内容整理一下。", context, budget=budget())
     )
 
     assert selection.skill_id == "builtin/direct_answer"
@@ -329,7 +339,7 @@ def test_generic_reference_does_not_match_unique_unrelated_memory_candidate(
         long_term_memory="阳台植物每周浇水两次，春季修剪枯叶。",
     )
 
-    selection = asyncio.run(selector.select("把这段内容整理一下。", context, budget=budget()))
+    selection = asyncio.run(select(selector, "把这段内容整理一下。", context, budget=budget()))
 
     assert selection.skill_id == "builtin/clarify"
     assert selection.reason_code == "query_context_ambiguous"
@@ -360,7 +370,7 @@ def test_reference_low_confidence_match_clarifies_without_skill_retrieval(tmp_pa
     )
 
     selection = asyncio.run(
-        selector.select("把这段关于回归测试的内容整理一下。", context, budget=budget())
+        select(selector, "把这段关于回归测试的内容整理一下。", context, budget=budget())
     )
 
     assert selection.skill_id == "builtin/clarify"
@@ -392,7 +402,7 @@ def test_reference_no_match_clarifies_instead_of_choosing_a_candidate(tmp_path: 
     )
 
     selection = asyncio.run(
-        selector.select("把这段关于预算的内容整理一下。", context, budget=budget())
+        select(selector, "把这段关于预算的内容整理一下。", context, budget=budget())
     )
 
     assert selection.skill_id == "builtin/clarify"
@@ -411,7 +421,8 @@ def test_followup_reuses_latest_task_context_without_query_model_call(tmp_path: 
     )
 
     selection = asyncio.run(
-        selector.select(
+        select(
+            selector,
             "继续",
             context,
             budget=budget(),
@@ -439,8 +450,11 @@ def test_selector_delegates_missing_slots_to_selected_skill_runtime(tmp_path: Pa
     )
 
     selection = asyncio.run(
-        selector.select(
-            "summarize these meeting notes", ContextSnapshot(request_id="r"), budget=budget()
+        select(
+            selector,
+            "summarize these meeting notes",
+            ContextSnapshot(request_id="r"),
+            budget=budget(),
         )
     )
 
@@ -469,7 +483,8 @@ def test_missing_skill_slots_clarify_when_classifier_marks_scope_incomplete(
     )
 
     selection = asyncio.run(
-        selector.select(
+        select(
+            selector,
             "Summarize these meeting notes",
             ContextSnapshot(request_id="missing-slot-and-incomplete-scope"),
             budget=budget(),
@@ -494,7 +509,8 @@ def test_partial_skill_coverage_routes_compound_request_to_plan(tmp_path: Path) 
     selector = ModelProviderSkillSelector(YamlSkillRegistry(tmp_path), model)
 
     selection = asyncio.run(
-        selector.select(
+        select(
+            selector,
             "Summarize these notes, create a calendar event, and email the attendees.",
             ContextSnapshot(request_id="partial-skill-coverage"),
             budget=budget(),
@@ -519,7 +535,8 @@ def test_explicitly_compound_actions_cannot_use_skill_fast_path(tmp_path: Path) 
     selector = ModelProviderSkillSelector(YamlSkillRegistry(tmp_path), model)
 
     selection = asyncio.run(
-        selector.select(
+        select(
+            selector,
             (
                 "把这段会议记录整理成纪要，然后创建日历事件并给三位参会人发送邮件。"
                 "记录：周五 15 点评审发布方案。"
@@ -546,7 +563,8 @@ def test_contract_inspection_can_plan_to_discover_missing_service_paths(tmp_path
     selector = ModelProviderSkillSelector(YamlSkillRegistry(tmp_path), model)
 
     selection = asyncio.run(
-        selector.select(
+        select(
+            selector,
             "检查两个服务的 API 契约是否一致，整理差异，并为需要的代码调整拟定分步计划。",
             ContextSnapshot(request_id="plan-006-discover-contracts"),
             budget=budget(),
@@ -571,13 +589,14 @@ def test_selector_sends_incomplete_high_confidence_clarification_to_plan(tmp_pat
     selector = ModelProviderSkillSelector(
         YamlSkillRegistry(tmp_path / "yaml", additional_roots=(PACKAGED_SKILLS,)),
         model,
-        deepagents_registry=markdown_registry,
-        deepagents_skill_ids_by_name={"office-helper": "legacy/office-helper"},
-        execution_modes={"legacy/office-helper": "deepagents"},
+        markdown_registry=markdown_registry,
+        markdown_skill_ids_by_name={"office-helper": "legacy/office-helper"},
+        execution_modes={"legacy/office-helper": "markdown"},
     )
 
     selection = asyncio.run(
-        selector.select(
+        select(
+            selector,
             "Please review my code",
             ContextSnapshot(request_id="high-score-clarify-mismatch"),
             budget=budget(),
@@ -603,7 +622,8 @@ def test_selector_can_route_to_packaged_code_review_skill(tmp_path: Path) -> Non
     )
 
     selection = asyncio.run(
-        selector.select(
+        select(
+            selector,
             "Review this code: def check(value): return eval(value)",
             ContextSnapshot(request_id="review-route"),
             budget=budget(),
@@ -629,7 +649,9 @@ def test_selector_sends_low_confidence_business_request_to_plan(tmp_path: Path) 
     )
 
     selection = asyncio.run(
-        selector.select("summarize meeting notes", ContextSnapshot(request_id="r"), budget=budget())
+        select(
+            selector, "summarize meeting notes", ContextSnapshot(request_id="r"), budget=budget()
+        )
     )
 
     assert selection.skill_id == "builtin/orchestrator_plan"
@@ -666,7 +688,9 @@ def test_selector_requires_minimum_margin_for_business_fast_path(tmp_path: Path)
     )
 
     selection = asyncio.run(
-        selector.select("summarize meeting notes", ContextSnapshot(request_id="r"), budget=budget())
+        select(
+            selector, "summarize meeting notes", ContextSnapshot(request_id="r"), budget=budget()
+        )
     )
 
     assert selection.skill_id == "builtin/orchestrator_plan"
@@ -702,8 +726,11 @@ def test_selector_passes_at_most_five_medium_yaml_candidates_to_plan(tmp_path: P
     )
 
     selection = asyncio.run(
-        selector.select(
-            "Summarize the meeting notes", ContextSnapshot(request_id="r"), budget=budget()
+        select(
+            selector,
+            "Summarize the meeting notes",
+            ContextSnapshot(request_id="r"),
+            budget=budget(),
         )
     )
 
@@ -781,7 +808,7 @@ def test_selector_rejects_model_selected_unknown_skill(tmp_path: Path) -> None:
     )
 
     selection = asyncio.run(
-        selector.select("perform this task", ContextSnapshot(request_id="r"), budget=budget())
+        select(selector, "perform this task", ContextSnapshot(request_id="r"), budget=budget())
     )
 
     assert selection.skill_id == "builtin/clarify"
@@ -796,17 +823,17 @@ def test_selector_routes_to_markdown_skill_only_when_execution_mode_allows_it(
     registry.save("meeting-notes", "Write minutes.", "List decisions.")
     selector = ModelProviderSkillSelector(
         YamlSkillRegistry(tmp_path / "yaml"),
-        FakeChatModel(response("deepagents_skill", skill_id="legacy/meeting-notes")),
-        deepagents_registry=registry,
-        execution_modes={"legacy/meeting-notes": "deepagents"},
+        FakeChatModel(response("markdown_skill", skill_id="legacy/meeting-notes")),
+        markdown_registry=registry,
+        execution_modes={"legacy/meeting-notes": "markdown"},
     )
 
     selection = asyncio.run(
-        selector.select("summarize notes", ContextSnapshot(request_id="r"), budget=budget())
+        select(selector, "summarize notes", ContextSnapshot(request_id="r"), budget=budget())
     )
 
     assert selection.skill_id == "legacy/meeting-notes"
-    assert selection.execution_mode == "deepagents"
+    assert selection.execution_mode == "markdown"
 
 
 def test_selector_normalizes_business_decision_for_available_markdown_skill(
@@ -817,16 +844,16 @@ def test_selector_normalizes_business_decision_for_available_markdown_skill(
     selector = ModelProviderSkillSelector(
         YamlSkillRegistry(tmp_path / "yaml"),
         FakeChatModel(response("business_skill", skill_id="legacy/meeting-notes")),
-        deepagents_registry=registry,
-        execution_modes={"legacy/meeting-notes": "deepagents"},
+        markdown_registry=registry,
+        execution_modes={"legacy/meeting-notes": "markdown"},
     )
 
     selection = asyncio.run(
-        selector.select("summarize notes", ContextSnapshot(request_id="r"), budget=budget())
+        select(selector, "summarize notes", ContextSnapshot(request_id="r"), budget=budget())
     )
 
     assert selection.skill_id == "legacy/meeting-notes"
-    assert selection.execution_mode == "deepagents"
+    assert selection.execution_mode == "markdown"
     assert selection.reason_code == "markdown_skill_selected_as_business"
 
 
@@ -850,17 +877,19 @@ def test_markdown_skill_result_assessment_reports_semantic_failure(tmp_path: Pat
     selector = ModelProviderSkillSelector(
         YamlSkillRegistry(tmp_path / "yaml"),
         AssessmentModel(),
-        deepagents_registry=registry,
-        execution_modes={"legacy/meeting-notes": "deepagents"},
+        markdown_registry=registry,
+        execution_modes={"legacy/meeting-notes": "markdown"},
     )
 
     accepted, reason_code, usage = asyncio.run(
-        selector.assess_deepagents_result(
+        selector.assess_markdown_result(
             "legacy/meeting-notes",
             "Summarize the decisions and owners",
             "Here is a general summary.",
-            ContextSnapshot(request_id="markdown-assessment"),
-            budget=budget(),
+            RequestContext(
+                ContextSnapshot(request_id="markdown-assessment"),
+                budget(),
+            ),
         )
     )
 
@@ -872,20 +901,20 @@ def test_markdown_skill_result_assessment_reports_semantic_failure(tmp_path: Pat
 def test_selector_rejects_markdown_skill_when_yaml_mode_is_selected(tmp_path: Path) -> None:
     registry = SkillRegistry(tmp_path / "markdown")
     registry.save("meeting-notes", "Write minutes.", "List decisions.")
-    model = FakeChatModel(response("deepagents_skill", skill_id="legacy/meeting-notes"))
+    model = FakeChatModel(response("markdown_skill", skill_id="legacy/meeting-notes"))
     selector = ModelProviderSkillSelector(
         YamlSkillRegistry(tmp_path / "yaml"),
         model,
-        deepagents_registry=registry,
+        markdown_registry=registry,
         execution_modes={"legacy/meeting-notes": "yaml"},
     )
 
     selection = asyncio.run(
-        selector.select("summarize notes", ContextSnapshot(request_id="r"), budget=budget())
+        select(selector, "summarize notes", ContextSnapshot(request_id="r"), budget=budget())
     )
 
     assert selection.skill_id == "builtin/clarify"
-    assert selection.reason_code == "deepagents_skill_not_available"
+    assert selection.reason_code == "markdown_skill_not_available"
 
 
 def test_selector_clarifies_when_classifier_fails_closed(tmp_path: Path) -> None:
@@ -894,7 +923,7 @@ def test_selector_clarifies_when_classifier_fails_closed(tmp_path: Path) -> None
     )
 
     selection = asyncio.run(
-        selector.select("do something", ContextSnapshot(request_id="r"), budget=budget())
+        select(selector, "do something", ContextSnapshot(request_id="r"), budget=budget())
     )
 
     assert selection.skill_id == "builtin/clarify"
@@ -911,8 +940,11 @@ def test_selector_uses_main_model_when_lightweight_model_fails(tmp_path: Path) -
     )
 
     selection = asyncio.run(
-        selector.select(
-            "Explain dependency injection", ContextSnapshot(request_id="r"), budget=budget()
+        select(
+            selector,
+            "Explain dependency injection",
+            ContextSnapshot(request_id="r"),
+            budget=budget(),
         )
     )
 
@@ -933,8 +965,11 @@ def test_selector_uses_main_model_when_optional_lightweight_model_is_absent(
     )
 
     selection = asyncio.run(
-        selector.select(
-            "Explain dependency injection", ContextSnapshot(request_id="r"), budget=budget()
+        select(
+            selector,
+            "Explain dependency injection",
+            ContextSnapshot(request_id="r"),
+            budget=budget(),
         )
     )
 
@@ -956,8 +991,11 @@ def test_selector_falls_back_to_bm25_when_embedding_recall_fails(tmp_path: Path)
     selector.vector_index = FailingVectorIndex()
 
     selection = asyncio.run(
-        selector.select(
-            "Explain dependency injection", ContextSnapshot(request_id="r"), budget=budget()
+        select(
+            selector,
+            "Explain dependency injection",
+            ContextSnapshot(request_id="r"),
+            budget=budget(),
         )
     )
 

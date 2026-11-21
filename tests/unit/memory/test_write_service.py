@@ -12,15 +12,15 @@ CONVERSATION_ID = "6c442c1e-6e95-4908-88ab-0b3a3c195443"
 
 
 class FakeConversations:
-    def __init__(self, conversation_id: str | None = CONVERSATION_ID) -> None:
-        self.conversation_id = conversation_id
+    def __init__(self, session_id: str | None = CONVERSATION_ID) -> None:
+        self.session_id = session_id
 
-    async def get(self, conversation_id: str) -> ConversationSummary | None:
-        if conversation_id != self.conversation_id:
+    async def get(self, session_id: str) -> ConversationSummary | None:
+        if session_id != self.session_id:
             return None
         now = datetime.now(UTC)
         return ConversationSummary(
-            conversation_id=conversation_id,
+            session_id=session_id,
             title="Memory test",
             created_at=now,
             updated_at=now,
@@ -32,7 +32,7 @@ def test_memory_write_requires_explicit_user_approval(tmp_path) -> None:
     service = MemoryWriteService(memory, FakeConversations())
     proposal = MemoryWriteProposal(
         scope=MemoryScope.SESSION_SUMMARY,
-        conversation_id=CONVERSATION_ID,
+        session_id=CONVERSATION_ID,
         content="Approved session facts",
     )
 
@@ -44,10 +44,10 @@ def test_memory_write_requires_explicit_user_approval(tmp_path) -> None:
 
 def test_approved_session_summary_requires_an_existing_conversation(tmp_path) -> None:
     memory = MarkdownMemoryStore(tmp_path / "memory")
-    service = MemoryWriteService(memory, FakeConversations(conversation_id=None))
+    service = MemoryWriteService(memory, FakeConversations(session_id=None))
     proposal = MemoryWriteProposal(
         scope=MemoryScope.SESSION_SUMMARY,
-        conversation_id=CONVERSATION_ID,
+        session_id=CONVERSATION_ID,
         content="Session facts",
     )
 
@@ -62,7 +62,7 @@ def test_approved_proposals_write_only_to_their_declared_scope(tmp_path) -> None
     service = MemoryWriteService(memory, FakeConversations())
     session_proposal = MemoryWriteProposal(
         scope=MemoryScope.SESSION_SUMMARY,
-        conversation_id=CONVERSATION_ID,
+        session_id=CONVERSATION_ID,
         content="Session summary",
     )
     shared_proposal = MemoryWriteProposal(
@@ -78,13 +78,13 @@ def test_approved_proposals_write_only_to_their_declared_scope(tmp_path) -> None
 
 
 def test_memory_proposal_rejects_invalid_scope_and_oversized_content(tmp_path) -> None:
-    with pytest.raises(ValidationError, match="require conversation_id"):
+    with pytest.raises(ValidationError, match="require session_id"):
         MemoryWriteProposal(scope=MemoryScope.SESSION_SUMMARY, content="Summary")
 
     with pytest.raises(ValidationError, match="cannot target a conversation"):
         MemoryWriteProposal(
             scope=MemoryScope.LONG_TERM,
-            conversation_id=CONVERSATION_ID,
+            session_id=CONVERSATION_ID,
             content="Shared memory",
         )
 

@@ -22,9 +22,10 @@ MAX_RESOURCE_BYTES = 512 * 1024
 MAX_PACKAGE_BYTES = 2 * 1024 * 1024
 MAX_PACKAGE_FILES = 100
 SCRIPT_RESOURCE_EXTENSIONS = frozenset({".js", ".py", ".sh"})
-RESOURCE_EXTENSIONS = frozenset(
-    {".csv", ".json", ".md", ".toml", ".txt", ".yaml", ".yml"}
-) | SCRIPT_RESOURCE_EXTENSIONS
+RESOURCE_EXTENSIONS = (
+    frozenset({".csv", ".json", ".md", ".toml", ".txt", ".yaml", ".yml"})
+    | SCRIPT_RESOURCE_EXTENSIONS
+)
 EXECUTABLE_EXTENSIONS = frozenset({".bat", ".cmd", ".dll", ".exe", ".ps1", ".so"})
 VIRTUAL_SKILLS_ROOT = "/skills/user"
 DISABLED_MARKER = ".hostpilot-disabled"

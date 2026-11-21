@@ -22,7 +22,7 @@ from hostpilot.config import Settings
 from hostpilot.contracts import BudgetContext, BudgetLimits, ContextSnapshot
 from hostpilot.evaluation.fixtures import write_fixture_skills
 from hostpilot.evaluation.model_config import model_configuration_from_environment
-from hostpilot.models import create_model_runtime
+from hostpilot.models import create_model_runtime_components
 from hostpilot.routing.skill_selector import ModelProviderSkillSelector
 from hostpilot.skills.yaml_registry import YamlSkillRegistry
 
@@ -179,7 +179,7 @@ async def _run(args: argparse.Namespace) -> int:
         model_base_url=base_url,
         model_streaming=streaming,
     )
-    model = create_model_runtime(settings).provider
+    model = create_model_runtime_components(settings).provider
     report = await _evaluate(model, dataset)
     report["model"] = model_name
     report["streaming"] = streaming

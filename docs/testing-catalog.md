@@ -6,13 +6,13 @@
 
 ### 1. Chat API、请求入口与路由
 
-- **测试类型**：单元、API/集成、WebSocket E2E、真实模型 route-only 评测、Chat Runtime 定向验证。
+- **测试类型**：单元、API/集成、WebSocket E2E、真实模型 route-only 评测、Chat Agent Runtime 定向验证。
 - **代表用例**：direct / clarify / Skill / Plan 路由；候选检索和分类；高置信 Skill 与澄清决策；上下文指代有无记忆；route-only 不得进入执行器；中断时报告标记 incomplete。
 - **问题与处理**：评测汇总曾从错误层级读取 `expected.skill_id`，覆盖率统计异常；已修复字段聚合并从逐例结果重算。活跃 Chat 曾误执行评测集外 Skill 并触发 HTTP 429；新增 route-only 隔离。曾出现 Embedding/Reranker 不可达导致 HTTP 504；该轮标记为不完整，不纳入质量基线。`plan-004` 曾暴露泛化澄清、Plan 无法终止澄清，以及多目标请求被会议纪要 Skill 部分完成却误判为接受；增加明确连接多动作时转 Plan 的本地保护后，Selector 定向测试 28 项通过，真实模型复测已按期望进入澄清并询问具体缺项。v4 `safety-001` 又发现明确点名的未知 Skill 被模型转入 Plan；Selector 增加确定性前置检查后，30 项定向测试通过，真实模型复测也正确澄清，未创建 Plan 或调用工具。上述单例保护不构成通用语义覆盖证明。
 - **指标状态**：route-only 组合评测、召回排名、业务 Skill 精确命中、延迟和 Token 已分轮记录；不同数据集和评测模式不可直接比较。当前汇总见[指标台账](testing-metrics.md)。
 - **报告**：[Stage C 评测计划](stage-c-model-evaluation.md)、[路由组合评测](test-results/2026-11-14-live-routing-route-only.md)、[路由中断与隔离](test-results/2026-11-14-live-routing-retry.md)、[上下文指代评测](test-results/2026-11-14-contextual-reference-resolution.md)、[`plan-004` Runtime](test-results/2026-11-16-stage-c-plan-004-runtime.md)、[`safety-001` 未知 Skill 安全路由](test-results/2026-11-16-stage-c-safety-001-runtime.md)。
 
-### 2. Skill Catalog、注册表与 Skill Runtime
+### 2. Skill Catalog、注册表与 SkillEngine
 
 - **测试类型**：schema/契约、注册表单元、Runtime 单元与集成、隔离工具 stub、真实模型定向评测。
 - **代表用例**：YAML/Markdown/双格式包发现与唯一执行入口；重复 ID、无效依赖、禁用 Skill、工具和子 Skill allowlist；输入/输出 schema；DAG 依赖、并行分支与失败处理；必填参数缺失时澄清；准入和结果评估；Skill 失败转 Plan。
@@ -88,11 +88,16 @@
 
 ### 11. Runtime Host 与插件生命周期
 
-- **测试类型**：Runtime Host/Turn 生命周期单测、Sandbox 后端工厂/插件单测、MCP Builder 注入测试、FastAPI lifespan 与 Provider 刷新集成、Chat Runtime 兼容性回归。
-- **代表用例**：插件依赖排序、缺失依赖与依赖环、必需/可选插件失败、逆序关闭、Turn 完成/失败/取消、按 Session 及 Host 停机取消、ConversationStore/Checkpointer 创建、初始化、服务注册和关闭；ToolFacade 稳定服务、Provider 替换与 Host 解绑；Runtime 创建 ToolExecutionScope 和 ToolInvocationCoordinator、Provider 本地/远程/拦截/补偿路径协调、主/补偿 Registry 隔离和 Sandbox Policy 配置；后端工厂不提前触发隔离探测，Host 关闭清理服务，MCP Builder 使用注入后端，MCP/Model 刷新复用同一后端集且隔离 Workspace/Registry。
-- **问题与处理**：Host 适配器曾总是传入可选确认 Provider，并未转发 route-only Selector；两处均已修复。默认 pytest 收集还存在两个同名 `test_models.py` 模块冲突，完整测试使用 `--import-mode=importlib` 收集。
-- **指标状态**：Sandbox 后端注入扩展回归 **125 passed、1 failed**，唯一失败仍是已知的文件沙箱临时工作区写入问题；全量 pytest **497 passed、1 failed**。Ruff lint/format 与 27 个相关源码文件 mypy 通过。Runtime 工厂每个 Host 创建一次后端集合，由初始和候选 Provider 共用；Provider 继续各自管理 Workspace/Registry/治理 Scope，MCP Provider 插件独占 Provider 资源关闭责任。
-- **报告**：[Turn、ToolFacade、ToolExecutionScope、ToolInvocationCoordinator 与 Sandbox 后端注入验证](test-results/2026-11-18-runtime-turn-lifecycle.md)、[Runtime Host 生命周期验证](test-results/2026-11-17-runtime-host.md)。
+- **测试类型**：Runtime Host/Turn/RequestContext 生命周期单测、Sandbox 后端工厂/插件单测、MCP Builder 注入测试、FastAPI lifespan 与 Provider 刷新集成、Chat Agent Runtime 兼容性回归。
+- **代表用例**：插件依赖排序、缺失依赖与依赖环、必需/可选插件失败、逆序关闭、Turn 完成/失败/取消、按 Session 及 Host 停机取消、ConversationStore/Checkpointer 创建、初始化、服务注册和关闭；ToolFacade 稳定服务、Provider 替换与 Host 解绑；Runtime 创建 ToolExecutionScope 和 ToolInvocationCoordinator、Provider 本地/远程/拦截/补偿路径协调、主/补偿 Registry 隔离和 Sandbox Policy 配置；RequestContext 保留请求快照、活动预算与可选审批能力并适配为 LangGraph 工具 Mapping；ChatService 每个 Turn 创建独立 RequestContext，并验证可选审批 Provider、预算实例传到旧 Tool Port；后端工厂不提前触发隔离探测，Host 关闭清理服务，MCP Builder 使用注入后端，MCP/Model 刷新复用同一后端集且隔离 Workspace/Registry。
+- **问题与处理**：Host 适配器曾总是传入可选确认 Provider，并未转发 route-only Selector；两处均已修复。默认 pytest 收集曾因两个同名 `test_models.py` 模块冲突失败；路由模型测试文件现已改名为 `test_routing_models.py`，默认导入模式已恢复。
+- **最新命名回归与质量修复**：2026-11-19 全量 pytest **507 passed**；全仓 mypy 116 个源码文件通过；Ruff lint 和 205 个 Python 文件格式检查通过；前端 Vitest 78 passed，lint 0 warnings/errors，类型检查与生产构建通过。详见[Session ID 与 Runtime 命名统一验证](test-results/2026-11-19-session-id-runtime-naming.md)。
+- **RequestContext Agent/Skill 传递复测**：同一请求对象贯穿 ChatAgentRuntime、Skill Selector、SkillEngine、Plan fallback 和 DeepAgents 结果评估；Chat Runtime 插件 API 为 2.0，LangGraph 在工具上下文边界适配旧 Mapping。首轮全量回归发现 3 个上下文指代集成测试仍传旧 selector 参数，更新为 RequestContext 后全量 pytest **508 passed**；定向回归 185 passed。详见[RequestContext Agent 与 Skill 传递验证](test-results/2026-11-19-request-context-agent-skill.md)。
+- **Runtime 执行循环边界契约**：新增请求/结果类型及 Model、Tool、Skill、Loop Protocol；验证 RequestContext 身份、消息和工具 ID allowlist、步数边界。当前 LangGraph 循环未替换。Runtime 定向测试 21 项通过，全量 pytest **517 passed**；Ruff、117 个源码文件 mypy 和导入隔离检查通过。详见[执行循环边界验证](test-results/2026-11-19-runtime-execution-loop-boundaries.md)。
+- **Runtime Model/Tool 循环实现**：新增 `DefaultRuntimeExecutionLoop` 和 ModelProvider/ToolFacade 适配器，覆盖调用提案整批校验、allowlist、共享 Token 预算、call ID 回填、步数熔断和取消。Runtime 定向回归与最终全量结果见[执行循环验证](test-results/2026-11-19-runtime-execution-loop.md)。
+- **Runtime Chat 默认执行路径**：`builtin.runtime-chat` 已成为默认 Chat Agent Runtime，`builtin.deepagents` 保留为显式回退插件。Runtime-native Model/Tool 循环通过统一 SkillExecutor 契约接入 YAML SkillEngine 和 Markdown DeepAgents 适配器，并使用 LangGraph Checkpoint；默认切换不移除框架依赖。真实模型评测、未知工具结果故障注入以及 SQLite + Chat API 跨应用生命周期恢复测试均已通过。切换实现和完整质量指标见[Runtime Chat 默认切换记录](test-results/2026-11-21-runtime-chat-default.md)及[测试指标台账](testing-metrics.md)。
+- **指标状态**：Sandbox 后端注入及模式传递修复后，扩展 Runtime/MCP/Sandbox/API 回归 **126 passed**，Chat/Runtime/Skill/Tool 扩展回归 228 passed，全量 pytest **502 passed**。此前唯一失败已定位为 `_set_runtime_sandbox_mode()` 未遍历 `ChatAgentRuntimeHostPlugin._runtime`，修复后 `workspace-write` 正确到达 MCP Provider 并使用可写挂载。Ruff lint/format 与 27 个相关源码文件 mypy 通过。Runtime 工厂每个 Host 创建一次后端集合，由初始和候选 Provider 共用；Provider 继续各自管理 Workspace/Registry/治理 Scope，MCP Provider 插件独占 Provider 资源关闭责任。
+- **报告**：[Runtime Model/Tool 执行循环验证](test-results/2026-11-19-runtime-execution-loop.md)、[Runtime 执行循环边界验证](test-results/2026-11-19-runtime-execution-loop-boundaries.md)、[RequestContext Agent 与 Skill 传递验证](test-results/2026-11-19-request-context-agent-skill.md)、[Turn、ToolFacade、ToolExecutionScope、ToolInvocationCoordinator 与 Sandbox 后端注入验证](test-results/2026-11-18-runtime-turn-lifecycle.md)、[Runtime Host 生命周期验证](test-results/2026-11-17-runtime-host.md)。
 
 ## 统一记录模板
 

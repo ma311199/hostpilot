@@ -4,7 +4,7 @@
 | --- | --- |
 | [新架构文档](新架构文档.md) | HostPilot 本地浏览器 Web Harness 的当前架构和已确认边界；MCP 接入和命名以用户确认的修订为准 |
 | [当前架构](新架构文档.md) | 当前实现、产品边界、模块职责与明确未完成项 |
-| [模块职责边界](模块职责边界.md) | Planner、Plan Validator、Orchestrator、Task Executor、Skill Runtime、Tool Executor 和子 Agent 的职责与治理边界 |
+| [模块职责边界](模块职责边界.md) | Planner、Plan Validator、Orchestrator、Task Executor、SkillEngine、Tool Executor 和子 Agent 的职责与治理边界 |
 | [需求基线](requirements.md) | 当前功能需求、非功能需求和待确认项 |
 | [ADR-0034：Runtime Core 与进程内插件生命周期](decisions/0034-runtime-core-and-plugin-lifecycle.md) | Runtime Host、共享上下文、插件生命周期及分阶段迁移边界 |
 | [Runtime Host 生命周期验证](test-results/2026-11-17-runtime-host.md) | Host 插件生命周期、FastAPI lifespan 集成、定向与全量测试结果及失败诊断 |
@@ -66,7 +66,7 @@
 | [上下文指代模型评测集 v1](evaluations/contextual-reference-resolution-v1.yaml) | 合成的唯一匹配、无关记忆、多候选和会话历史样例 |
 | [ADR-0016：增加本地 STDIO MCP Server](decisions/0016-local-stdio-mcp-servers.md) | 管理本地 MCP 子进程、参数、凭证和生命周期 |
 | [ADR-0017：本地 Trace 元数据持久化与查询](decisions/0017-local-trace-storage-and-query.md) | SQLite 安全元数据白名单、保留上限、API 与观测页面边界 |
-| [ADR-0029：按 Skill 格式执行并以 Plan 兜底](decisions/0029-three-skill-pipelines.md) | YAML Skill Runtime、DeepAgents Markdown Skill、失败回退与按需工具检索 |
+| [ADR-0029：按 Skill 格式执行并以 Plan 兜底](decisions/0029-three-skill-pipelines.md) | YAML SkillEngine、DeepAgents Markdown Skill、失败回退与按需工具检索 |
 | [Stage B：YAML Skill 注册表与路由验证](test-results/2026-11-02-stage-b-yaml-skill-registry.md) | schema v1、包校验、依赖预检、路由和质量检查结果 |
 | [验证记录](test-results/2026-10-29-skill-v1.md) | Skill 首版测试、质量检查结果和已知缺口 |
 | [Phase 0 核心契约验证](test-results/2026-10-29-phase0-core.md) | 核心 DTO、配置和遥测接口的测试与质量检查结果 |

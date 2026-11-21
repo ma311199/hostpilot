@@ -135,13 +135,13 @@ test('confirms conversation deletion and switches away from the deleted active c
   await expect(page.locator('.conversation-row')).toHaveCount(1)
   const firstConversation = (await (await page.request.get(
     'http://127.0.0.1:8011/api/v1/conversations',
-  )).json()) as Array<{ conversation_id: string }>
+  )).json()) as Array<{ session_id: string }>
 
   await page.getByRole('button', { name: '新建' }).click()
   await expect(page.locator('.conversation-row')).toHaveCount(2)
   const conversations = (await (await page.request.get(
     'http://127.0.0.1:8011/api/v1/conversations',
-  )).json()) as Array<{ conversation_id: string }>
+  )).json()) as Array<{ session_id: string }>
   expect(conversations).toHaveLength(2)
 
   const activeRow = page.locator('.conversation-row').first()
@@ -156,11 +156,11 @@ test('confirms conversation deletion and switches away from the deleted active c
 
   const remaining = (await (await page.request.get(
     'http://127.0.0.1:8011/api/v1/conversations',
-  )).json()) as Array<{ conversation_id: string }>
+  )).json()) as Array<{ session_id: string }>
   expect(remaining).toHaveLength(1)
-  expect(remaining[0].conversation_id).toBe(firstConversation[0].conversation_id)
+  expect(remaining[0].session_id).toBe(firstConversation[0].session_id)
   const deletedResponse = await page.request.get(
-    `http://127.0.0.1:8011/api/v1/conversations/${conversations[0].conversation_id}`,
+    `http://127.0.0.1:8011/api/v1/conversations/${conversations[0].session_id}`,
   )
   expect(deletedResponse.status()).toBe(404)
 })
@@ -188,12 +188,12 @@ test('requires confirmation and persists irreversible sandbox upgrades', async (
   await page.reload()
   const conversationsResponse = await page.request.get('http://127.0.0.1:8011/api/v1/conversations')
   const conversations = (await conversationsResponse.json()) as Array<{
-    conversation_id: string
+    session_id: string
     sandbox_mode: string
   }>
   expect(conversations[0].sandbox_mode).toBe('danger-full-access')
   const downgradeResponse = await page.request.post(
-    `http://127.0.0.1:8011/api/v1/conversations/${conversations[0].conversation_id}/sandbox/upgrade`,
+    `http://127.0.0.1:8011/api/v1/conversations/${conversations[0].session_id}/sandbox/upgrade`,
     { data: { target_mode: 'workspace-write' } },
   )
   expect(downgradeResponse.status()).toBe(409)

@@ -133,7 +133,7 @@ describe('Skill catalog API', () => {
       execution_format: 'yaml',
       detected_formats: ['yaml', 'skill_md'],
       execution_mode: 'both',
-      available_execution_modes: ['yaml', 'deepagents', 'both'],
+      available_execution_modes: ['yaml', 'markdown', 'both'],
       enabled: true,
       source: 'user',
     }

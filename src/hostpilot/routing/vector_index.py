@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from hostpilot.budget import RequestBudget
-from hostpilot.routing.models import RoutingModelRuntime
+from hostpilot.routing.models import RoutingModelComponents
 
 
 @dataclass(frozen=True)
@@ -45,7 +45,7 @@ class ChromaSkillVectorIndex:
         path: Path | str,
         *,
         embedding_model: str,
-        models: RoutingModelRuntime,
+        models: RoutingModelComponents,
         max_batch_size: int = 64,
     ) -> None:
         if max_batch_size < 1:

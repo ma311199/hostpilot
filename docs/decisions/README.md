@@ -14,7 +14,7 @@
 - [ADR-0008：多个远程 MCP Server 与 Streamable HTTP](0008-remote-mcp-servers.md)
 - [ADR-0016：增加本地 STDIO MCP Server](0016-local-stdio-mcp-servers.md)
 - [ADR-0017：本地 Trace 元数据持久化与查询](0017-local-trace-storage-and-query.md)
-- [ADR-0009：Skill Runtime 与 YAML 执行契约](0009-skill-runtime-and-yaml-contract.md)
+- [ADR-0009：SkillEngine 与 YAML 执行契约](0009-skill-runtime-and-yaml-contract.md)
 - [ADR-0010：Harness 服务契约与配置边界](0010-harness-contracts-and-configuration-boundary.md)
 - [ADR-0011：YAML Skill 注册表与旧格式过渡](0011-yaml-skill-registry-and-legacy-migration.md)
 - [ADR-0012：业务 Skill 快速路径与 Plan 兜底](0012-business-skill-fast-path-and-plan-fallback.md)
@@ -38,6 +38,7 @@
 - [ADR-0032：上下文指代候选解析](0032-contextual-reference-resolution.md)
 - [ADR-0033：Plan 任务生命周期 Trace](0033-plan-task-lifecycle-trace.md)
 - [ADR-0034：Runtime Core 与进程内插件生命周期](0034-runtime-core-and-plugin-lifecycle.md)
+- [ADR-0035：Runtime Chat 作为默认 Chat 控制路径](0035-runtime-chat-default.md)
 
 ## 后续待记录
 

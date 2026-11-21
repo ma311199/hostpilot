@@ -16,14 +16,18 @@ from hostpilot.contracts import (
     MessageRole,
     ModelTokenUsage,
     Route,
+    ToolDescriptor,
 )
-from hostpilot.models.factory import ModelRuntimeRegistry
+from hostpilot.models import ModelToolCall, ModelToolDefinition
+from hostpilot.models.factory import ModelProviderRegistry
 from hostpilot.observability import TraceSink
 from hostpilot.orchestration.runtime_plugins import (
-    ChatRuntimePluginContext,
-    ChatRuntimeRegistry,
+    ChatAgentRuntimePluginContext,
+    ChatAgentRuntimeRegistry,
 )
-from hostpilot.persistence import conversation_thread_config
+from hostpilot.persistence import session_thread_config
+from hostpilot.runtime import DefaultRuntimeExecutionLoop, RequestContext
+from hostpilot.runtime.adapters import ModelProviderRuntimeAdapter, ToolFacadeRuntimeAdapter
 from hostpilot.skills import SkillRegistry
 from hostpilot.skills.plan_plugins import PlanComponentRegistry, PlanComponentSelection
 from hostpilot.tools.executor import AsyncConfirmationProvider
@@ -37,7 +41,7 @@ if TYPE_CHECKING:
     from hostpilot.skills.deepagents_adapter import DeepAgentsSkillAdapter
 
 
-class AgentExecutionContext(TypedDict):
+class ChatAgentToolContext(TypedDict):
     """Request-local values injected into LangGraph MCP tool calls."""
 
     snapshot: ContextSnapshot
@@ -45,8 +49,17 @@ class AgentExecutionContext(TypedDict):
     confirmation_provider: AsyncConfirmationProvider | None
 
 
+def _agent_execution_context(request: RequestContext) -> ChatAgentToolContext:
+    """Adapt Runtime request state to the LangGraph tool context contract."""
+    return ChatAgentToolContext(
+        snapshot=request.snapshot,
+        budget=request.budget,
+        confirmation_provider=request.confirmation_provider,
+    )
+
+
 @dataclass(frozen=True)
-class AgentResponse:
+class ChatAgentResponse:
     """Assistant text and provider-reported token usage for one turn."""
 
     content: str
@@ -56,36 +69,33 @@ class AgentResponse:
     clarification_prompt: str | None = None
 
 
-class AgentRuntime(Protocol):
+class ChatAgentRuntime(Protocol):
     """Agent interface used by context assembly and the chat application service."""
 
-    async def read_messages(self, conversation_id: str) -> tuple[ConversationMessage, ...]:
+    async def read_messages(self, session_id: str) -> tuple[ConversationMessage, ...]:
         """Read messages saved for one graph thread."""
 
     async def respond(
         self,
         message: str,
-        context: ContextSnapshot,
-        *,
-        budget: RequestBudget | None = None,
-        confirmation_provider: AsyncConfirmationProvider | None = None,
-    ) -> AgentResponse:
+        request_context: RequestContext,
+    ) -> ChatAgentResponse:
         """Generate one assistant turn and report any provider usage metadata."""
 
     async def record_turn(
         self,
-        conversation_id: str,
+        session_id: str,
         user_message: str,
         assistant_message: str,
     ) -> None:
         """Persist a completed non-model turn such as a clarification response."""
 
 
-class AgentRuntimeUnavailable(RuntimeError):
+class ChatAgentRuntimeUnavailable(RuntimeError):
     """Raised when a chat endpoint has no configured model runtime."""
 
 
-class LangGraphAgentRuntime:
+class LangGraphChatAgentRuntime:
     """Invoke one compiled agent graph with the persistent conversation thread."""
 
     def __init__(
@@ -109,11 +119,11 @@ class LangGraphAgentRuntime:
         if root_async_client is not None:
             await root_async_client.close()
 
-    async def read_messages(self, conversation_id: str) -> tuple[ConversationMessage, ...]:
+    async def read_messages(self, session_id: str) -> tuple[ConversationMessage, ...]:
         """Read user-visible conversation messages from the current graph checkpoint."""
         config = cast(
             "RunnableConfig",
-            conversation_thread_config(conversation_id),
+            session_thread_config(session_id),
         )
         snapshot = await self.graph.aget_state(config)
         raw_messages = snapshot.values.get("messages", ())
@@ -129,15 +139,15 @@ class LangGraphAgentRuntime:
     async def respond(
         self,
         message: str,
-        context: ContextSnapshot,
+        request_context: RequestContext,
         *,
-        budget: RequestBudget | None = None,
-        confirmation_provider: AsyncConfirmationProvider | None = None,
         selected_skill_id: str | None = None,
-    ) -> AgentResponse:
+    ) -> ChatAgentResponse:
         """Run one agent turn; the graph checkpointer commits the resulting state."""
-        if context.conversation_id is None:
-            raise ValueError("Chat context must contain a conversation_id.")
+        context = request_context.snapshot
+        budget = request_context.budget
+        if context.session_id is None:
+            raise ValueError("Chat context must contain a session_id.")
         from langchain_core.messages import HumanMessage
 
         agent_input: dict[str, Any] = {"messages": [HumanMessage(content=message)]}
@@ -151,15 +161,9 @@ class LangGraphAgentRuntime:
                 )
         config = cast(
             "RunnableConfig",
-            conversation_thread_config(context.conversation_id),
+            session_thread_config(context.session_id),
         )
-        runtime_context: ContextSnapshot | AgentExecutionContext = context
-        if budget is not None:
-            runtime_context = AgentExecutionContext(
-                snapshot=context,
-                budget=budget,
-                confirmation_provider=confirmation_provider,
-            )
+        runtime_context = _agent_execution_context(request_context)
         budget_managed = budget is not None and getattr(
             self.model, "accounts_request_budget", False
         )
@@ -174,7 +178,7 @@ class LangGraphAgentRuntime:
             if getattr(response, "type", None) == "ai":
                 content = _message_content(response).strip()
                 if content:
-                    return AgentResponse(
+                    return ChatAgentResponse(
                         content=content,
                         token_usage=usage,
                         budget_usage_accounted=budget_managed,
@@ -184,24 +188,20 @@ class LangGraphAgentRuntime:
     async def respond_with_skill(
         self,
         message: str,
-        context: ContextSnapshot,
+        request_context: RequestContext,
         *,
         skill_id: str,
-        budget: RequestBudget | None = None,
-        confirmation_provider: AsyncConfirmationProvider | None = None,
-    ) -> AgentResponse:
+    ) -> ChatAgentResponse:
         """Run DeepAgents with exactly one selected Markdown Skill in its input snapshot."""
         return await self.respond(
             message,
-            context,
-            budget=budget,
-            confirmation_provider=confirmation_provider,
+            request_context,
             selected_skill_id=skill_id,
         )
 
     async def record_turn(
         self,
-        conversation_id: str,
+        session_id: str,
         user_message: str,
         assistant_message: str,
     ) -> None:
@@ -210,7 +210,7 @@ class LangGraphAgentRuntime:
 
         config = cast(
             "RunnableConfig",
-            conversation_thread_config(conversation_id),
+            session_thread_config(session_id),
         )
         await self.graph.aupdate_state(
             config,
@@ -229,7 +229,7 @@ def create_deepagents_runtime(
     checkpointer: Any,
     skills: DeepAgentsSkillAdapter,
     tools: Sequence[Any] = (),
-) -> LangGraphAgentRuntime:
+) -> LangGraphChatAgentRuntime:
     """Build a DeepAgents graph with per-turn Markdown memory in runtime context."""
     from deepagents import create_deep_agent
     from langchain.agents.middleware import dynamic_prompt
@@ -250,18 +250,18 @@ def create_deepagents_runtime(
         return append_memory_context(base_prompt, context)
 
     options = skills.agent_options(checkpointer=checkpointer)
-    options["context_schema"] = AgentExecutionContext
+    options["context_schema"] = ChatAgentToolContext
     options["middleware"] = [context_prompt]
     options["tools"] = list(tools)
     graph = create_deep_agent(model, **options)
-    return LangGraphAgentRuntime(graph, input_preparer=skills.prepare_input, model=model)
+    return LangGraphChatAgentRuntime(graph, input_preparer=skills.prepare_input, model=model)
 
 
-def create_default_chat_runtime_registry() -> ChatRuntimeRegistry:
+def create_default_chat_agent_runtime_registry() -> ChatAgentRuntimeRegistry:
     """Register the built-in DeepAgents adapter behind the chat runtime contract."""
-    registry = ChatRuntimeRegistry()
+    registry = ChatAgentRuntimeRegistry()
 
-    def build_deepagents(context: ChatRuntimePluginContext) -> AgentRuntime:
+    def build_deepagents(context: ChatAgentRuntimePluginContext) -> ChatAgentRuntime:
         return create_deepagents_runtime(
             context.model,
             checkpointer=context.checkpointer,
@@ -269,11 +269,34 @@ def create_default_chat_runtime_registry() -> ChatRuntimeRegistry:
             tools=context.tools,
         )
 
+    def build_runtime_chat(context: ChatAgentRuntimePluginContext) -> ChatAgentRuntime:
+        from hostpilot.orchestration.runtime_chat import RuntimeChatAgentRuntime
+        from hostpilot.orchestration.runtime_chat_state import (
+            LangGraphRuntimeSessionStateAdapter,
+        )
+
+        if context.runtime_execution_loop is None:
+            raise ValueError("Runtime Chat plugin requires a Runtime execution loop.")
+        skill_runtime = create_deepagents_runtime(
+            context.model,
+            checkpointer=context.checkpointer,
+            skills=context.skills,
+            tools=context.tools,
+        )
+        return RuntimeChatAgentRuntime(
+            context.runtime_execution_loop,
+            LangGraphRuntimeSessionStateAdapter(skill_runtime.graph),
+            tools=context.runtime_tool_definitions,
+            allowed_tool_ids=context.runtime_allowed_tool_ids,
+            skill_runtime=skill_runtime,
+        )
+
     registry.register("builtin.deepagents", build_deepagents)
+    registry.register("builtin.runtime-chat", build_runtime_chat)
     return registry
 
 
-def create_configured_runtime(
+def create_configured_chat_agent_runtime(
     settings: Settings,
     *,
     checkpointer: Any,
@@ -285,12 +308,12 @@ def create_configured_runtime(
     skill_execution_modes: Mapping[str, str] | None = None,
     trace_sink: TraceSink | None = None,
     plan_component_registry: PlanComponentRegistry | None = None,
-    chat_runtime_registry: ChatRuntimeRegistry | None = None,
-    model_runtime_registry: ModelRuntimeRegistry | None = None,
-) -> AgentRuntime:
+    chat_agent_runtime_registry: ChatAgentRuntimeRegistry | None = None,
+    model_provider_registry: ModelProviderRegistry | None = None,
+) -> ChatAgentRuntime:
     """Create the configured chat graph plus the Skill selector and execution runtime."""
-    from hostpilot.models.factory import create_model_runtime
-    from hostpilot.orchestration.skill_runtime import SkillRuntimeAgentAdapter
+    from hostpilot.models.factory import create_model_runtime_components
+    from hostpilot.orchestration.skill_runtime import SkillEngineAgentAdapter
     from hostpilot.routing.skill_selector import ModelProviderSkillSelector
     from hostpilot.skills.compensation import CompensationRegistry
     from hostpilot.skills.deepagents_adapter import DeepAgentsSkillAdapter
@@ -304,16 +327,23 @@ def create_configured_runtime(
     from hostpilot.skills.model_provider_adapter import ProviderSingleTurnLLM
     from hostpilot.skills.runtime import (
         BuiltinExecutorRegistry,
-        SkillRuntime,
+        SkillEngine,
         register_core_builtin_skills,
     )
     from hostpilot.skills.yaml_registry import YamlSkillRegistry
     from hostpilot.tools.facade import ToolFacade
 
-    model_runtime = create_model_runtime(settings, registry=model_runtime_registry)
-    model_provider = model_runtime.provider
+    model_components = create_model_runtime_components(settings, registry=model_provider_registry)
+    model_provider = model_components.provider
     if tool_provider is not None and not callable(getattr(tool_provider, "descriptors", None)):
         tool_provider = ToolFacade(tool_provider)
+    runtime_tool_definitions = _runtime_tool_definitions(tool_provider)
+    runtime_execution_loop = DefaultRuntimeExecutionLoop(
+        ModelProviderRuntimeAdapter(model_provider),
+        ToolFacadeRuntimeAdapter(tool_provider)
+        if tool_provider is not None
+        else _UnavailableRuntimeToolPort(),
+    )
     compensation_handlers = compensation_registry or CompensationRegistry()
     additional_roots = (Path(__file__).resolve().parents[1] / "skill_packages",)
     legacy_registry = SkillRegistry(settings.skills_dir, additional_roots=additional_roots)
@@ -339,9 +369,7 @@ def create_configured_runtime(
     saved_execution_modes = skill_execution_modes or {}
     for package in yaml_by_directory.values():
         markdown_package = markdown_by_directory.get(package.source_directory.resolve())
-        available_modes = (
-            {"yaml", "deepagents", "both"} if markdown_package is not None else {"yaml"}
-        )
+        available_modes = {"yaml", "markdown", "both"} if markdown_package is not None else {"yaml"}
         preferred = saved_execution_modes.get(package.skill_id, "yaml")
         execution_modes[package.skill_id] = preferred if preferred in available_modes else "yaml"
     for markdown_package in markdown_by_directory.values():
@@ -351,20 +379,27 @@ def create_configured_runtime(
         )
         skill_ids_by_name[markdown_package.name] = skill_id
         if yaml_package is None:
-            execution_modes[skill_id] = "deepagents"
+            execution_modes[skill_id] = "markdown"
     deepagents_skills = DeepAgentsSkillAdapter(
         legacy_registry,
         execution_modes=execution_modes,
         skill_ids_by_name=skill_ids_by_name,
     )
-    runtime_registry = chat_runtime_registry or create_default_chat_runtime_registry()
-    chat_runtime = runtime_registry.create(
+    chat_agent_runtime_registry = (
+        chat_agent_runtime_registry or create_default_chat_agent_runtime_registry()
+    )
+    chat_agent_runtime = chat_agent_runtime_registry.create(
         settings.chat_runtime_plugin,
-        ChatRuntimePluginContext(
-            model=model_runtime.agent_chat_model,
+        ChatAgentRuntimePluginContext(
+            model=model_components.agent_chat_model,
             checkpointer=checkpointer,
             skills=deepagents_skills,
             tools=tools,
+            runtime_execution_loop=runtime_execution_loop,
+            runtime_tool_definitions=runtime_tool_definitions,
+            runtime_allowed_tool_ids=frozenset(
+                definition.name for definition in runtime_tool_definitions
+            ),
         ),
     )
     skill_registry = YamlSkillRegistry(
@@ -402,7 +437,7 @@ def create_configured_runtime(
 
     builtins = BuiltinExecutorRegistry()
     assessors = LLMSkillAssessor(model_provider)
-    skill_runtime = SkillRuntime(
+    skill_runtime = SkillEngine(
         skill_registry,
         step_actions,
         builtins,
@@ -443,8 +478,8 @@ def create_configured_runtime(
         skill_registry,
         model_provider,
         fallback_provider=model_provider,
-        deepagents_registry=legacy_registry,
-        deepagents_skill_ids_by_name=skill_ids_by_name,
+        markdown_registry=legacy_registry,
+        markdown_skill_ids_by_name=skill_ids_by_name,
         execution_modes=execution_modes,
         minimum_business_confidence=settings.routing_minimum_business_confidence,
         minimum_business_margin=settings.routing_minimum_business_margin,
@@ -453,8 +488,8 @@ def create_configured_runtime(
         max_business_candidates=settings.routing_max_business_candidates,
         trace_sink=trace_sink,
     )
-    return SkillRuntimeAgentAdapter(
-        chat_runtime,
+    return SkillEngineAgentAdapter(
+        chat_agent_runtime,
         skill_runtime,
         selector,
         trace_sink=trace_sink,
@@ -470,6 +505,36 @@ def _tool_descriptors(provider: Any) -> tuple[Any, ...]:
     if registry is None:
         raise TypeError("Tool provider must expose a descriptor catalog.")
     return tuple(registry.descriptors())
+
+
+def _runtime_tool_definitions(provider: Any) -> tuple[ModelToolDefinition, ...]:
+    """Expose the configured governed tool catalog as normalized model definitions."""
+    if provider is None:
+        return ()
+    definitions: list[ModelToolDefinition] = []
+    for descriptor in _tool_descriptors(provider):
+        if not isinstance(descriptor, ToolDescriptor):
+            raise TypeError("Runtime Chat requires validated ToolDescriptor values.")
+        definitions.append(
+            ModelToolDefinition(
+                name=descriptor.name,
+                description=descriptor.description,
+                parameters=descriptor.input_schema,
+            )
+        )
+    return tuple(definitions)
+
+
+class _UnavailableRuntimeToolPort:
+    """Reject impossible tool dispatch when no governed ToolFacade is configured."""
+
+    async def execute(
+        self,
+        request_context: RequestContext,
+        tool_call: ModelToolCall,
+    ) -> str:
+        del request_context
+        raise RuntimeError(f"No ToolFacade is configured for tool {tool_call.name!r}.")
 
 
 def append_memory_context(base_prompt: str, context: ContextSnapshot) -> str:
@@ -569,13 +634,13 @@ def _message_content(message: Any) -> str:
 
 
 __all__ = [
-    "AgentExecutionContext",
-    "AgentResponse",
-    "AgentRuntime",
-    "AgentRuntimeUnavailable",
-    "LangGraphAgentRuntime",
+    "ChatAgentToolContext",
+    "ChatAgentResponse",
+    "ChatAgentRuntime",
+    "ChatAgentRuntimeUnavailable",
+    "LangGraphChatAgentRuntime",
     "append_memory_context",
-    "create_configured_runtime",
+    "create_configured_chat_agent_runtime",
     "create_deepagents_runtime",
-    "create_default_chat_runtime_registry",
+    "create_default_chat_agent_runtime_registry",
 ]

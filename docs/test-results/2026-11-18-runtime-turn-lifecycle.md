@@ -111,6 +111,30 @@ State 插件现在接收 `CheckpointerFactory` 返回的异步上下文管理器
 - 全量 `.venv/bin/pytest -q --import-mode=importlib`：**497 passed、1 failed**。唯一失败为 `test_chat_sandbox_mode_is_isolated_between_conversations`：Bubblewrap 在 pytest 临时工作区执行写入时返回 `verification_failed`，确认审批后仍无法写入。该问题在本轮前的 Runtime 测试报告中已持续记录；本轮未改变 Sandbox Profile 或 Mount 规则。输出另有 FastMCP 依赖的 Authlib 弃用提示。
 - 文档与代码白空格检查使用 `git diff --check`；它检查整个共享工作区的已跟踪差异，结果可能同时覆盖此前已有改动。
 
+### Sandbox 写入失败复测（2026-11-19）
+
+此前全量回归唯一失败的 `test_chat_sandbox_mode_is_isolated_between_conversations` 并非 OS 工作区不可写或 Bubblewrap 挂载本身故障。运行时诊断确认 `WorkspaceFiles.read_only=False`，但隔离调用实际收到 `read-only` 会话模式，因此生成 `--ro-bind`，并以 `OSError: [Errno 30] Read-only file system` 失败。原因是 API 的 `_set_runtime_sandbox_mode()` 遍历到 `AgentRuntimeHostPlugin`，但未继续访问它持有的 `_runtime`，导致自定义 Runtime 内直接调用的 MCP Provider 没收到 `workspace-write` 模式。
+
+修复后，同一回归用例通过；扩展 Runtime/MCP/Sandbox/API 回归为 **126 passed**，全量 pytest 为 **498 passed**。Ruff 检查与格式、27 个相关源码文件的 mypy、`git diff --check` 均通过。测试输出仍包含 FastMCP 依赖的 Authlib 弃用提示。
+
+## Runtime RequestContext 契约
+
+在 `hostpilot.runtime` 新增请求级 `RequestContext`，聚合一次执行的 `ContextSnapshot`、活动 `RequestBudget` 和可选审批提供器。`LangGraphAgentRuntime` 将其适配为现有 `snapshot`、`budget`、`confirmation_provider` Mapping；AgentRuntime 公共调用签名和 `RuntimeContext` 进程级职责未改变。测试确认请求快照与可变预算对象按引用保留、不同请求数据隔离，并覆盖审批提供器缺省和存在两种映射结果。
+
+- TDD RED：契约测试在 `hostpilot.runtime` 尚未导出 `RequestContext` 时按预期导入失败；适配测试在 Runtime 尚无 Mapping 转换函数时按预期失败。
+- Runtime/Orchestration 定向测试：**19 passed**；实现后全量 pytest：**501 passed**，有 1 条 FastMCP/Authlib 弃用提示。
+- 本次改动文件 Ruff lint/format、Runtime 与 Chat Runtime 相关 mypy（**5 个源码文件**）及 `git diff --check` 通过。全仓 mypy 仍报告既存 `src/hostpilot/evaluation/fixtures.py:39` 缺少 `step` 类型注解。
+- 本切片不迁移 Chat/Skill/Tool 的外部传递签名；后续再逐域统一为 RequestContext。
+
+## ChatService 使用 RequestContext
+
+`ChatService.send()` 在 ContextBuilder 返回快照并附加初始预算快照后，为该 Turn 创建一个 `RequestContext`，同时保留活动 `RequestBudget` 和可选审批提供器。Turn 跟踪读取其中的请求 ID，私有 `_execute_turn()` 接收整个对象；路由、AgentRuntime 和 Tool Port 调用仍使用旧参数形式。Route-only 评测路径保持不变。
+
+- TDD RED：新测试使用捕获子类验证 `_execute_turn()` 的调用边界；旧代码仍传入六个独立参数，触发预期 `TypeError`。GREEN 后测试同时覆盖无审批 Provider 和有审批 Provider 的两个独立 Turn，并确认预算实例隔离、旧 Tool Port 参数身份不变。
+- Chat/Runtime/Skill/Tool 扩展回归：**228 passed**；全量 pytest：**502 passed**，1 条 FastMCP/Authlib 弃用提示。
+- Chat 与 Runtime 相关 mypy（**5 个源码文件**）、本次文件 Ruff lint/format 及 `git diff --check` 通过。此前全仓 mypy 的既存 `src/hostpilot/evaluation/fixtures.py:39` 类型注解问题仍未处理。
+- 仍未把同一个 RequestContext 实例贯穿 Host/Skill/LangGraph 接口；该迁移会在后续逐域进行。
+
 ## Runtime ToolExecutor Factory
 
 继续将工具治理的构造边界迁入 Runtime。`builtin.tool-governance` 现在同时注册稳定 facade 和 `hostpilot.tool-governance`；后者提供可替换的 `ToolExecutorFactory`。FastAPI 通过 `create_app(tool_executor_factory=...)` 注入工厂，供初始 Provider 和候选 Provider 创建主执行器与补偿执行器。Provider 仍持有自己的 ToolRegistry、Transport、处理器及执行器引用；直接调用 Provider builder 时使用同一默认工厂实现。

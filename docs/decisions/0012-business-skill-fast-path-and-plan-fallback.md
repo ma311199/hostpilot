@@ -7,7 +7,7 @@
 
 ## 背景
 
-新架构增加了单一业务 Skill 的快速执行路径：明确命中业务 Skill 时先评估适用性，再由 Skill Runtime 执行 YAML workflow，之后评估执行过程与结果。必要时把执行快照交给 `orchestrator_plan` 继续规划。这修订了 ADR-0009 中“需要步骤或工具的请求一律由 Plan 接管”的边界。
+新架构增加了单一业务 Skill 的快速执行路径：明确命中业务 Skill 时先评估适用性，再由 SkillEngine 执行 YAML workflow，之后评估执行过程与结果。必要时把执行快照交给 `orchestrator_plan` 继续规划。这修订了 ADR-0009 中“需要步骤或工具的请求一律由 Plan 接管”的边界。
 
 ## 决定
 

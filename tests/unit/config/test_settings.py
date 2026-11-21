@@ -29,7 +29,7 @@ def test_settings_have_safe_non_secret_defaults(monkeypatch) -> None:
     assert settings.log_level == "INFO"
     assert settings.skills_dir is None
     assert settings.model_streaming is True
-    assert settings.chat_runtime_plugin == "builtin.deepagents"
+    assert settings.chat_runtime_plugin == "builtin.runtime-chat"
     assert settings.model_provider_plugin == "builtin.openai-compatible"
     assert settings.plan_planner_plugin == "builtin.llm"
     assert settings.plan_validator_plugin == "builtin.runtime"

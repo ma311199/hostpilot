@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 class ConversationLookup(Protocol):
     """Minimal conversation lookup needed to enforce session memory scope."""
 
-    async def get(self, conversation_id: str) -> object | None: ...
+    async def get(self, session_id: str) -> object | None: ...
 
 
 @dataclass(frozen=True)
@@ -30,7 +30,7 @@ class MemoryChunk:
     scope: MemoryScope
     content: str
     source: str
-    conversation_id: str | None = None
+    session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,7 @@ class MemoryArchiveCandidate:
     scope: MemoryScope
     content: str
     source_skill_id: str
-    conversation_id: str | None = None
+    session_id: str | None = None
     request_id: str | None = None
 
 
@@ -72,7 +72,7 @@ class MemoryController:
     async def recall(
         self,
         *,
-        conversation_id: str,
+        session_id: str,
         query: str,
         max_chars: int | None = None,
         request_id: str | None = None,
@@ -82,7 +82,7 @@ class MemoryController:
         try:
             if not query.strip():
                 raise ValueError("Memory recall query cannot be blank.")
-            if await self._conversations.get(conversation_id) is None:
+            if await self._conversations.get(session_id) is None:
                 raise ValueError("Memory recall targets an unknown conversation.")
             char_limit = self.max_recall_chars if max_chars is None else max_chars
             if char_limit < 1:
@@ -91,14 +91,14 @@ class MemoryController:
             sources = (
                 (
                     MemoryScope.SESSION_SUMMARY,
-                    self._memory.read_session_summary(conversation_id),
+                    self._memory.read_session_summary(session_id),
                     "session_summary",
-                    conversation_id,
+                    session_id,
                 ),
                 (MemoryScope.LONG_TERM, self._memory.read_long_term_memory(), "long_term", None),
             )
             candidates: list[MemoryChunk] = []
-            for scope, content, source, scoped_conversation_id in sources:
+            for scope, content, source, scoped_session_id in sources:
                 if content is None:
                     continue
                 candidates.extend(
@@ -106,7 +106,7 @@ class MemoryController:
                         scope=scope,
                         content=chunk,
                         source=source,
-                        conversation_id=scoped_conversation_id,
+                        session_id=scoped_session_id,
                     )
                     for chunk in split_memory_text(content)
                 )
@@ -126,7 +126,7 @@ class MemoryController:
                         content=bounded,
                         scope=candidate.scope,
                         source=candidate.source,
-                        conversation_id=candidate.conversation_id,
+                        session_id=candidate.session_id,
                     )
                 )
                 remaining -= len(bounded)
@@ -166,10 +166,10 @@ class MemoryController:
         max_chars: int | None = None,
     ) -> ContextSnapshot:
         """Create a request-local context using the same scoped recall boundary."""
-        if context.conversation_id is None:
+        if context.session_id is None:
             return context
         chunks = await self.recall(
-            conversation_id=context.conversation_id,
+            session_id=context.session_id,
             query=query,
             max_chars=max_chars,
             request_id=context.request_id,
@@ -199,7 +199,7 @@ class MemoryController:
             raise ValueError("Memory archive candidates require a source skill ID.")
         proposal = MemoryWriteProposal(
             scope=candidate.scope,
-            conversation_id=candidate.conversation_id,
+            session_id=candidate.session_id,
             source_skill_id=source_skill_id,
             content=candidate.content,
         )

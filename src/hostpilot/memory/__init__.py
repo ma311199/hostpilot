@@ -21,7 +21,7 @@ from hostpilot.persistence import MemoryStore
 class ConversationLookup(Protocol):
     """Minimal conversation lookup required to scope session-summary writes."""
 
-    async def get(self, conversation_id: str) -> ConversationSummary | None:
+    async def get(self, session_id: str) -> ConversationSummary | None:
         """Return a conversation when it exists."""
 
 
@@ -70,7 +70,7 @@ class MemoryWriteService:
                 archive_id=uuid5(NAMESPACE_URL, f"hostpilot-memory:{proposal.proposal_id}"),
                 proposal_id=proposal.proposal_id,
                 scope=proposal.scope,
-                conversation_id=proposal.conversation_id,
+                session_id=proposal.session_id,
                 importance_score=assessment.score,
                 content=proposal.content,
             )
@@ -94,12 +94,12 @@ class MemoryWriteService:
 
     async def _write_content(self, proposal: MemoryWriteProposal, content: str) -> None:
         if proposal.scope is MemoryScope.SESSION_SUMMARY:
-            conversation_id = proposal.conversation_id
-            if conversation_id is None:
+            session_id = proposal.session_id
+            if session_id is None:
                 raise MemoryWriteDenied("Session summary proposal has no conversation scope.")
-            if await self.conversations.get(conversation_id) is None:
+            if await self.conversations.get(session_id) is None:
                 raise MemoryWriteDenied("Session summary proposal targets an unknown conversation.")
-            self.memory.write_session_summary(conversation_id, content)
+            self.memory.write_session_summary(session_id, content)
             return
 
         self.memory.write_long_term_memory(content)

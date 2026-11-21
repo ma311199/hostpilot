@@ -106,7 +106,7 @@ export class ChatSocketClient {
   } | null = null
   onConfirmation: ((request: ToolConfirmationMessage) => void) | null = null
 
-  async send(conversationId: string, message: string): Promise<ChatResponse> {
+  async send(sessionId: string, message: string): Promise<ChatResponse> {
     await this.connect()
     if (this.pending) throw new Error('上一条消息仍在处理中。')
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
@@ -118,7 +118,7 @@ export class ChatSocketClient {
       try {
         this.socket?.send(JSON.stringify({
           type: 'chat.send',
-          conversation_id: conversationId,
+          session_id: sessionId,
           message,
         }))
       } catch {

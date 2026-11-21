@@ -1,5 +1,5 @@
 export interface ConversationSummary {
-  conversation_id: string
+  session_id: string
   title: string
   created_at: string
   updated_at: string
@@ -19,7 +19,7 @@ interface ConversationHistory {
 }
 
 export interface ChatResponse {
-  conversation_id: string
+  session_id: string
   request_id: string
   assistant_message: string
   route: 'direct' | 'clarify' | 'tool_call' | 'plan_execute' | 'skill_execute'
@@ -71,25 +71,25 @@ export function createConversation(title?: string): Promise<ConversationSummary>
   })
 }
 
-export function deleteConversation(conversationId: string): Promise<void> {
-  return request<void>(`/conversations/${encodeURIComponent(conversationId)}`, {
+export function deleteConversation(sessionId: string): Promise<void> {
+  return request<void>(`/conversations/${encodeURIComponent(sessionId)}`, {
     method: 'DELETE',
   })
 }
 
 export function upgradeConversationSandbox(
-  conversationId: string,
+  sessionId: string,
   targetMode: SandboxMode,
 ): Promise<ConversationSummary> {
   return request<ConversationSummary>(
-    `/conversations/${encodeURIComponent(conversationId)}/sandbox/upgrade`,
+    `/conversations/${encodeURIComponent(sessionId)}/sandbox/upgrade`,
     { method: 'POST', body: JSON.stringify({ target_mode: targetMode }) },
   )
 }
 
 export async function getConversationMessages(
-  conversationId: string,
+  sessionId: string,
 ): Promise<ConversationHistory> {
-  return request<ConversationHistory>(`/conversations/${encodeURIComponent(conversationId)}/messages`)
+  return request<ConversationHistory>(`/conversations/${encodeURIComponent(sessionId)}/messages`)
 }
 

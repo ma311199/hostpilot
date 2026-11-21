@@ -5,10 +5,10 @@ import pytest
 
 from hostpilot.config import Settings
 from hostpilot.models.factory import (
-    MODEL_RUNTIME_PLUGIN_API_VERSION,
-    ModelRuntime,
-    create_default_model_runtime_registry,
-    create_model_runtime,
+    MODEL_PROVIDER_PLUGIN_API_VERSION,
+    ModelRuntimeComponents,
+    create_default_model_provider_registry,
+    create_model_runtime_components,
 )
 from hostpilot.models.langchain_adapter import ProviderChatModel
 
@@ -40,7 +40,7 @@ def test_factory_builds_openai_compatible_provider_from_settings(monkeypatch) ->
         model_streaming=False,
     )
 
-    model_runtime = create_model_runtime(settings)
+    model_components = create_model_runtime_components(settings)
 
     assert model_arguments["model"] == "test-model"
     assert model_arguments["api_key"].get_secret_value() == "test-secret"
@@ -49,23 +49,23 @@ def test_factory_builds_openai_compatible_provider_from_settings(monkeypatch) ->
     assert model_arguments["streaming"] is False
     assert len(http_clients) == 1
     assert model_arguments["http_async_client"] is http_clients[0]
-    assert isinstance(model_runtime.agent_chat_model, ProviderChatModel)
-    assert model_runtime.agent_chat_model.provider is model_runtime.provider
-    assert model_runtime.provider.model_id == "test-model"
+    assert isinstance(model_components.agent_chat_model, ProviderChatModel)
+    assert model_components.agent_chat_model.provider is model_components.provider
+    assert model_components.provider.model_id == "test-model"
 
 
 def test_factory_requires_model_name_and_api_key() -> None:
     with pytest.raises(ValueError, match="Model name and API key"):
-        create_model_runtime(Settings())
+        create_model_runtime_components(Settings())
 
 
-def test_model_runtime_registry_selects_custom_factory_and_checks_contract() -> None:
+def test_model_provider_registry_selects_custom_factory_and_checks_contract() -> None:
     class Provider:
         async def complete(self, request):
             raise NotImplementedError
 
-    custom_runtime = ModelRuntime(Provider(), object())
-    registry = create_default_model_runtime_registry()
+    custom_runtime = ModelRuntimeComponents(Provider(), object())
+    registry = create_default_model_provider_registry()
     registry.register("project.custom.v1", lambda settings: custom_runtime)
     settings = Settings(
         model_name="project-model",
@@ -73,13 +73,13 @@ def test_model_runtime_registry_selects_custom_factory_and_checks_contract() -> 
         model_provider_plugin="project.custom.v1",
     )
 
-    assert MODEL_RUNTIME_PLUGIN_API_VERSION == "1.0"
+    assert MODEL_PROVIDER_PLUGIN_API_VERSION == "1.0"
     assert registry.implementations() == ("builtin.openai-compatible", "project.custom.v1")
-    assert create_model_runtime(settings, registry=registry) is custom_runtime
+    assert create_model_runtime_components(settings, registry=registry) is custom_runtime
     with pytest.raises(ValueError, match="Unknown model runtime"):
-        create_model_runtime(settings)
+        create_model_runtime_components(settings)
     with pytest.raises(ValueError, match="Unsupported model runtime plugin API"):
         registry.register("old.provider", lambda _: custom_runtime, api_version="0.9")
-    with pytest.raises(TypeError, match="must return ModelRuntime"):
+    with pytest.raises(TypeError, match="must return ModelRuntimeComponents"):
         registry.register("invalid.provider", lambda _: object())
         registry.create("invalid.provider", settings)

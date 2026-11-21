@@ -61,7 +61,7 @@ class ConversationMessage(ContractModel):
 class ConversationSummary(ContractModel):
     """Metadata used to list and identify one local conversation."""
 
-    conversation_id: NonEmptyString
+    session_id: NonEmptyString
     title: NonEmptyString
     created_at: datetime
     updated_at: datetime
@@ -79,7 +79,7 @@ class ContextSnapshot(ContractModel):
     """Minimal, request-scoped conversation context passed to the agent."""
 
     request_id: NonEmptyString
-    conversation_id: NonEmptyString | None = None
+    session_id: NonEmptyString | None = None
     messages: tuple[ConversationMessage, ...] = ()
     session_summary: str | None = None
     long_term_memory: str | None = None
@@ -114,7 +114,7 @@ class MemoryWriteProposal(ContractModel):
 
     proposal_id: NonEmptyString = Field(default_factory=lambda: str(uuid4()), max_length=64)
     scope: MemoryScope
-    conversation_id: NonEmptyString | None = None
+    session_id: NonEmptyString | None = None
     source_skill_id: NonEmptyString | None = None
     content: str = Field(min_length=1, max_length=262_144)
     importance_score: int | None = Field(default=None, ge=0, le=100)
@@ -130,14 +130,14 @@ class MemoryWriteProposal(ContractModel):
         if self.summary_content is not None and not self.summary_content.strip():
             raise ValueError("Memory proposal summary cannot be blank.")
         if self.scope is MemoryScope.SESSION_SUMMARY:
-            if self.conversation_id is None:
-                raise ValueError("Session summary proposals require conversation_id.")
+            if self.session_id is None:
+                raise ValueError("Session summary proposals require session_id.")
             try:
-                normalized_id = str(UUID(self.conversation_id))
+                normalized_id = str(UUID(self.session_id))
             except ValueError as error:
-                raise ValueError("conversation_id must be a UUID.") from error
-            object.__setattr__(self, "conversation_id", normalized_id)
-        elif self.conversation_id is not None:
+                raise ValueError("session_id must be a UUID.") from error
+            object.__setattr__(self, "session_id", normalized_id)
+        elif self.session_id is not None:
             raise ValueError("Long-term memory proposals cannot target a conversation.")
         return self
 
@@ -148,16 +148,16 @@ class MemoryRawArchive(ContractModel):
     archive_id: UUID
     proposal_id: NonEmptyString = Field(max_length=64)
     scope: MemoryScope
-    conversation_id: NonEmptyString | None = None
+    session_id: NonEmptyString | None = None
     importance_score: int = Field(ge=0, le=100)
     content: str = Field(min_length=1, max_length=262_144)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @model_validator(mode="after")
     def validate_scope_target(self) -> Self:
-        if self.scope is MemoryScope.SESSION_SUMMARY and self.conversation_id is None:
-            raise ValueError("Session memory archives require conversation_id.")
-        if self.scope is MemoryScope.LONG_TERM and self.conversation_id is not None:
+        if self.scope is MemoryScope.SESSION_SUMMARY and self.session_id is None:
+            raise ValueError("Session memory archives require session_id.")
+        if self.scope is MemoryScope.LONG_TERM and self.session_id is not None:
             raise ValueError("Long-term memory archives cannot target a conversation.")
         return self
 
@@ -183,7 +183,7 @@ class ModelTokenUsage(ContractModel):
 class ChatTurnResult(ContractModel):
     """Result of one completed user/assistant chat turn."""
 
-    conversation_id: NonEmptyString
+    session_id: NonEmptyString
     request_id: NonEmptyString
     assistant_message: str
     route: Route = Route.DIRECT

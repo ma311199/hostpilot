@@ -57,11 +57,11 @@ async def _run(args: argparse.Namespace) -> int:
                 .raise_for_status()
                 .json()
             )
-            conversation_id = conversation["conversation_id"]
+            session_id = conversation["session_id"]
             started = time.perf_counter()
             try:
                 response = await client.post(
-                    f"/conversations/{conversation_id}/routing-evaluation",
+                    f"/conversations/{session_id}/routing-evaluation",
                     json={
                         "message": case["prompt"],
                         "evaluation_context": case.get("evaluation_context", {}),
@@ -125,7 +125,7 @@ async def _run(args: argparse.Namespace) -> int:
                 )
                 break
             finally:
-                await client.delete(f"/conversations/{conversation_id}")
+                await client.delete(f"/conversations/{session_id}")
 
     matched = sum(case["passed"] is True for case in cases)
     measured = sum(case["passed"] is not None for case in cases)

@@ -163,4 +163,25 @@ describe('model settings', () => {
     expect(embedding.text()).toContain('连接成功')
     wrapper.unmount()
   })
+
+  it('keeps the dialog open when text selection starts in the model name field', async () => {
+    const wrapper = mount(ModelSettings)
+    await flushPromises()
+
+    await wrapper.get('input[placeholder="例如 gpt-4.1-mini"]').trigger('pointerdown')
+    await wrapper.get('.model-settings-backdrop').trigger('click')
+
+    expect(wrapper.emitted('close')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('closes when the user presses the backdrop directly', async () => {
+    const wrapper = mount(ModelSettings)
+    await flushPromises()
+
+    await wrapper.get('.model-settings-backdrop').trigger('pointerdown')
+
+    expect(wrapper.emitted('close')).toHaveLength(1)
+    wrapper.unmount()
+  })
 })

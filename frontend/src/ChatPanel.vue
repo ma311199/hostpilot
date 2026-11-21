@@ -15,12 +15,12 @@ import { getWorkspace, selectWorkspace, type WorkspaceStatus } from './api/works
 import { ChatSocketClient, type ToolConfirmationMessage } from './api/chatSocket'
 
 const conversations = ref<ConversationSummary[]>([])
-const activeConversationId = ref<string | null>(null)
+const activeSessionId = ref<string | null>(null)
 const messages = ref<ConversationMessage[]>([])
 const draft = ref('')
 const loading = ref(false)
 const sending = ref(false)
-const deletingConversationId = ref<string | null>(null)
+const deletingSessionId = ref<string | null>(null)
 const upgradingSandbox = ref(false)
 const selectingWorkspace = ref(false)
 const errorMessage = ref('')
@@ -37,8 +37,8 @@ interface ConversationPreference {
 
 const conversationPreferenceKey = 'hostpilot.conversation-preferences.v1'
 const conversationPreferences = ref<Record<string, ConversationPreference>>(loadConversationPreferences())
-const openConversationMenuId = ref<string | null>(null)
-const renamingConversationId = ref<string | null>(null)
+const openSessionMenuId = ref<string | null>(null)
+const renamingSessionId = ref<string | null>(null)
 const conversationNameDraft = ref('')
 const conversationNameInput = ref<HTMLInputElement[]>([])
 const visibleMessages = computed(() =>
@@ -48,7 +48,7 @@ const visibleMessages = computed(() =>
   ),
 )
 const displayConversations = computed(() => conversations.value.map((conversation) => {
-  const preference = conversationPreferences.value[conversation.conversation_id]
+  const preference = conversationPreferences.value[conversation.session_id]
   return {
     ...conversation,
     title: preference?.title || conversation.title,
@@ -56,7 +56,7 @@ const displayConversations = computed(() => conversations.value.map((conversatio
   }
 }))
 const activeConversation = computed(() =>
-  displayConversations.value.find((conversation) => conversation.conversation_id === activeConversationId.value),
+  displayConversations.value.find((conversation) => conversation.session_id === activeSessionId.value),
 )
 const conversationQuery = ref('')
 const filteredConversations = computed(() => {
@@ -120,59 +120,59 @@ function persistConversationPreferences(): void {
   }
 }
 
-function toggleConversationMenu(conversationId: string): void {
-  openConversationMenuId.value = openConversationMenuId.value === conversationId ? null : conversationId
-  renamingConversationId.value = null
+function toggleConversationMenu(sessionId: string): void {
+  openSessionMenuId.value = openSessionMenuId.value === sessionId ? null : sessionId
+  renamingSessionId.value = null
 }
 
 async function beginRenameConversation(conversation: ConversationSummary): Promise<void> {
-  renamingConversationId.value = conversation.conversation_id
+  renamingSessionId.value = conversation.session_id
   conversationNameDraft.value = conversation.title
   await nextTick()
   conversationNameInput.value[0]?.focus()
 }
 
-function saveConversationName(conversationId: string): void {
+function saveConversationName(sessionId: string): void {
   const title = conversationNameDraft.value.trim().slice(0, 200)
   if (!title) return
   conversationPreferences.value = {
     ...conversationPreferences.value,
-    [conversationId]: { ...conversationPreferences.value[conversationId], title },
+    [sessionId]: { ...conversationPreferences.value[sessionId], title },
   }
   persistConversationPreferences()
-  renamingConversationId.value = null
-  openConversationMenuId.value = null
+  renamingSessionId.value = null
+  openSessionMenuId.value = null
 }
 
 function cancelRenameConversation(): void {
-  renamingConversationId.value = null
+  renamingSessionId.value = null
   conversationNameDraft.value = ''
 }
 
-function toggleConversationPinned(conversationId: string): void {
-  const previous = conversationPreferences.value[conversationId] || {}
+function toggleConversationPinned(sessionId: string): void {
+  const previous = conversationPreferences.value[sessionId] || {}
   const next: ConversationPreference = { ...previous }
   if (previous.pinned) delete next.pinned
   else next.pinned = true
   if (!next.title) delete next.title
   const preferences = { ...conversationPreferences.value }
-  if (Object.keys(next).length) preferences[conversationId] = next
-  else delete preferences[conversationId]
+  if (Object.keys(next).length) preferences[sessionId] = next
+  else delete preferences[sessionId]
   conversationPreferences.value = preferences
   persistConversationPreferences()
-  openConversationMenuId.value = null
+  openSessionMenuId.value = null
 }
 
-async function openConversation(conversationId: string): Promise<void> {
+async function openConversation(sessionId: string): Promise<void> {
   if (sending.value) return
-  openConversationMenuId.value = null
-  renamingConversationId.value = null
-  activeConversationId.value = conversationId
+  openSessionMenuId.value = null
+  renamingSessionId.value = null
+  activeSessionId.value = sessionId
   messages.value = []
   loading.value = true
   errorMessage.value = ''
   try {
-    const history = await getConversationMessages(conversationId)
+    const history = await getConversationMessages(sessionId)
     messages.value = history.messages
     await scrollToLatest()
   } catch (error) {
@@ -188,7 +188,7 @@ async function startConversation(): Promise<void> {
   try {
     const conversation = await createConversation()
     conversations.value = [conversation, ...conversations.value]
-    activeConversationId.value = conversation.conversation_id
+    activeSessionId.value = conversation.session_id
     messages.value = []
   } catch (error) {
     errorMessage.value = messageFor(error)
@@ -196,34 +196,34 @@ async function startConversation(): Promise<void> {
 }
 
 async function removeConversation(conversation: ConversationSummary): Promise<void> {
-  if (sending.value || deletingConversationId.value) return
+  if (sending.value || deletingSessionId.value) return
   const confirmed = window.confirm(
     `确定删除会话“${conversation.title}”吗？会话消息、检查点、摘要和待审批记忆提案都会删除。`,
   )
   if (!confirmed) return
 
-  deletingConversationId.value = conversation.conversation_id
+  deletingSessionId.value = conversation.session_id
   errorMessage.value = ''
   try {
-    await deleteConversation(conversation.conversation_id)
+    await deleteConversation(conversation.session_id)
     conversations.value = conversations.value.filter(
-      (item) => item.conversation_id !== conversation.conversation_id,
+      (item) => item.session_id !== conversation.session_id,
     )
     const preferences = { ...conversationPreferences.value }
-    delete preferences[conversation.conversation_id]
+    delete preferences[conversation.session_id]
     conversationPreferences.value = preferences
     persistConversationPreferences()
-    openConversationMenuId.value = null
-    if (activeConversationId.value === conversation.conversation_id) {
-      activeConversationId.value = null
+    openSessionMenuId.value = null
+    if (activeSessionId.value === conversation.session_id) {
+      activeSessionId.value = null
       messages.value = []
       const latest = conversations.value[0]
-      if (latest) await openConversation(latest.conversation_id)
+      if (latest) await openConversation(latest.session_id)
     }
   } catch (error) {
     errorMessage.value = messageFor(error)
   } finally {
-    deletingConversationId.value = null
+    deletingSessionId.value = null
   }
 }
 
@@ -243,9 +243,9 @@ async function upgradeSandbox(targetMode: SandboxMode): Promise<void> {
   upgradingSandbox.value = true
   errorMessage.value = ''
   try {
-    const upgraded = await upgradeConversationSandbox(conversation.conversation_id, targetMode)
+    const upgraded = await upgradeConversationSandbox(conversation.session_id, targetMode)
     conversations.value = conversations.value.map((item) =>
-      item.conversation_id === upgraded.conversation_id ? upgraded : item,
+      item.session_id === upgraded.session_id ? upgraded : item,
     )
   } catch (error) {
     errorMessage.value = messageFor(error)
@@ -286,21 +286,21 @@ async function submitMessage(): Promise<void> {
   await scrollToLatest()
 
   try {
-    if (!activeConversationId.value) {
+    if (!activeSessionId.value) {
       const conversation = await createConversation(message.slice(0, 40))
-      activeConversationId.value = conversation.conversation_id
+      activeSessionId.value = conversation.session_id
       conversations.value = [conversation, ...conversations.value]
     }
-    const conversationId = activeConversationId.value
-    await chatSocket.send(conversationId, message)
-    const history = await getConversationMessages(conversationId)
+    const sessionId = activeSessionId.value
+    await chatSocket.send(sessionId, message)
+    const history = await getConversationMessages(sessionId)
     messages.value = history.messages
     await refreshConversations()
     await scrollToLatest()
   } catch (error) {
-    if (activeConversationId.value) {
+    if (activeSessionId.value) {
       try {
-        const history = await getConversationMessages(activeConversationId.value)
+        const history = await getConversationMessages(activeSessionId.value)
         messages.value = history.messages
       } catch {
         messages.value.pop()
@@ -370,7 +370,7 @@ onMounted(async () => {
       workspaceError.value = messageFor(error)
     }
     const latest = conversations.value[0]
-    if (latest) await openConversation(latest.conversation_id)
+    if (latest) await openConversation(latest.session_id)
   } catch (error) {
     errorMessage.value = messageFor(error)
   } finally {
@@ -482,14 +482,14 @@ onUnmounted(() => chatSocket.close())
           <h2>{{ group.label }}</h2>
           <div
             v-for="conversation in group.items"
-            :key="conversation.conversation_id"
+            :key="conversation.session_id"
             class="conversation-row"
           >
             <button
               class="conversation-item"
-              :class="{ 'conversation-item-active': activeConversationId === conversation.conversation_id }"
+              :class="{ 'conversation-item-active': activeSessionId === conversation.session_id }"
               type="button"
-              @click="openConversation(conversation.conversation_id)"
+              @click="openConversation(conversation.session_id)"
             >
               <span
                 class="conversation-icon"
@@ -522,27 +522,27 @@ onUnmounted(() => chatSocket.close())
               class="conversation-more-button"
               type="button"
               :aria-label="`会话操作 ${conversation.title}`"
-              :aria-expanded="openConversationMenuId === conversation.conversation_id"
+              :aria-expanded="openSessionMenuId === conversation.session_id"
               title="会话操作"
-              @click.stop="toggleConversationMenu(conversation.conversation_id)"
+              @click.stop="toggleConversationMenu(conversation.session_id)"
             >
               <span aria-hidden="true">⋯</span>
             </button>
             <div
-              v-if="openConversationMenuId === conversation.conversation_id"
+              v-if="openSessionMenuId === conversation.session_id"
               class="conversation-actions-menu"
               role="group"
               :aria-label="`${conversation.title} 的操作`"
-              @keydown.esc.stop.prevent="openConversationMenuId = null"
+              @keydown.esc.stop.prevent="openSessionMenuId = null"
             >
               <form
-                v-if="renamingConversationId === conversation.conversation_id"
+                v-if="renamingSessionId === conversation.session_id"
                 class="conversation-rename-form"
-                @submit.prevent="saveConversationName(conversation.conversation_id)"
+                @submit.prevent="saveConversationName(conversation.session_id)"
               >
-                <label :for="`conversation-name-${conversation.conversation_id}`">会话名称</label>
+                <label :for="`conversation-name-${conversation.session_id}`">会话名称</label>
                 <input
-                  :id="`conversation-name-${conversation.conversation_id}`"
+                  :id="`conversation-name-${conversation.session_id}`"
                   ref="conversationNameInput"
                   v-model="conversationNameDraft"
                   aria-label="会话名称"
@@ -572,14 +572,14 @@ onUnmounted(() => chatSocket.close())
                 <button
                   type="button"
                   :aria-label="conversation.pinned ? '取消置顶会话' : '置顶会话'"
-                  @click="toggleConversationPinned(conversation.conversation_id)"
+                  @click="toggleConversationPinned(conversation.session_id)"
                 >
                   {{ conversation.pinned ? '取消置顶' : '置顶' }}
                 </button>
                 <button
                   type="button"
                   class="conversation-action-delete"
-                  :disabled="sending || deletingConversationId !== null"
+                  :disabled="sending || deletingSessionId !== null"
                   :aria-label="`删除会话 ${conversation.title}`"
                   @click="removeConversation(conversation)"
                 >

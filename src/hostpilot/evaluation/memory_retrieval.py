@@ -20,7 +20,7 @@ class MemoryEvaluationEntry:
     entry_id: str
     scope: MemoryScopeName
     content: str
-    conversation_id: str | None = None
+    session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ class MemoryEvaluationCase:
     """One query and its manually labeled relevant memory IDs."""
 
     case_id: str
-    conversation_id: str
+    session_id: str
     query: str
     relevant_ids: tuple[str, ...]
 
@@ -97,13 +97,13 @@ def load_memory_evaluation_dataset(
         entry_id = _required_string(item, "entry_id")
         scope = _required_string(item, "scope")
         content = _required_string(item, "content")
-        conversation_id = item.get("conversation_id")
+        session_id = item.get("session_id")
         if scope not in {"session_summary", "long_term"}:
             raise ValueError("Memory retrieval entry scope is unsupported.")
-        if scope == "session_summary" and not isinstance(conversation_id, str):
-            raise ValueError("Session memory entries require a conversation_id.")
-        if scope == "long_term" and conversation_id is not None:
-            raise ValueError("Long-term memory entries cannot have a conversation_id.")
+        if scope == "session_summary" and not isinstance(session_id, str):
+            raise ValueError("Session memory entries require a session_id.")
+        if scope == "long_term" and session_id is not None:
+            raise ValueError("Long-term memory entries cannot have a session_id.")
         if entry_id in entry_ids:
             raise ValueError("Memory retrieval entry IDs must be unique.")
         entry_ids.add(entry_id)
@@ -112,7 +112,7 @@ def load_memory_evaluation_dataset(
                 entry_id=entry_id,
                 scope=scope,  # type: ignore[arg-type]
                 content=content,
-                conversation_id=conversation_id,
+                session_id=session_id,
             )
         )
 
@@ -123,7 +123,7 @@ def load_memory_evaluation_dataset(
         if not isinstance(item, dict):
             raise ValueError("Memory retrieval cases must be mappings.")
         case_id = _required_string(item, "case_id")
-        conversation_id = _required_string(item, "conversation_id")
+        session_id = _required_string(item, "session_id")
         query = _required_string(item, "query")
         relevant_ids = item.get("relevant_ids")
         if not isinstance(relevant_ids, list) or not relevant_ids:
@@ -136,7 +136,7 @@ def load_memory_evaluation_dataset(
             relevant_entry = entries_by_id[entry_id]
             if (
                 relevant_entry.scope == "session_summary"
-                and relevant_entry.conversation_id != conversation_id
+                and relevant_entry.session_id != session_id
             ):
                 raise ValueError("Memory retrieval case labels an out-of-scope session entry.")
         if case_id in case_ids:
@@ -145,7 +145,7 @@ def load_memory_evaluation_dataset(
         cases.append(
             MemoryEvaluationCase(
                 case_id=case_id,
-                conversation_id=conversation_id,
+                session_id=session_id,
                 query=query,
                 relevant_ids=tuple(relevant_ids),
             )
@@ -164,13 +164,11 @@ def rank_memory_entries(
     query: str,
     entries: tuple[MemoryEvaluationEntry, ...],
     *,
-    conversation_id: str,
+    session_id: str,
 ) -> tuple[MemoryEvaluationEntry, ...]:
     """Rank allowed memory entries with a dependency-free BM25 lexical baseline."""
     allowed = tuple(
-        entry
-        for entry in entries
-        if entry.scope == "long_term" or entry.conversation_id == conversation_id
+        entry for entry in entries if entry.scope == "long_term" or entry.session_id == session_id
     )
     indexes = rank_text_indexes(query, tuple(entry.content for entry in allowed))
     return tuple(allowed[index] for index in indexes)
@@ -200,7 +198,7 @@ def evaluate_memory_retrieval(
         allowed = tuple(
             entry
             for entry in entries
-            if entry.scope == "long_term" or entry.conversation_id == case.conversation_id
+            if entry.scope == "long_term" or entry.session_id == case.session_id
         )
         fixed_order = tuple(
             sorted(
@@ -214,7 +212,7 @@ def evaluate_memory_retrieval(
         lexical_order = rank_memory_entries(
             case.query,
             allowed,
-            conversation_id=case.conversation_id,
+            session_id=case.session_id,
         )
         lexical_ids_set = {entry.entry_id for entry in lexical_order}
         hybrid_order = lexical_order + tuple(
@@ -281,9 +279,7 @@ def evaluate_memory_retrieval(
     )
 
 
-def _within_budget(
-    entries: tuple[MemoryEvaluationEntry, ...], char_budget: int
-) -> tuple[str, ...]:
+def _within_budget(entries: tuple[MemoryEvaluationEntry, ...], char_budget: int) -> tuple[str, ...]:
     selected: list[str] = []
     remaining = char_budget
     for entry in entries:

@@ -12,7 +12,7 @@ Harness 请求限制、Workspace 路径和每个 Skill 的执行模式都是有�
 
 - 定义 `HarnessConfigurationStore`、`WorkspaceConfigurationStore`、`SkillExecutionStore` 三个独立 Protocol，并允许 `create_app` 分别注入 Factory。
 - 默认继续使用原有 SQLite 实现与数据库表，不迁移数据格式。
-- Harness 保存已验证的 `HarnessRuntimeConfiguration`；Workspace 保存路径字符串；Skill Preference 保存 Skill ID 和受限执行模式。三类数据不通过宽泛的通用字典/JSON Store 共享接口。
+- Harness 保存已验证的 `HarnessConfiguration`；Workspace 保存路径字符串；Skill Preference 保存 Skill ID 和受限执行模式。三类数据不通过宽泛的通用字典/JSON Store 共享接口。
 - 审计、取消和 Trace Store 不纳入本次配置 Store Port，保留独立记录/观测语义。
 - 当前通过应用代码依赖注入选择实现，不增加环境变量后端 ID、UI 后端选择或通用 Store Registry。
 

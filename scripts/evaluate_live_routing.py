@@ -99,13 +99,13 @@ async def _run(args: argparse.Namespace) -> int:
                 .raise_for_status()
                 .json()
             )
-            conversation_id = conversation["conversation_id"]
+            session_id = conversation["session_id"]
             started = time.perf_counter()
             try:
                 response = (
                     (
                         await client.post(
-                            f"/conversations/{conversation_id}/routing-evaluation",
+                            f"/conversations/{session_id}/routing-evaluation",
                             json={"message": case["prompt"]},
                         )
                     )
@@ -202,7 +202,7 @@ async def _run(args: argparse.Namespace) -> int:
                 )
                 break
             finally:
-                await client.delete(f"/conversations/{conversation_id}")
+                await client.delete(f"/conversations/{session_id}")
 
     routed = sum(case["route_match"] for case in results)
     business = [case for case in results if case.get("expected_skill_id")]

@@ -24,4 +24,4 @@ HostPilot 是面向个人客户端的 Agent 项目，需要确定模型/工具�
 
 ## 新架构对本决策的影响
 
-本 ADR 描述当前代码的框架选型，不直接约束新架构的 Skill Runtime。新 Runtime 是否继续复用 DeepAgents、LangGraph 和 LangChain，需在迁移设计中明确；模型 Provider 与 Tool Facade 应先依赖 HostPilot 自身接口。
+本 ADR 描述当前代码的框架选型，不直接约束新架构的 SkillEngine。新 Runtime 是否继续复用 DeepAgents、LangGraph 和 LangChain，需在迁移设计中明确；模型 Provider 与 Tool Facade 应先依赖 HostPilot 自身接口。

@@ -1,5 +1,24 @@
 """Application runtime host and in-process plugin lifecycle contracts."""
 
+from hostpilot.runtime.chat_prompt import RuntimeChatPromptBuilder
+from hostpilot.runtime.chat_state import RuntimeSessionStatePort
+from hostpilot.runtime.context import RequestContext
+from hostpilot.runtime.execution import (
+    RuntimeExecutionLoop,
+    RuntimeExecutionMessageSink,
+    RuntimeExecutionRequest,
+    RuntimeExecutionResult,
+    RuntimeExecutionStatus,
+    RuntimeModelPort,
+    RuntimeSkillPort,
+    RuntimeToolPort,
+    RuntimeToolReplay,
+    runtime_tool_call_key,
+)
+from hostpilot.runtime.execution_loop import (
+    DefaultRuntimeExecutionLoop,
+    RuntimeToolProposalError,
+)
 from hostpilot.runtime.host import (
     RuntimeContext,
     RuntimeHost,
@@ -19,6 +38,21 @@ __all__ = [
     "RuntimePluginError",
     "RuntimePluginSpec",
     "RuntimeServiceRegistry",
+    "RequestContext",
+    "RuntimeChatPromptBuilder",
+    "RuntimeSessionStatePort",
+    "RuntimeExecutionLoop",
+    "RuntimeExecutionMessageSink",
+    "DefaultRuntimeExecutionLoop",
+    "RuntimeExecutionRequest",
+    "RuntimeExecutionResult",
+    "RuntimeExecutionStatus",
+    "RuntimeModelPort",
+    "RuntimeSkillPort",
+    "RuntimeToolPort",
+    "RuntimeToolReplay",
+    "runtime_tool_call_key",
+    "RuntimeToolProposalError",
     "TurnLifecycleManager",
     "TurnRecord",
     "TurnState",

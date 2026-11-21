@@ -10,7 +10,7 @@ export interface SkillCatalogItem {
   source: 'user' | 'bundled'
 }
 
-export type SkillExecutionMode = 'yaml' | 'deepagents' | 'both'
+export type SkillExecutionMode = 'yaml' | 'markdown' | 'both'
 
 export interface SkillCatalogResponse {
   skills: SkillCatalogItem[]

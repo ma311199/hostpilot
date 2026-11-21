@@ -4,10 +4,10 @@ import { onMounted, reactive, ref } from 'vue'
 import {
   getHarnessConfiguration,
   saveHarnessConfiguration,
-  type HarnessRuntimeConfiguration,
+  type HarnessConfiguration,
 } from './api/harness'
 
-const configuration = reactive<HarnessRuntimeConfiguration>({
+const configuration = reactive<HarnessConfiguration>({
   max_context_messages: 40,
   max_memory_context_chars: 16000,
   max_request_chars: 32000,

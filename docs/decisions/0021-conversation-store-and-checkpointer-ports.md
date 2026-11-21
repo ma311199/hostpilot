@@ -13,7 +13,7 @@
 - ContextBuilder、ChatService 与 API 对话端点依赖 `ConversationStore` Protocol，不依赖 `SQLiteConversationStore` 实现。
 - API 通过 `ConversationStoreFactory` 构造会话元数据 Store；默认 factory 为 `SQLiteConversationStore`。
 - LangGraph Checkpointer 通过 `CheckpointerFactory` 异步上下文管理器单独注入；默认由 `open_sqlite_checkpointer` 创建。
-- conversation ID 到 LangGraph thread config 的映射属于共享契约，提供 `conversation_thread_config` helper；SQLite Store 的旧静态方法保留为兼容入口。
+- conversation ID 到 LangGraph thread config 的映射属于共享契约，提供 `session_thread_config` helper；SQLite Store 的旧静态方法保留为兼容入口。
 - 默认仍由两个 SQLite 实现共用数据库文件。自定义元数据 Store 不会自动替换 Checkpointer，且须保持 UUID 会话 ID 和 `ConversationNotFoundError` / 返回值约定。
 - 其他模型、MCP、Harness、审计、取消、Workspace、Trace 和 Skill 执行配置 Store 仍使用当前 SQLite 实现；本次不建立通用 Store 插件注册表。
 

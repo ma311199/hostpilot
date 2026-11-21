@@ -50,11 +50,11 @@ from hostpilot.skills.runtime import (
     AssessmentDisposition,
     BuiltinExecutor,
     SkillAssessment,
+    SkillEngine,
     SkillExecutionRequest,
     SkillExecutionResult,
     SkillExecutionSnapshot,
     SkillExecutionStatus,
-    SkillRuntime,
     SkillSideEffect,
 )
 from hostpilot.skills.yaml_registry import SideEffectLevel, YamlSkillPackage, YamlSkillRegistry
@@ -202,7 +202,7 @@ class LLMPlanner:
         draft, _ = await _invoke_structured(
             self.provider,
             _PlanModel,
-            request.budget,
+            request.request_context.budget,
             (
                 "Create a bounded execution plan for the user's goal. If essential user input "
                 "is missing before a requested action can be performed safely, return an empty "
@@ -226,7 +226,7 @@ class LLMPlanner:
                 "previous_execution_outcome_uncertain": request.payload.get(
                     "previous_execution_outcome_uncertain", False
                 ),
-                "context": _context_data(request.context),
+                "context": _context_data(request.request_context.snapshot),
                 "completed_results": dict(blackboard.results),
                 "capability_catalog": capability_catalog,
                 "complexity": complexity,
@@ -274,7 +274,7 @@ class LLMPlanner:
         draft, _ = await _invoke_structured(
             self.provider,
             _PlanModel,
-            request.budget,
+            request.request_context.budget,
             (
                 "Revise the plan using completed work. Do not repeat failed work "
                 "without new information. If a task could not invoke a relevant tool or its "
@@ -387,7 +387,7 @@ class LLMPlanner:
         return tuple(catalog)
 
 
-class RuntimePlanValidator:
+class PlanExecutionValidator:
     """Reject plans with unavailable or unauthorized Skills and unregistered tools."""
 
     def __init__(
@@ -470,7 +470,7 @@ class GovernedPlanTaskExecutor:
     def __init__(
         self,
         provider: ModelProvider,
-        skills: SkillRuntime,
+        skills: SkillEngine,
         tool_provider: Any | None,
         tool_descriptors: Mapping[str, ToolDescriptor],
         memory_controller: MemoryController | None = None,
@@ -504,12 +504,16 @@ class GovernedPlanTaskExecutor:
         self.plan_tool_candidate_limit = candidate_limit
 
     async def execute_task(self, call: PlanTaskCall) -> PlanTaskResult:
-        if self.memory_controller is not None and call.request.context.conversation_id is not None:
+        if (
+            self.memory_controller is not None
+            and call.request.request_context.snapshot.session_id is not None
+        ):
             context = await self.memory_controller.enrich_context(
-                call.request.context,
+                call.request.request_context.snapshot,
                 query=call.task.description,
             )
-            call = replace(call, request=replace(call.request, context=context))
+            request_context = replace(call.request.request_context, snapshot=context)
+            call = replace(call, request=replace(call.request, request_context=request_context))
         task = call.task
         if task.execution_type is PlanExecutionType.TOOL_TASK:
             return await self._execute_tool_task(call)
@@ -549,7 +553,7 @@ class GovernedPlanTaskExecutor:
                         "expected_output": call.task.expected_output,
                         "input": dict(call.task.input or {}),
                         "dependencies": dict(call.dependencies),
-                        "context": _context_data(call.request.context),
+                        "context": _context_data(call.request.request_context.snapshot),
                     },
                     ensure_ascii=False,
                     default=str,
@@ -577,9 +581,9 @@ class GovernedPlanTaskExecutor:
                         messages=tuple(messages),
                         tools=tool_definitions,
                         tool_choice="auto",
-                        timeout_seconds=_remaining_timeout(call.request.budget),
+                        timeout_seconds=_remaining_timeout(call.request.request_context.budget),
                     ),
-                    call.request.budget,
+                    call.request.request_context.budget,
                 )
             except Exception as error:
                 diagnostic["error_code"] = type(error).__name__
@@ -620,7 +624,7 @@ class GovernedPlanTaskExecutor:
                 while call_id in used_call_ids:
                     call_id = f"{call_id}-{index}"
                 used_call_ids.add(call_id)
-                budget_snapshot = call.request.budget.snapshot()
+                budget_snapshot = call.request.request_context.budget.snapshot()
                 if budget_snapshot.usage.tool_calls >= budget_snapshot.limits.tool_calls:
                     diagnostic["error_code"] = "tool_call_budget_exceeded"
                     return PlanTaskResult(
@@ -652,8 +656,8 @@ class GovernedPlanTaskExecutor:
                         result = await self.tool_provider.call_tool(
                             tool_call.name,
                             tool_call.arguments,
-                            budget=call.request.budget,
-                            confirmation_provider=call.request.confirmation_provider,
+                            budget=call.request.request_context.budget,
+                            confirmation_provider=call.request.request_context.confirmation_provider,
                         )
                     except ToolConfirmationDeniedError:
                         diagnostic["error_code"] = "tool_confirmation_denied"
@@ -757,10 +761,8 @@ class GovernedPlanTaskExecutor:
             SkillExecutionRequest(
                 skill_id=skill_id,
                 payload=payload,
-                context=call.request.context,
-                budget=call.request.budget,
+                request_context=call.request.request_context,
                 idempotency_key=call.idempotency_key,
-                confirmation_provider=call.request.confirmation_provider,
                 delegation_depth=call.request.delegation_depth + 1,
             )
         )
@@ -815,7 +817,7 @@ class GovernedPlanTaskExecutor:
         selection, _ = await _invoke_structured(
             self.provider,
             _CapabilitySelectionModel,
-            call.request.budget,
+            call.request.request_context.budget,
             "Select exactly one matching business Skill from the provided allowlist and provide "
             "only its input payload. Never invent IDs or values. Use only information in the task, "
             "context, and dependency results. Follow the selected Skill input schema and leave "
@@ -849,16 +851,18 @@ class GovernedPlanTaskExecutor:
                                 "task": call.task.description,
                                 "input": dict(call.task.input or {}),
                                 "dependencies": dict(call.dependencies),
-                                "memory_context": _context_data(call.request.context),
+                                "memory_context": _context_data(
+                                    call.request.request_context.snapshot
+                                ),
                             },
                             ensure_ascii=False,
                             default=str,
                         ),
                     ),
                 ),
-                timeout_seconds=_remaining_timeout(call.request.budget),
+                timeout_seconds=_remaining_timeout(call.request.request_context.budget),
             ),
-            call.request.budget,
+            call.request.request_context.budget,
         )
         return PlanTaskResult(
             True,
@@ -877,7 +881,7 @@ class LLMPlanVerifier:
         decision, _ = await _invoke_structured(
             self.provider,
             _VerificationModel,
-            request.budget,
+            request.request_context.budget,
             "Verify whether the results satisfy the user's goal. Do not infer unrecorded actions.",
             {
                 "goal": request.payload.get("task_description"),
@@ -970,7 +974,7 @@ def build_model_plan_executor(
     provider: ModelProvider,
     *,
     skills: YamlSkillRegistry,
-    skill_runtime: SkillRuntime,
+    skill_runtime: SkillEngine,
     tool_provider: Any | None,
     tool_descriptors: Mapping[str, ToolDescriptor],
     memory_controller: MemoryController | None = None,
@@ -1105,8 +1109,8 @@ def create_default_plan_component_registry() -> PlanComponentRegistry:
             tool_descriptors=context.tool_descriptors,
         )
 
-    def build_validator(context: PlanComponentContext) -> RuntimePlanValidator:
-        return RuntimePlanValidator(
+    def build_validator(context: PlanComponentContext) -> PlanExecutionValidator:
+        return PlanExecutionValidator(
             context.skills,
             tuple(context.tool_descriptors),
             context.tool_descriptors,
@@ -1400,7 +1404,7 @@ __all__ = [
     "LLMSkillAssessor",
     "LLMPlanVerifier",
     "LLMPlanner",
-    "RuntimePlanValidator",
+    "PlanExecutionValidator",
     "build_model_plan_executor",
     "create_default_plan_component_registry",
 ]

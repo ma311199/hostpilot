@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 import aiosqlite
 
 from hostpilot.contracts import ConversationSummary, SandboxMode
-from hostpilot.persistence.checkpointer import conversation_thread_config
+from hostpilot.persistence.checkpointer import session_thread_config
 from hostpilot.persistence.sqlite_path import prepare_sqlite_database_path
 
 
@@ -46,12 +46,12 @@ class SQLiteConversationStore:
                 if version_row is None:
                     raise RuntimeError("Could not read conversation database schema version.")
                 schema_version = int(version_row[0])
-                if schema_version > 2:
+                if schema_version > 3:
                     raise RuntimeError("Conversation database schema is newer than this app.")
                 await connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS conversations (
-                        conversation_id TEXT PRIMARY KEY,
+                        session_id TEXT PRIMARY KEY,
                         title TEXT NOT NULL,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
@@ -61,13 +61,21 @@ class SQLiteConversationStore:
                 )
                 cursor = await connection.execute("PRAGMA table_info(conversations)")
                 columns = {str(row[1]) for row in await cursor.fetchall()}
+                if "session_id" not in columns and "conversation_id" in columns:
+                    await connection.execute(
+                        "ALTER TABLE conversations RENAME COLUMN conversation_id TO session_id"
+                    )
+                    columns.remove("conversation_id")
+                    columns.add("session_id")
+                if "session_id" not in columns:
+                    raise RuntimeError("Conversation database is missing its session_id column.")
                 if "sandbox_mode" not in columns:
                     await connection.execute(
                         "ALTER TABLE conversations ADD COLUMN sandbox_mode TEXT "
                         "NOT NULL DEFAULT 'read-only'"
                     )
-                if schema_version < 2:
-                    await connection.execute("PRAGMA user_version = 2")
+                if schema_version < 3:
+                    await connection.execute("PRAGMA user_version = 3")
                 await connection.commit()
             os.chmod(self.database_path, 0o600)
             self._initialized = True
@@ -83,7 +91,7 @@ class SQLiteConversationStore:
 
         now = datetime.now(UTC)
         record = ConversationSummary(
-            conversation_id=str(uuid4()),
+            session_id=str(uuid4()),
             title=normalized_title,
             created_at=now,
             updated_at=now,
@@ -91,11 +99,11 @@ class SQLiteConversationStore:
         async with aiosqlite.connect(self.database_path) as connection:
             await connection.execute(
                 """
-                INSERT INTO conversations (conversation_id, title, created_at, updated_at)
+                INSERT INTO conversations (session_id, title, created_at, updated_at)
                 VALUES (?, ?, ?, ?)
                 """,
                 (
-                    record.conversation_id,
+                    record.session_id,
                     record.title,
                     record.created_at.isoformat(),
                     record.updated_at.isoformat(),
@@ -104,14 +112,14 @@ class SQLiteConversationStore:
             await connection.commit()
         return record
 
-    async def get(self, conversation_id: str) -> ConversationSummary | None:
+    async def get(self, session_id: str) -> ConversationSummary | None:
         """Return one conversation summary, if it exists."""
         await self.initialize()
-        normalized_id = _normalize_conversation_id(conversation_id)
+        normalized_id = _normalize_session_id(session_id)
         async with aiosqlite.connect(self.database_path) as connection:
             connection.row_factory = sqlite3.Row
             cursor = await connection.execute(
-                "SELECT * FROM conversations WHERE conversation_id = ?",
+                "SELECT * FROM conversations WHERE session_id = ?",
                 (normalized_id,),
             )
             row = await cursor.fetchone()
@@ -123,20 +131,20 @@ class SQLiteConversationStore:
         async with aiosqlite.connect(self.database_path) as connection:
             connection.row_factory = sqlite3.Row
             cursor = await connection.execute(
-                "SELECT * FROM conversations ORDER BY updated_at DESC, conversation_id"
+                "SELECT * FROM conversations ORDER BY updated_at DESC, session_id"
             )
             rows = await cursor.fetchall()
         return tuple(_record_from_row(row) for row in rows)
 
-    async def touch(self, conversation_id: str, *, title: str | None = None) -> None:
+    async def touch(self, session_id: str, *, title: str | None = None) -> None:
         """Update activity time and optionally rename a conversation."""
         await self.initialize()
-        normalized_id = _normalize_conversation_id(conversation_id)
+        normalized_id = _normalize_session_id(session_id)
         now = datetime.now(UTC).isoformat()
         async with aiosqlite.connect(self.database_path) as connection:
             if title is None:
                 cursor = await connection.execute(
-                    "UPDATE conversations SET updated_at = ? WHERE conversation_id = ?",
+                    "UPDATE conversations SET updated_at = ? WHERE session_id = ?",
                     (now, normalized_id),
                 )
             else:
@@ -146,7 +154,7 @@ class SQLiteConversationStore:
                 cursor = await connection.execute(
                     """
                     UPDATE conversations SET title = ?, updated_at = ?
-                    WHERE conversation_id = ?
+                    WHERE session_id = ?
                     """,
                     (normalized_title, now, normalized_id),
                 )
@@ -154,29 +162,29 @@ class SQLiteConversationStore:
         if cursor.rowcount == 0:
             raise ConversationNotFoundError(normalized_id)
 
-    async def delete(self, conversation_id: str) -> bool:
+    async def delete(self, session_id: str) -> bool:
         """Delete a conversation index row; its checkpointer is deleted separately."""
         await self.initialize()
-        normalized_id = _normalize_conversation_id(conversation_id)
+        normalized_id = _normalize_session_id(session_id)
         async with aiosqlite.connect(self.database_path) as connection:
             cursor = await connection.execute(
-                "DELETE FROM conversations WHERE conversation_id = ?",
+                "DELETE FROM conversations WHERE session_id = ?",
                 (normalized_id,),
             )
             await connection.commit()
         return cursor.rowcount > 0
 
     async def upgrade_sandbox_mode(
-        self, conversation_id: str, target: SandboxMode
+        self, session_id: str, target: SandboxMode
     ) -> ConversationSummary:
         """Atomically apply one strict privilege upgrade to a conversation."""
         await self.initialize()
-        normalized_id = _normalize_conversation_id(conversation_id)
+        normalized_id = _normalize_session_id(session_id)
         async with aiosqlite.connect(self.database_path) as connection:
             connection.row_factory = sqlite3.Row
             await connection.execute("BEGIN IMMEDIATE")
             cursor = await connection.execute(
-                "SELECT * FROM conversations WHERE conversation_id = ?", (normalized_id,)
+                "SELECT * FROM conversations WHERE session_id = ?", (normalized_id,)
             )
             row = await cursor.fetchone()
             if row is None:
@@ -188,13 +196,12 @@ class SQLiteConversationStore:
                 raise ValueError("Sandbox mode can only be upgraded to a higher level.")
             now = datetime.now(UTC).isoformat()
             await connection.execute(
-                "UPDATE conversations SET sandbox_mode = ?, updated_at = ? "
-                "WHERE conversation_id = ?",
+                "UPDATE conversations SET sandbox_mode = ?, updated_at = ? WHERE session_id = ?",
                 (target.value, now, normalized_id),
             )
             await connection.commit()
             updated = await connection.execute(
-                "SELECT * FROM conversations WHERE conversation_id = ?", (normalized_id,)
+                "SELECT * FROM conversations WHERE session_id = ?", (normalized_id,)
             )
             updated_row = await updated.fetchone()
         if updated_row is None:
@@ -202,21 +209,21 @@ class SQLiteConversationStore:
         return _record_from_row(updated_row)
 
     @staticmethod
-    def thread_config(conversation_id: str) -> dict[str, dict[str, str]]:
+    def thread_config(session_id: str) -> dict[str, dict[str, str]]:
         """Map a HostPilot conversation ID to LangGraph's persistent thread ID."""
-        return conversation_thread_config(conversation_id)
+        return session_thread_config(session_id)
 
 
-def _normalize_conversation_id(conversation_id: str) -> str:
+def _normalize_session_id(session_id: str) -> str:
     try:
-        return str(UUID(conversation_id))
+        return str(UUID(session_id))
     except (ValueError, AttributeError) as error:
-        raise ValueError("conversation_id must be a UUID.") from error
+        raise ValueError("session_id must be a UUID.") from error
 
 
 def _record_from_row(row: sqlite3.Row) -> ConversationSummary:
     return ConversationSummary(
-        conversation_id=row["conversation_id"],
+        session_id=row["session_id"],
         title=row["title"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),

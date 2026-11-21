@@ -62,9 +62,7 @@ class FakeModels:
         )
 
 
-def test_chroma_index_synchronizes_local_skill_documents_and_queries(
-    tmp_path, monkeypatch
-) -> None:
+def test_chroma_index_synchronizes_local_skill_documents_and_queries(tmp_path, monkeypatch) -> None:
     collection = FakeCollection()
 
     class FakeClient:

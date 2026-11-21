@@ -36,7 +36,7 @@ def write_fixture_skills(
         if isinstance(input_description, str) and input_description.strip():
             input_property["description"] = input_description
         uses_model_transform = fixture.get("execution") == "pure_text_transform"
-        step = {
+        step: dict[str, Any] = {
             "step_id": "evaluation_transform" if uses_model_transform else "evaluation_noop",
             "action": "llm.complete" if uses_model_transform else "evaluation.noop",
             "depends_on": [],

@@ -11,14 +11,14 @@ from hostpilot.persistence import ConversationStore
 
 
 class ConversationStateReader(Protocol):
-    async def read_messages(self, conversation_id: str) -> tuple[ConversationMessage, ...]: ...
+    async def read_messages(self, session_id: str) -> tuple[ConversationMessage, ...]: ...
 
 
 class MemoryRecallProvider(Protocol):
     async def recall(
         self,
         *,
-        conversation_id: str,
+        session_id: str,
         query: str,
         max_chars: int | None = None,
         request_id: str | None = None,
@@ -51,16 +51,16 @@ class ContextBuilder:
         self.max_messages = max_messages
         self.max_memory_chars = max_memory_chars
 
-    async def build(self, conversation_id: str, *, query: str | None = None) -> ContextSnapshot:
+    async def build(self, session_id: str, *, query: str | None = None) -> ContextSnapshot:
         """Validate the session, then load bounded history and scoped Markdown memory."""
-        conversation = await self.conversations.get(conversation_id)
+        conversation = await self.conversations.get(session_id)
         if conversation is None:
-            raise ConversationNotFoundError(conversation_id)
+            raise ConversationNotFoundError(session_id)
 
         request_id = str(uuid4())
-        messages = await self.runtime.read_messages(conversation.conversation_id)
+        messages = await self.runtime.read_messages(conversation.session_id)
         chunks = await self.memory.recall(
-            conversation_id=conversation.conversation_id,
+            session_id=conversation.session_id,
             query=query or (messages[-1].content if messages else "conversation context"),
             max_chars=self.max_memory_chars,
             request_id=request_id,
@@ -73,7 +73,7 @@ class ContextBuilder:
         )
         return ContextSnapshot(
             request_id=request_id,
-            conversation_id=conversation.conversation_id,
+            session_id=conversation.session_id,
             messages=messages[-self.max_messages :],
             session_summary=session_summary,
             long_term_memory=long_term_memory,

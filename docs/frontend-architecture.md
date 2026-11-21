@@ -77,7 +77,7 @@ frontend/
 
 服务端回传同一 request_id 的 pong。服务端对超过 1 KiB 或不符合消息结构的数据返回 error；不可信 Origin 在握手时以关闭码 1008 拒绝。此通道只报告 API 健康状态，项目阶段数据仍以版本化的前端路线数据为准。
 
-聊天通道接收 `{"type":"chat.send","conversation_id":"...","message":"..."}`；完成后发送 `chat.response`，失败时发送 `chat.error`。当前一次返回完整回复，不逐 Token 推送。
+聊天通道接收 `{"type":"chat.send","session_id":"...","message":"..."}`；完成后发送 `chat.response`，失败时发送 `chat.error`。当前一次返回完整回复，不逐 Token 推送。
 
 高影响工具调用暂停期间，服务端发送不含工具原始参数或文件正文的摘要：
 
@@ -117,7 +117,7 @@ Stage E 的本地浏览器管理页面已覆盖项目看板、聊天、模型与
 
 MCP 连接页通过只读 `GET /api/v1/mcp/connections` 加载连接 ID、transport、生命周期状态、发现工具数和分类错误码；另通过 `/api/v1/mcp/servers` 管理持久化的本地 STDIO 与远程 HTTP Server 配置。配置编辑区默认显示参数表单，可切换到 JSON 导入视图，两个视图不会同时显示。密钥只提交至本地后端并在进程内保存，配置读取仅暴露密钥是否已提供；环境变量配置的 Server 只读展示。连接状态代表最近一次建立连接与工具发现结果，当前没有周期性健康探测。
 
-`GET /api/v1/skills` 聚合用户目录与只读 bundled 目录中的 YAML 和 `SKILL.md` 包，只返回通过校验的 Skill ID、名称、说明、检测格式、当前及可选执行入口、启用状态、来源和无效包数量；不返回文件路径、资源或指令正文。`GET /api/v1/skills/detail?skill_id=...` 按目录 ID 返回通过校验的 YAML manifest、`SKILL.md` 和文本资源，不接受文件系统路径。`POST /api/v1/skills/import` 接收原始 ZIP 请求体，不依赖 multipart；限制压缩文件 4 MiB、解压后文件总量 2 MiB 和最多 100 个文件，校验一个包后才安装。拒绝路径穿越、符号链接、隐藏路径、二进制可执行文件、无效包和重复 Skill；UTF-8 的 `.py`、`.js`、`.sh` 可作为普通文本资源导入，不会在导入或加载时运行。需要执行脚本时，Agent 将源码交给对应的内置沙箱工具；当前工具接收源码字符串，不会把 Skill 目录挂载到脚本进程。`PATCH /api/v1/skills/state` 按 Skill ID 启停用户包；`PATCH /api/v1/skills/execution` 按 Skill ID 持久化兼容的执行入口；`DELETE /api/v1/skills?skill_id=...` 删除用户包。管理操作只修改用户目录内经校验的直接子目录，bundled 包不可编辑。双格式包可选择 YAML、DeepAgents 或 `both`，默认 YAML；`both` 的分类器每次请求只选择一个入口，DeepAgents 输入只包含被选中的 Markdown Skill。执行偏好在 SQLite 持久化，并在运行时锁内即时应用。Harness 配置只管理运行时参数和凭证，不保存 Skill steps 或业务 Prompt。MCP 连接面板显示连接状态及动态发现的工具，不复制 MCP 工具定义。Trace 展示应遵守凭证和敏感参数脱敏要求。
+`GET /api/v1/skills` 聚合用户目录与只读 bundled 目录中的 YAML 和 `SKILL.md` 包，只返回通过校验的 Skill ID、名称、说明、检测格式、当前及可选执行入口、启用状态、来源和无效包数量；不返回文件路径、资源或指令正文。`GET /api/v1/skills/detail?skill_id=...` 按目录 ID 返回通过校验的 YAML manifest、`SKILL.md` 和文本资源，不接受文件系统路径。`POST /api/v1/skills/import` 接收原始 ZIP 请求体，不依赖 multipart；限制压缩文件 4 MiB、解压后文件总量 2 MiB 和最多 100 个文件，校验一个包后才安装。拒绝路径穿越、符号链接、隐藏路径、二进制可执行文件、无效包和重复 Skill；UTF-8 的 `.py`、`.js`、`.sh` 可作为普通文本资源导入，不会在导入或加载时运行。需要执行脚本时，Agent 将源码交给对应的内置沙箱工具；当前工具接收源码字符串，不会把 Skill 目录挂载到脚本进程。`PATCH /api/v1/skills/state` 按 Skill ID 启停用户包；`PATCH /api/v1/skills/execution` 按 Skill ID 持久化兼容的执行入口；`DELETE /api/v1/skills?skill_id=...` 删除用户包。管理操作只修改用户目录内经校验的直接子目录，bundled 包不可编辑。双格式包可选择 YAML、Markdown 或 `both`，默认 YAML；`both` 的分类器每次请求只选择一个入口，Markdown 执行器只收到被选中的 Skill。执行偏好在 SQLite 持久化，并在运行时锁内即时应用。历史 `deepagents` 偏好会迁移为 `markdown`，旧 API 输入值也会被兼容转换。Harness 配置只管理运行时参数和凭证，不保存 Skill steps 或业务 Prompt。MCP 连接面板显示连接状态及动态发现的工具，不复制 MCP 工具定义。Trace 展示应遵守凭证和敏感参数脱敏要求。
 
 前端形态确认为本地浏览器 Web，不打包为 Electron、Tauri 等桌面壳。Harness 运行参数配置、MCP/Skill 管理、Trace 和 Audit 页面均已交付。Trace 展示请求及 Skill、工具、审批等关联 Span；Audit 支持筛选、分页和 CSV 导出。当前尚未提供记忆编辑页面，也未提供模型回复的 WebSocket 流式传输。
 

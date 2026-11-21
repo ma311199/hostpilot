@@ -38,13 +38,13 @@ async def open_sqlite_checkpointer(
         yield checkpointer
 
 
-def conversation_thread_config(conversation_id: str) -> dict[str, dict[str, str]]:
+def session_thread_config(session_id: str) -> dict[str, dict[str, str]]:
     """Map a validated HostPilot conversation ID to LangGraph thread configuration."""
     try:
-        thread_id = str(UUID(conversation_id))
+        thread_id = str(UUID(session_id))
     except (ValueError, AttributeError) as error:
-        raise ValueError("conversation_id must be a UUID.") from error
+        raise ValueError("session_id must be a UUID.") from error
     return {"configurable": {"thread_id": thread_id}}
 
 
-__all__ = ["conversation_thread_config", "open_sqlite_checkpointer"]
+__all__ = ["session_thread_config", "open_sqlite_checkpointer"]

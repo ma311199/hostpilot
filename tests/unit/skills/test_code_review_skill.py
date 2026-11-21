@@ -4,14 +4,15 @@ from pathlib import Path
 from hostpilot.budget import RequestBudget
 from hostpilot.contracts import BudgetContext, BudgetLimits, ContextSnapshot, ModelTokenUsage
 from hostpilot.models import ModelResponse
+from hostpilot.runtime import RequestContext
 from hostpilot.skills.llm_actions import register_llm_completion_action
 from hostpilot.skills.runtime import (
     AssessmentDisposition,
     BuiltinExecutorRegistry,
     SkillAssessment,
+    SkillEngine,
     SkillExecutionRequest,
     SkillExecutionStatus,
-    SkillRuntime,
     StepActionRegistry,
 )
 from hostpilot.skills.yaml_registry import YamlSkillRegistry
@@ -44,7 +45,7 @@ def test_packaged_code_review_skill_runs_read_only_and_counts_model_usage(tmp_pa
         actions = StepActionRegistry()
         register_llm_completion_action(actions, model)
         assessor = AcceptingAssessor()
-        runtime = SkillRuntime(registry, actions, BuiltinExecutorRegistry(), assessor, assessor)
+        runtime = SkillEngine(registry, actions, BuiltinExecutorRegistry(), assessor, assessor)
         budget = RequestBudget.start(
             BudgetContext(
                 limits=BudgetLimits(
@@ -58,8 +59,10 @@ def test_packaged_code_review_skill_runs_read_only_and_counts_model_usage(tmp_pa
         request = SkillExecutionRequest(
             skill_id="business/code-review-check",
             payload={"code_or_diff": "def check_input(value): return eval(value)"},
-            context=ContextSnapshot(request_id="review-1", conversation_id="conversation-1"),
-            budget=budget,
+            request_context=RequestContext(
+                ContextSnapshot(request_id="review-1", session_id="conversation-1"),
+                budget,
+            ),
         )
 
         result = await runtime.execute(request)
@@ -93,20 +96,22 @@ def test_packaged_code_review_skill_clarifies_missing_source_before_model_call(
         actions = StepActionRegistry()
         register_llm_completion_action(actions, model)
         assessor = AcceptingAssessor()
-        runtime = SkillRuntime(registry, actions, BuiltinExecutorRegistry(), assessor, assessor)
+        runtime = SkillEngine(registry, actions, BuiltinExecutorRegistry(), assessor, assessor)
         request = SkillExecutionRequest(
             skill_id="business/code-review-check",
             payload={},
-            context=ContextSnapshot(request_id="review-2", conversation_id="conversation-1"),
-            budget=RequestBudget.start(
-                BudgetContext(
-                    limits=BudgetLimits(
-                        total_tokens=100,
-                        tool_calls=0,
-                        retrieval_calls=0,
-                        timeout_seconds=30,
+            request_context=RequestContext(
+                ContextSnapshot(request_id="review-2", session_id="conversation-1"),
+                RequestBudget.start(
+                    BudgetContext(
+                        limits=BudgetLimits(
+                            total_tokens=100,
+                            tool_calls=0,
+                            retrieval_calls=0,
+                            timeout_seconds=30,
+                        )
                     )
-                )
+                ),
             ),
         )
 

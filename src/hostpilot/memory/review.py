@@ -37,11 +37,8 @@ class MemoryProposalReview:
         if encoded_size > self.writer.memory.max_file_bytes:
             raise MemoryWriteDenied("Memory proposal exceeds the configured file size limit.")
         if proposal.scope is MemoryScope.SESSION_SUMMARY:
-            conversation_id = proposal.conversation_id
-            if (
-                conversation_id is None
-                or await self.writer.conversations.get(conversation_id) is None
-            ):
+            session_id = proposal.session_id
+            if session_id is None or await self.writer.conversations.get(session_id) is None:
                 raise MemoryWriteDenied("Session summary proposal targets an unknown conversation.")
 
         assessment = assess_memory_content(proposal.content)
@@ -110,13 +107,13 @@ class MemoryProposalReview:
                 raise PendingProposalNotFound(proposal_id)
             self._record("memory.proposal.rejected", AuditOutcome.CANCELLED, proposal_id)
 
-    async def remove_for_conversation(self, conversation_id: str) -> None:
+    async def remove_for_conversation(self, session_id: str) -> None:
         """Discard pending session-summary proposals when their session is deleted."""
         async with self._lock:
             proposal_ids = [
                 proposal_id
                 for proposal_id, proposal in self._proposals.items()
-                if proposal.conversation_id == conversation_id
+                if proposal.session_id == session_id
             ]
             for proposal_id in proposal_ids:
                 del self._proposals[proposal_id]
@@ -149,7 +146,7 @@ class MemoryProposalReview:
 
 
 def _target_key(proposal: MemoryWriteProposal) -> tuple[MemoryScope, str | None]:
-    return proposal.scope, proposal.conversation_id
+    return proposal.scope, proposal.session_id
 
 
 __all__ = [

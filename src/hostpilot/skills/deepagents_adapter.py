@@ -64,9 +64,9 @@ class DeepAgentsSkillAdapter:
                 skill_id = self.skill_ids_by_name.get(package.name, f"legacy/{package.name}")
                 mode = self.execution_modes.get(
                     skill_id,
-                    "yaml" if has_yaml_manifest else "deepagents",
+                    "yaml" if has_yaml_manifest else "markdown",
                 )
-                if mode not in {"deepagents", "both"}:
+                if mode not in {"markdown", "both"}:
                     continue
             skill_id = self.skill_ids_by_name.get(package.name, f"legacy/{package.name}")
             if selected_skill_id is not None and skill_id != selected_skill_id:

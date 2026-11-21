@@ -104,7 +104,7 @@ describe('chat tool approval dialog', () => {
 
   it('hides internal tool-call and tool-result messages from conversation history', async () => {
     const conversation = {
-      conversation_id: 'conversation-1',
+      session_id: 'conversation-1',
       title: 'Approval test',
       created_at: '2026-10-31T00:00:00Z',
       updated_at: '2026-10-31T00:00:00Z',
@@ -164,9 +164,9 @@ describe('chat tool approval dialog', () => {
     const earlier = new Date(today)
     earlier.setDate(today.getDate() - 3)
     chatMocks.listConversations.mockResolvedValue([
-      { conversation_id: 'today', title: 'Today work', created_at: today.toISOString(), updated_at: today.toISOString(), sandbox_mode: 'read-only' },
-      { conversation_id: 'yesterday', title: 'Yesterday plan', created_at: yesterday.toISOString(), updated_at: yesterday.toISOString(), sandbox_mode: 'read-only' },
-      { conversation_id: 'earlier', title: 'Older notes', created_at: earlier.toISOString(), updated_at: earlier.toISOString(), sandbox_mode: 'read-only' },
+      { session_id: 'today', title: 'Today work', created_at: today.toISOString(), updated_at: today.toISOString(), sandbox_mode: 'read-only' },
+      { session_id: 'yesterday', title: 'Yesterday plan', created_at: yesterday.toISOString(), updated_at: yesterday.toISOString(), sandbox_mode: 'read-only' },
+      { session_id: 'earlier', title: 'Older notes', created_at: earlier.toISOString(), updated_at: earlier.toISOString(), sandbox_mode: 'read-only' },
     ])
     const wrapper = mount(ChatPanel)
     await flushPromises()
@@ -182,7 +182,7 @@ describe('chat tool approval dialog', () => {
 
   it('renames and pins a conversation through its overflow menu and restores those preferences', async () => {
     const conversation = {
-      conversation_id: 'conversation-menu',
+      session_id: 'conversation-menu',
       title: 'Original title',
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
@@ -216,14 +216,14 @@ describe('chat tool approval dialog', () => {
 
   it('deletes a conversation after confirmation and selects the next conversation', async () => {
     const current = {
-      conversation_id: 'conversation-current',
+      session_id: 'conversation-current',
       title: 'Current',
       created_at: '2026-11-08T00:00:00Z',
       updated_at: '2026-11-08T00:00:00Z',
       sandbox_mode: 'read-only',
     }
     const previous = {
-      conversation_id: 'conversation-previous',
+      session_id: 'conversation-previous',
       title: 'Previous',
       created_at: '2026-11-07T00:00:00Z',
       updated_at: '2026-11-07T00:00:00Z',
@@ -231,7 +231,7 @@ describe('chat tool approval dialog', () => {
     }
     chatMocks.listConversations.mockResolvedValue([current, previous])
     chatMocks.getConversationMessages.mockImplementation(async (id: string) => ({
-      conversation: id === current.conversation_id ? current : previous,
+      conversation: id === current.session_id ? current : previous,
       messages: [{ role: 'user', content: `Message for ${id}` }],
     }))
     chatMocks.deleteConversation.mockResolvedValue(undefined)
@@ -244,17 +244,17 @@ describe('chat tool approval dialog', () => {
     await flushPromises()
 
     expect(confirmSpy).toHaveBeenCalledOnce()
-    expect(chatMocks.deleteConversation).toHaveBeenCalledWith(current.conversation_id)
+    expect(chatMocks.deleteConversation).toHaveBeenCalledWith(current.session_id)
     expect(wrapper.text()).not.toContain('Current')
     expect(wrapper.text()).toContain('Previous')
-    expect(wrapper.text()).toContain(`Message for ${previous.conversation_id}`)
+    expect(wrapper.text()).toContain(`Message for ${previous.session_id}`)
     confirmSpy.mockRestore()
     wrapper.unmount()
   })
 
   it('requires explicit confirmation and persists a session sandbox upgrade', async () => {
     const conversation = {
-      conversation_id: 'conversation-sandbox',
+      session_id: 'conversation-sandbox',
       title: 'Sandbox test',
       created_at: '2026-11-08T00:00:00Z',
       updated_at: '2026-11-08T00:00:00Z',
@@ -276,7 +276,7 @@ describe('chat tool approval dialog', () => {
     expect(confirmSpy).toHaveBeenCalledOnce()
     expect(confirmSpy.mock.calls[0]?.[0]).toContain('不能在本会话中撤销')
     expect(chatMocks.upgradeConversationSandbox).toHaveBeenCalledWith(
-      conversation.conversation_id,
+      conversation.session_id,
       'workspace-write',
     )
     expect(wrapper.text()).toContain('本会话：工作区可写')

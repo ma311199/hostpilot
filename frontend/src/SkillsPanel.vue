@@ -148,7 +148,7 @@ async function toggleSkill(skill: SkillCatalogResponse['skills'][number]): Promi
 function executionModeLabel(mode: SkillExecutionMode): string {
   const labels: Record<SkillExecutionMode, string> = {
     yaml: 'YAML Runtime',
-    deepagents: 'DeepAgents',
+    markdown: 'Markdown (SKILL.md)',
     both: '两种入口',
   }
   return labels[mode]
@@ -157,7 +157,7 @@ function executionModeLabel(mode: SkillExecutionMode): string {
 function availableExecutionModes(
   skill: SkillCatalogResponse['skills'][number],
 ): SkillExecutionMode[] {
-  return skill.available_execution_modes || [skill.execution_format === 'yaml' ? 'yaml' : 'deepagents']
+  return skill.available_execution_modes || [skill.execution_format === 'yaml' ? 'yaml' : 'markdown']
 }
 
 function effectiveExecutionMode(skill: SkillCatalogResponse['skills'][number]): SkillExecutionMode {
@@ -463,7 +463,7 @@ onMounted(() => void refresh())
     <p class="skills-note">
       ZIP 导入支持一个有效 YAML 或 SKILL.md 包及 UTF-8 文本资源（含 .py、.sh、.js，最大 4 MiB）。脚本只作为 Skill 资源导入，不会在导入或加载时运行；执行脚本须调用对应的隔离沙箱工具并经过用户确认。
       导入后可在 Skill 详情中检查文件。
-      执行方式按包内有效格式限制；选择“两种入口”时，路由每次只执行 YAML 或 DeepAgents 中的一种。修改前会提示确认。
+      执行方式按包内有效格式限制；选择“两种入口”时，路由每次只执行 YAML 或 Markdown 中的一种。修改前会提示确认。
     </p>
   </section>
 </template>

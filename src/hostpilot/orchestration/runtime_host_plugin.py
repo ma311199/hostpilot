@@ -4,15 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from hostpilot.budget import RequestBudget
-from hostpilot.contracts import ContextSnapshot, ConversationMessage
-from hostpilot.orchestration.runtime import AgentResponse, AgentRuntime
-from hostpilot.runtime import RuntimeContext, RuntimePluginSpec
-from hostpilot.tools.executor import AsyncConfirmationProvider
+from hostpilot.contracts import ConversationMessage
+from hostpilot.orchestration.runtime import ChatAgentResponse, ChatAgentRuntime
+from hostpilot.runtime import RequestContext, RuntimeContext, RuntimePluginSpec
 
 
-class AgentRuntimeHostPlugin:
-    """Own the active AgentRuntime and expose it as a HostPilot service."""
+class ChatAgentRuntimeHostPlugin:
+    """Own the active ChatAgentRuntime and expose it as a HostPilot service."""
 
     spec = RuntimePluginSpec(
         "builtin.chat-execution",
@@ -24,7 +22,7 @@ class AgentRuntimeHostPlugin:
     )
     service_id = "hostpilot.agent-runtime"
 
-    def __init__(self, runtime: AgentRuntime | None = None) -> None:
+    def __init__(self, runtime: ChatAgentRuntime | None = None) -> None:
         self._runtime = runtime
 
     @property
@@ -42,7 +40,7 @@ class AgentRuntimeHostPlugin:
         del context
         await self.replace(None)
 
-    async def replace(self, runtime: AgentRuntime | None) -> None:
+    async def replace(self, runtime: ChatAgentRuntime | None) -> None:
         previous = self._runtime
         self._runtime = runtime
         if previous is None or previous is runtime:
@@ -51,40 +49,29 @@ class AgentRuntimeHostPlugin:
         if callable(close):
             await close()
 
-    async def read_messages(self, conversation_id: str) -> tuple[ConversationMessage, ...]:
-        return await self._require_runtime().read_messages(conversation_id)
+    async def read_messages(self, session_id: str) -> tuple[ConversationMessage, ...]:
+        return await self._require_runtime().read_messages(session_id)
 
     async def respond(
         self,
         message: str,
-        context: ContextSnapshot,
-        *,
-        budget: RequestBudget | None = None,
-        confirmation_provider: AsyncConfirmationProvider | None = None,
-    ) -> AgentResponse:
-        runtime = self._require_runtime()
-        if confirmation_provider is None:
-            return await runtime.respond(message, context, budget=budget)
-        return await runtime.respond(
-            message,
-            context,
-            budget=budget,
-            confirmation_provider=confirmation_provider,
-        )
+        request_context: RequestContext,
+    ) -> ChatAgentResponse:
+        return await self._require_runtime().respond(message, request_context)
 
     async def record_turn(
         self,
-        conversation_id: str,
+        session_id: str,
         user_message: str,
         assistant_message: str,
     ) -> None:
         await self._require_runtime().record_turn(
-            conversation_id,
+            session_id,
             user_message,
             assistant_message,
         )
 
-    def _require_runtime(self) -> AgentRuntime:
+    def _require_runtime(self) -> ChatAgentRuntime:
         if self._runtime is None:
             raise RuntimeError("The configured chat Runtime is not available.")
         return self._runtime

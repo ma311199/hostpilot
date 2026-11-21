@@ -10,6 +10,7 @@ from hostpilot.budget import RequestBudget
 from hostpilot.contracts import BudgetContext, BudgetLimits, ContextSnapshot, ModelTokenUsage
 from hostpilot.models import ModelRequest, ModelResponse
 from hostpilot.persistence import SQLiteCancellationStore
+from hostpilot.runtime import RequestContext
 from hostpilot.skills.compensation import (
     CompensationRegistry,
     CompensationStatus,
@@ -20,11 +21,11 @@ from hostpilot.skills.runtime import (
     AssessmentDisposition,
     BuiltinExecutorRegistry,
     SkillAssessment,
+    SkillEngine,
+    SkillEngineError,
     SkillExecutionRequest,
     SkillExecutionResult,
     SkillExecutionStatus,
-    SkillRuntime,
-    SkillRuntimeError,
     SkillSideEffect,
     StepActionRegistration,
     StepActionRegistry,
@@ -85,7 +86,7 @@ def write_package(root: Path, value: dict[str, Any] | None = None) -> None:
 
 
 def request(*, total_tokens: int = 100) -> SkillExecutionRequest:
-    context = ContextSnapshot(request_id="request-1", conversation_id="conversation-1")
+    context = ContextSnapshot(request_id="request-1", session_id="conversation-1")
     budget = RequestBudget.start(
         BudgetContext(
             limits=BudgetLimits(
@@ -99,8 +100,7 @@ def request(*, total_tokens: int = 100) -> SkillExecutionRequest:
     return SkillExecutionRequest(
         skill_id="business/summary",
         payload={"notes": "decisions and owners"},
-        context=context,
-        budget=budget,
+        request_context=RequestContext(context, budget),
     )
 
 
@@ -161,7 +161,7 @@ def test_runtime_executes_builtin_by_skill_id_and_validates_schemas(tmp_path: Pa
         input_schema={"type": "object", "required": ["message"]},
         output_schema={"type": "object", "required": ["answer"]},
     )
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path), StepActionRegistry(), builtins, accepts(), accepts()
     )
     builtin_request = replace(
@@ -180,21 +180,20 @@ def test_core_direct_answer_is_single_turn_and_clarify_never_calls_model(
     llm = FakeLLM()
     builtins = BuiltinExecutorRegistry()
     register_core_builtin_skills(builtins, llm=llm, plan_executor=FakePlanExecutor())
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path), StepActionRegistry(), builtins, accepts(), accepts()
     )
-    context = request().context
+    request_context = request().request_context
+    context = request_context.snapshot
     direct_request = SkillExecutionRequest(
         "builtin/direct_answer",
         {"message": "hello"},
-        context,
-        request().budget,
+        request_context,
     )
     clarify_request = SkillExecutionRequest(
         "builtin/clarify",
         {"clarification_prompt": "Which file should I use?"},
-        context,
-        request().budget,
+        request_context,
     )
 
     direct = asyncio.run(runtime.execute(direct_request))
@@ -217,7 +216,7 @@ def test_runtime_runs_steps_with_mapped_inputs_and_records_snapshot(tmp_path: Pa
 
     actions = StepActionRegistry()
     actions.register(StepActionRegistration("text.transform", SideEffectLevel.READ_ONLY, transform))
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path), actions, BuiltinExecutorRegistry(), accepts(), accepts()
     )
 
@@ -245,7 +244,7 @@ def test_runtime_rejects_undeclared_tool_action_before_assessment_or_execution(
         tool_id="search",
     )
     admission = accepts()
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path),
         StepActionRegistry(),
         BuiltinExecutorRegistry(),
@@ -254,7 +253,7 @@ def test_runtime_rejects_undeclared_tool_action_before_assessment_or_execution(
     )
     runtime.actions.register(action)
 
-    with pytest.raises(SkillRuntimeError, match="undeclared tools: search"):
+    with pytest.raises(SkillEngineError, match="undeclared tools: search"):
         asyncio.run(runtime.execute(request()))
 
     assert admission.calls == 0
@@ -284,7 +283,7 @@ def test_runtime_compiles_declared_steps_as_langgraph_nodes(tmp_path: Path) -> N
 
     actions = StepActionRegistry()
     actions.register(StepActionRegistration("text.transform", SideEffectLevel.READ_ONLY, transform))
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path), actions, BuiltinExecutorRegistry(), accepts(), accepts()
     )
 
@@ -334,7 +333,7 @@ def test_runtime_runs_independent_langgraph_steps_in_parallel(tmp_path: Path) ->
     actions = StepActionRegistry()
     actions.register(StepActionRegistration("parallel.branch", SideEffectLevel.READ_ONLY, branch))
     actions.register(StepActionRegistration("parallel.combine", SideEffectLevel.READ_ONLY, combine))
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path), actions, BuiltinExecutorRegistry(), accepts(), accepts()
     )
 
@@ -381,7 +380,7 @@ def test_parallel_llm_steps_stop_after_provider_usage_exceeds_shared_budget(
     actions = StepActionRegistry()
     register_llm_completion_action(actions, model)
     actions.register(StepActionRegistration("tool.after", SideEffectLevel.READ_ONLY, after))
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path), actions, BuiltinExecutorRegistry(), accepts(), accepts()
     )
     original = request(total_tokens=10)
@@ -390,7 +389,7 @@ def test_parallel_llm_steps_stop_after_provider_usage_exceeds_shared_budget(
 
     assert len(model.requests) == 2
     assert [item.max_output_tokens for item in model.requests] == [10, 4]
-    assert original.budget.snapshot().usage.total_tokens == 6
+    assert original.request_context.budget.snapshot().usage.total_tokens == 6
     assert result.status is SkillExecutionStatus.FAILED
 
 
@@ -408,7 +407,7 @@ def test_admission_can_clarify_without_running_workflow(tmp_path: Path) -> None:
     admission = FakeAssessor(
         SkillAssessment(AssessmentDisposition.CLARIFY, 0.9, "missing_input", "Which note?")
     )
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path), actions, BuiltinExecutorRegistry(), admission, accepts()
     )
 
@@ -433,7 +432,7 @@ def test_missing_required_skill_slots_clarify_before_admission_or_workflow(tmp_p
     admission = FakeAssessor(
         SkillAssessment(AssessmentDisposition.ACCEPT, 1.0, "accepted", "Accepted")
     )
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path), actions, BuiltinExecutorRegistry(), admission, accepts()
     )
 
@@ -456,7 +455,7 @@ def test_admission_rejection_returns_failed_result_without_running_workflow(tmp_
 
     actions = StepActionRegistry()
     actions.register(StepActionRegistration("text.transform", SideEffectLevel.READ_ONLY, transform))
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path),
         actions,
         BuiltinExecutorRegistry(),
@@ -488,7 +487,7 @@ def test_assessor_failures_fail_closed_with_snapshot(tmp_path: Path) -> None:
             raise RuntimeError("assessment unavailable")
 
     admission_result = asyncio.run(
-        SkillRuntime(
+        SkillEngine(
             YamlSkillRegistry(tmp_path),
             actions,
             BuiltinExecutorRegistry(),
@@ -501,7 +500,7 @@ def test_assessor_failures_fail_closed_with_snapshot(tmp_path: Path) -> None:
     assert admission_result.snapshot.failure_code == "admission_assessor_RuntimeError"
 
     result_assessor_result = asyncio.run(
-        SkillRuntime(
+        SkillEngine(
             YamlSkillRegistry(tmp_path),
             actions,
             BuiltinExecutorRegistry(),
@@ -523,7 +522,7 @@ def test_admission_plan_decision_uses_plan_fallback_before_execution(tmp_path: P
         StepActionRegistration("text.transform", SideEffectLevel.READ_ONLY, lambda _: None)
     )
     admission = FakeAssessor(SkillAssessment(AssessmentDisposition.PLAN, 0.2, "not_suitable"))
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path),
         actions,
         BuiltinExecutorRegistry(),
@@ -559,7 +558,7 @@ def test_irreversible_result_failure_uses_plan_for_state_reconciliation(tmp_path
     result_assessor = FakeAssessor(
         SkillAssessment(AssessmentDisposition.PLAN, 0.1, "result_failed")
     )
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path),
         actions,
         BuiltinExecutorRegistry(),
@@ -604,7 +603,7 @@ def test_reversible_result_failure_compensates_before_plan_fallback(
 
     compensations = CompensationRegistry()
     compensations.register("text.transform", compensate)
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path),
         actions,
         BuiltinExecutorRegistry(),
@@ -642,7 +641,7 @@ def test_uncompensated_reversible_effect_uses_plan_for_state_reconciliation(
 
     actions = StepActionRegistry()
     actions.register(StepActionRegistration("text.transform", SideEffectLevel.REVERSIBLE, mutate))
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path),
         actions,
         BuiltinExecutorRegistry(),
@@ -705,7 +704,7 @@ def test_workflow_cancellation_compensates_completed_reversible_steps(tmp_path: 
     )
     compensations = CompensationRegistry()
     compensations.register("state.mutate", compensate)
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path),
         actions,
         BuiltinExecutorRegistry(),
@@ -770,7 +769,7 @@ def test_workflow_cancellation_safely_compensates_prepared_inflight_effect(
     )
     compensations = CompensationRegistry()
     compensations.register("text.transform", compensate, safe_for_uncertain_effect=True)
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path),
         actions,
         BuiltinExecutorRegistry(),
@@ -807,7 +806,7 @@ def test_action_risk_cannot_exceed_skill_declaration(tmp_path: Path) -> None:
 
     actions = StepActionRegistry()
     actions.register(StepActionRegistration("text.transform", SideEffectLevel.IDEMPOTENT, mutate))
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path), actions, BuiltinExecutorRegistry(), accepts(), accepts()
     )
 
@@ -828,7 +827,7 @@ def test_budget_exhaustion_prevents_plan_fallback(tmp_path: Path) -> None:
         StepActionRegistration("text.transform", SideEffectLevel.READ_ONLY, lambda _: None)
     )
     admission = FakeAssessor(SkillAssessment(AssessmentDisposition.PLAN, 0.2, "not_suitable"))
-    runtime = SkillRuntime(
+    runtime = SkillEngine(
         YamlSkillRegistry(tmp_path),
         actions,
         BuiltinExecutorRegistry(),
@@ -837,7 +836,7 @@ def test_budget_exhaustion_prevents_plan_fallback(tmp_path: Path) -> None:
         plan_fallback=fallback,
     )
     limited = request(total_tokens=1)
-    limited.budget.consume_tokens(1)
+    limited.request_context.budget.consume_tokens(1)
 
     result = asyncio.run(runtime.execute(limited))
 

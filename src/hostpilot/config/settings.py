@@ -199,7 +199,7 @@ class Settings(BaseSettings):
     routing_max_plan_candidates: int = Field(default=5, gt=0, le=20)
     routing_max_business_candidates: int = Field(default=32, gt=0, le=100)
     chat_runtime_plugin: str = Field(
-        default="builtin.deepagents", pattern=r"^[a-z][a-z0-9_.-]{0,63}$"
+        default="builtin.runtime-chat", pattern=r"^[a-z][a-z0-9_.-]{0,63}$"
     )
     plan_planner_plugin: str = Field(default="builtin.llm", pattern=r"^[a-z][a-z0-9_.-]{0,63}$")
     plan_validator_plugin: str = Field(

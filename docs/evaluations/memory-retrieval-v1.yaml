@@ -9,12 +9,12 @@ description: >-
 entries:
   - entry_id: session-alpha-contract
     scope: session_summary
-    conversation_id: conversation-alpha
+    session_id: conversation-alpha
     content: >-
       本次合同讨论确认税费由乙方承担，首批交付安排在六月十二日；尚未确认的是验收材料的提交人。
   - entry_id: session-beta-private
     scope: session_summary
-    conversation_id: conversation-beta
+    session_id: conversation-beta
     content: >-
       另一个会话的合同讨论确认税费由甲方承担，私人报价与本会话无关。
   - entry_id: preference-concise
@@ -48,38 +48,38 @@ entries:
 
 cases:
   - case_id: session-contract-tax
-    conversation_id: conversation-alpha
+    session_id: conversation-alpha
     query: 这个会话里税费由谁承担？
     relevant_ids: [session-alpha-contract]
   - case_id: model-key-after-restart
-    conversation_id: conversation-alpha
+    session_id: conversation-alpha
     query: 应用重新启动后，模型访问凭据还保留在设置里吗？
     relevant_ids: [model-credential-lifecycle]
   - case_id: mcp-key-after-restart
-    conversation_id: conversation-alpha
+    session_id: conversation-alpha
     query: MCP 连接认证在下次打开程序时要不要再填？
     relevant_ids: [mcp-credential-lifecycle]
   - case_id: workspace-permission-fallback
-    conversation_id: conversation-alpha
+    session_id: conversation-alpha
     query: 选中的目录没有访问权限时程序会怎样处理？
     relevant_ids: [workspace-access-recovery]
   - case_id: sandbox-cannot-downgrade
-    conversation_id: conversation-alpha
+    session_id: conversation-alpha
     query: 会话提权后能否再恢复成只读？
     relevant_ids: [sandbox-one-way-upgrade]
   - case_id: skill-dual-entry
-    conversation_id: conversation-alpha
+    session_id: conversation-alpha
     query: 同一个 Skill 有两种运行格式时失败后会换另一种吗？
     relevant_ids: [skill-format-selection]
   - case_id: memory-semantic-status
-    conversation_id: conversation-alpha
+    session_id: conversation-alpha
     query: 目前记忆会根据问题含义自动找相似内容吗？
     relevant_ids: [memory-recall-boundary]
   - case_id: response-style
-    conversation_id: conversation-alpha
+    session_id: conversation-alpha
     query: 开发完成后我希望用什么语言和篇幅汇报？
     relevant_ids: [preference-concise]
   - case_id: credential-after-exit-paraphrase
-    conversation_id: conversation-alpha
+    session_id: conversation-alpha
     query: 之前授权的访问口令退出程序后还能用吗？
     relevant_ids: [model-credential-lifecycle, mcp-credential-lifecycle]

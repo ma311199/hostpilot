@@ -32,7 +32,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     """Assistant response associated with a persisted conversation."""
 
-    conversation_id: str
+    session_id: str
     request_id: str
     assistant_message: str
     route: Route = Route.DIRECT

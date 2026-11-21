@@ -16,6 +16,7 @@ from hostpilot.models import ModelResponse
 from hostpilot.observability import TraceContext, TraceEvent, trace_context_scope
 from hostpilot.persistence import MarkdownMemoryStore, SQLiteConversationStore
 from hostpilot.routing.skill_selector import ModelProviderSkillSelector
+from hostpilot.runtime import RequestContext
 from hostpilot.skills.yaml_registry import YamlSkillRegistry
 
 
@@ -33,8 +34,8 @@ def request_budget() -> RequestBudget:
 
 
 class EmptyStateReader:
-    async def read_messages(self, conversation_id: str) -> tuple[()]:
-        del conversation_id
+    async def read_messages(self, session_id: str) -> tuple[()]:
+        del session_id
         return ()
 
 
@@ -118,7 +119,7 @@ def test_long_term_recall_keeps_late_chunk_available_for_reference_matching(
         memory_store.write_long_term_memory(f"{distractors}\n\n# 发布清单\n\n{target}")
 
         context = await builder.build(
-            conversation.conversation_id,
+            conversation.session_id,
             query="把这段关于回归测试的内容整理一下。",
         )
 
@@ -140,17 +141,16 @@ def test_long_term_recall_keeps_late_chunk_available_for_reference_matching(
         )
         retrieval_queries: list[str] = []
 
-        async def capture_retrieval(catalog, query, budget, deepagents_candidates):
+        async def capture_retrieval(catalog, query, budget, markdown_candidates):
             del catalog, budget
             retrieval_queries.append(query)
-            return [], deepagents_candidates
+            return [], markdown_candidates
 
         selector._retrieve_candidates = capture_retrieval
         with trace_context_scope(TraceContext()):
             selection = await selector.select(
                 "把这段关于回归测试的内容整理一下。",
-                context,
-                budget=request_budget(),
+                RequestContext(context, request_budget()),
             )
 
         assert selection.skill_id == "builtin/direct_answer"
@@ -173,7 +173,7 @@ def test_unrelated_recalled_memory_clarifies_without_skill_retrieval(tmp_path: P
         conversation = await conversations.create("unrelated reference")
         memory_store.write_long_term_memory("# Gardening\n\n本周需要给阳台的植物浇水，并修剪枯叶。")
         context = await builder.build(
-            conversation.conversation_id,
+            conversation.session_id,
             query="把这段关于回归测试的内容整理一下。",
         )
 
@@ -186,8 +186,7 @@ def test_unrelated_recalled_memory_clarifies_without_skill_retrieval(tmp_path: P
         selector._retrieve_candidates = retrieval_must_not_run
         selection = await selector.select(
             "把这段关于回归测试的内容整理一下。",
-            context,
-            budget=request_budget(),
+            RequestContext(context, request_budget()),
         )
 
         assert selection.skill_id == "builtin/clarify"
@@ -206,7 +205,7 @@ def test_ambiguous_memory_candidates_are_not_arbitrarily_selected(tmp_path: Path
             "# Option B\n\n第二份待整理方案，内容是年度预算分配。"
         )
         context = await builder.build(
-            conversation.conversation_id,
+            conversation.session_id,
             query="把这段关于预算的内容整理一下。",
         )
 
@@ -219,8 +218,7 @@ def test_ambiguous_memory_candidates_are_not_arbitrarily_selected(tmp_path: Path
         selector._retrieve_candidates = retrieval_must_not_run
         selection = await selector.select(
             "把这段关于预算的内容整理一下。",
-            context,
-            budget=request_budget(),
+            RequestContext(context, request_budget()),
         )
 
         assert len(model.candidates) == 2

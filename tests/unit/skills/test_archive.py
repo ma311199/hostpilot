@@ -28,7 +28,7 @@ def test_imports_one_wrapped_markdown_skill_and_keeps_text_resources(tmp_path: P
             "meeting-notes/reference.md": "Use concise headings.\n",
             "meeting-notes/helpers.py": "raise RuntimeError('resource was executed')\n",
             "meeting-notes/check.sh": "exit 42\n",
-            "meeting-notes/metadata.json": "{\"format\": \"example\"}\n",
+            "meeting-notes/metadata.json": '{"format": "example"}\n',
         }
     )
     root = tmp_path / "skills"
@@ -41,7 +41,7 @@ def test_imports_one_wrapped_markdown_skill_and_keeps_text_resources(tmp_path: P
     package = SkillRegistry(root).load("meeting-notes")
     assert package.resources["helpers.py"] == "raise RuntimeError('resource was executed')\n"
     assert package.resources["check.sh"] == "exit 42\n"
-    assert package.resources["metadata.json"] == "{\"format\": \"example\"}\n"
+    assert package.resources["metadata.json"] == '{"format": "example"}\n'
     assert result.directory == root / "meeting-notes"
 
 
@@ -122,7 +122,7 @@ execution:
             "archive-example/SKILL.md": "# Archive example\nDetails.\n",
             "archive-example/runner.py": "raise RuntimeError('resource was executed')\n",
             "archive-example/runner.sh": "exit 42\n",
-            "archive-example/data.json": "{\"safe\": true}\n",
+            "archive-example/data.json": '{"safe": true}\n',
         }
     )
     root = tmp_path / "skills"
@@ -138,4 +138,4 @@ execution:
     resources = catalog.skills[0].resources
     assert resources["runner.py"] == "raise RuntimeError('resource was executed')\n"
     assert resources["runner.sh"] == "exit 42\n"
-    assert resources["data.json"] == "{\"safe\": true}\n"
+    assert resources["data.json"] == '{"safe": true}\n'

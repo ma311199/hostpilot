@@ -1,4 +1,4 @@
-export interface HarnessRuntimeConfiguration {
+export interface HarnessConfiguration {
   max_context_messages: number
   max_memory_context_chars: number
   max_request_chars: number
@@ -48,14 +48,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T
 }
 
-export function getHarnessConfiguration(): Promise<HarnessRuntimeConfiguration> {
-  return request<HarnessRuntimeConfiguration>('/harness/configuration')
+export function getHarnessConfiguration(): Promise<HarnessConfiguration> {
+  return request<HarnessConfiguration>('/harness/configuration')
 }
 
 export function saveHarnessConfiguration(
-  configuration: HarnessRuntimeConfiguration,
-): Promise<HarnessRuntimeConfiguration> {
-  return request<HarnessRuntimeConfiguration>('/harness/configuration', {
+  configuration: HarnessConfiguration,
+): Promise<HarnessConfiguration> {
+  return request<HarnessConfiguration>('/harness/configuration', {
     method: 'PUT',
     body: JSON.stringify(configuration),
   })

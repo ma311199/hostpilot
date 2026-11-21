@@ -11,49 +11,45 @@ from fastapi.testclient import TestClient
 from hostpilot.api import create_app
 from hostpilot.budget import RequestBudget
 from hostpilot.config import Settings
-from hostpilot.contracts import ContextSnapshot, ConversationMessage, ModelTokenUsage
+from hostpilot.contracts import ConversationMessage, ModelTokenUsage
 from hostpilot.models import ModelResponse
 from hostpilot.observability import TraceEvent
-from hostpilot.orchestration.runtime import AgentResponse
-from hostpilot.orchestration.skill_runtime import SkillRuntimeAgentAdapter
+from hostpilot.orchestration.runtime import ChatAgentResponse
+from hostpilot.orchestration.skill_runtime import SkillEngineAgentAdapter
 from hostpilot.routing.skill_selector import ModelProviderSkillSelector
 from hostpilot.skills.runtime import (
+    SkillEngine,
     SkillExecutionRequest,
     SkillExecutionResult,
     SkillExecutionStatus,
-    SkillRuntime,
 )
 from hostpilot.skills.yaml_registry import YamlSkillCatalog, YamlSkillRegistry
-from hostpilot.tools.executor import AsyncConfirmationProvider
 
 
 class InMemoryChatRuntime:
     def __init__(self) -> None:
         self.messages_by_id: dict[str, list[ConversationMessage]] = {}
 
-    async def read_messages(self, conversation_id: str) -> tuple[ConversationMessage, ...]:
-        return tuple(self.messages_by_id.get(conversation_id, ()))
+    async def read_messages(self, session_id: str) -> tuple[ConversationMessage, ...]:
+        return tuple(self.messages_by_id.get(session_id, ()))
 
     async def respond(
         self,
         message: str,
-        context: ContextSnapshot,
-        *,
-        budget: RequestBudget | None = None,
-        confirmation_provider: AsyncConfirmationProvider | None = None,
-    ) -> AgentResponse:
-        del message, context, budget, confirmation_provider
+        request_context,
+    ) -> ChatAgentResponse:
+        del message, request_context
         raise AssertionError("The selector-backed chat runtime should handle every turn.")
 
     async def record_turn(
         self,
-        conversation_id: str,
+        session_id: str,
         user_message: str,
         assistant_message: str,
     ) -> None:
         from hostpilot.contracts import MessageRole
 
-        self.messages_by_id.setdefault(conversation_id, []).extend(
+        self.messages_by_id.setdefault(session_id, []).extend(
             (
                 ConversationMessage(role=MessageRole.USER, content=user_message),
                 ConversationMessage(role=MessageRole.ASSISTANT, content=assistant_message),
@@ -98,7 +94,7 @@ class SequenceRoutingModel:
         )
 
 
-class FakeSkillRuntime:
+class FakeSkillEngine:
     def __init__(self) -> None:
         self.requests: list[SkillExecutionRequest] = []
 
@@ -135,14 +131,14 @@ class TrackingSelector(ModelProviderSkillSelector):
         catalog: YamlSkillCatalog,
         message: str,
         budget: RequestBudget,
-        deepagents_candidates: list[dict[str, Any]],
+        markdown_candidates: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         self.retrieval_queries.append(message)
         return await super()._retrieve_candidates(
             catalog,
             message,
             budget,
-            deepagents_candidates,
+            markdown_candidates,
         )
 
 
@@ -163,16 +159,16 @@ def test_chat_clarification_recovers_from_followup_and_stays_conversation_scoped
     model = SequenceRoutingModel(clarified_detail)
     trace = TraceRecorder()
     selector = TrackingSelector(YamlSkillRegistry(tmp_path / "skills"), model, trace)
-    skill_runtime = FakeSkillRuntime()
-    runtime = SkillRuntimeAgentAdapter(chat_runtime, cast(SkillRuntime, skill_runtime), selector)
+    skill_runtime = FakeSkillEngine()
+    runtime = SkillEngineAgentAdapter(chat_runtime, cast(SkillEngine, skill_runtime), selector)
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         first = client.post("/api/v1/conversations", json={"title": "clarification recovery"})
         assert first.status_code == 201
-        conversation_id = first.json()["conversation_id"]
+        session_id = first.json()["session_id"]
 
         unclear = client.post(
-            f"/api/v1/conversations/{conversation_id}/messages",
+            f"/api/v1/conversations/{session_id}/messages",
             json={"message": "把这段内容整理一下。"},
         )
         assert unclear.status_code == 200
@@ -182,23 +178,23 @@ def test_chat_clarification_recovers_from_followup_and_stays_conversation_scoped
         assert selector.retrieval_queries == []
 
         supplied = client.post(
-            f"/api/v1/conversations/{conversation_id}/messages",
+            f"/api/v1/conversations/{session_id}/messages",
             json={"message": clarified_detail},
         )
         assert supplied.status_code == 200
         assert supplied.json()["route"] == "direct"
 
         followup = client.post(
-            f"/api/v1/conversations/{conversation_id}/messages",
+            f"/api/v1/conversations/{session_id}/messages",
             json={"message": "把刚才那段整理成清单。"},
         )
         assert followup.status_code == 200
         assert followup.json()["route"] == "direct"
         assert followup.json()["assistant_message"] == "已整理为清单。"
 
-        history = client.get(f"/api/v1/conversations/{conversation_id}/messages")
+        history = client.get(f"/api/v1/conversations/{session_id}/messages")
         isolated = client.post("/api/v1/conversations", json={"title": "isolated session"})
-        isolated_id = isolated.json()["conversation_id"]
+        isolated_id = isolated.json()["session_id"]
         isolated_clarification = client.post(
             f"/api/v1/conversations/{isolated_id}/messages",
             json={"message": "把这段内容整理一下。"},
@@ -220,7 +216,9 @@ def test_chat_clarification_recovers_from_followup_and_stays_conversation_scoped
     assert len(skill_runtime.requests) == 4
     assert skill_runtime.requests[0].skill_id == "builtin/clarify"
     assert skill_runtime.requests[2].skill_id == "builtin/direct_answer"
-    assert skill_runtime.requests[2].context.messages[-2].content == clarified_detail
+    assert (
+        skill_runtime.requests[2].request_context.snapshot.messages[-2].content == clarified_detail
+    )
     assert isolated_clarification.status_code == 200
     assert isolated_clarification.json()["route"] == "clarify"
     assert len(model.requests) == 3
@@ -229,7 +227,8 @@ def test_chat_clarification_recovers_from_followup_and_stays_conversation_scoped
         isolated_clarification.json()["assistant_message"],
     ]
     assert all(
-        request.context.conversation_id == isolated_id for request in skill_runtime.requests[3:]
+        request.request_context.snapshot.session_id == isolated_id
+        for request in skill_runtime.requests[3:]
     )
 
     reference_events = [

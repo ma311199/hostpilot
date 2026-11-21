@@ -18,7 +18,7 @@ describe('Conversation API', () => {
 
   it('submits a one-way sandbox upgrade for the selected conversation', async () => {
     const summary = {
-      conversation_id: 'conversation/one',
+      session_id: 'conversation/one',
       title: 'Planning',
       created_at: '2026-11-08T00:00:00Z',
       updated_at: '2026-11-08T00:00:00Z',

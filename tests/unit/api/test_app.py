@@ -3,6 +3,7 @@ import json
 import zipfile
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 from uuid import uuid4
@@ -28,7 +29,7 @@ from hostpilot.contracts import (
     SandboxMode,
 )
 from hostpilot.observability import AuditEvent, AuditOutcome, TraceContext, TraceEvent
-from hostpilot.orchestration import AgentResponse
+from hostpilot.orchestration import ChatAgentResponse
 from hostpilot.orchestration.skill_runtime import SkillSelection
 from hostpilot.persistence import (
     MarkdownMemoryStore,
@@ -402,11 +403,11 @@ def test_model_connection_test_exercises_each_role_without_saving_credentials(
             return None
 
     monkeypatch.setattr(
-        "hostpilot.models.factory.create_model_runtime",
+        "hostpilot.models.factory.create_model_runtime_components",
         lambda *_args, **_kwargs: SimpleNamespace(provider=FakeProvider(), agent_chat_model=None),
     )
     monkeypatch.setattr(
-        "hostpilot.routing.models.create_routing_model_runtime",
+        "hostpilot.routing.models.create_routing_model_components",
         lambda *_args, **_kwargs: FakeRoutingRuntime(),
     )
     settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
@@ -430,6 +431,80 @@ def test_model_connection_test_exercises_each_role_without_saving_credentials(
         configuration = client.get("/api/v1/routing-model/configuration")
         assert configuration.status_code == 200
         assert configuration.json()["saved"] is False
+
+
+def test_chat_model_connection_probe_allows_reasoning_models_time_to_respond(
+    tmp_path, monkeypatch
+) -> None:
+    from hostpilot.models.contracts import ModelResponse
+
+    captured_requests = []
+
+    class FakeProvider:
+        async def complete(self, request):
+            captured_requests.append(request)
+            return ModelResponse(text="OK")
+
+    monkeypatch.setattr(
+        "hostpilot.models.factory.create_model_runtime_components",
+        lambda *_args, **_kwargs: SimpleNamespace(provider=FakeProvider(), agent_chat_model=None),
+    )
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/api/v1/model/configuration/test",
+            json={
+                "role": "llm",
+                "model_name": "glm-5.3",
+                "api_key": "test-key",
+                "base_url": "https://example.test/v1",
+                "streaming": True,
+            },
+        )
+
+    assert response.json()["success"] is True
+    assert len(captured_requests) == 1
+    assert captured_requests[0].temperature is None
+    assert captured_requests[0].max_output_tokens >= 128
+    assert captured_requests[0].timeout_seconds >= 30
+
+
+def test_chat_model_connection_probe_reports_safe_provider_error_category(
+    tmp_path, monkeypatch
+) -> None:
+    from hostpilot.models.contracts import ModelProviderError, ModelProviderErrorCategory
+
+    class FakeProvider:
+        async def complete(self, _request):
+            raise ModelProviderError(
+                ModelProviderErrorCategory.INVALID_REQUEST,
+                status_code=400,
+                provider_code="invalid_parameter_do_not_expose",
+            )
+
+    monkeypatch.setattr(
+        "hostpilot.models.factory.create_model_runtime_components",
+        lambda *_args, **_kwargs: SimpleNamespace(provider=FakeProvider(), agent_chat_model=None),
+    )
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/api/v1/model/configuration/test",
+            json={
+                "role": "llm",
+                "model_name": "glm-5.3",
+                "api_key": "test-key",
+                "base_url": "https://example.test/v1",
+                "streaming": True,
+            },
+        )
+
+    assert response.json()["success"] is False
+    assert response.json()["error_code"] == "invalid_request"
+    assert "HTTP 400" in response.json()["message"]
+    assert "invalid_parameter_do_not_expose" not in response.text
 
 
 def test_partial_routing_model_save_skips_other_roles_missing_credentials(
@@ -471,7 +546,7 @@ def test_partial_routing_model_save_skips_other_roles_missing_credentials(
         return FakeRoutingRuntime()
 
     monkeypatch.setattr(
-        "hostpilot.routing.models.create_routing_model_runtime",
+        "hostpilot.routing.models.create_routing_model_components",
         create_fake_routing_runtime,
     )
     monkeypatch.setattr(
@@ -826,17 +901,14 @@ def test_local_api_manages_conversations_and_deletes_checkpoints(tmp_path) -> No
         response = client.post("/api/v1/conversations", json={"title": "Planning"})
         assert response.status_code == 201
         conversation = response.json()
+        assert "session_id" in conversation
+        assert "conversation_id" not in conversation
 
         listed = client.get("/api/v1/conversations")
-        assert [item["conversation_id"] for item in listed.json()] == [
-            conversation["conversation_id"]
-        ]
-        assert (
-            client.get(f"/api/v1/conversations/{conversation['conversation_id']}").status_code
-            == 200
-        )
+        assert [item["session_id"] for item in listed.json()] == [conversation["session_id"]]
+        assert client.get(f"/api/v1/conversations/{conversation['session_id']}").status_code == 200
 
-        deleted = client.delete(f"/api/v1/conversations/{conversation['conversation_id']}")
+        deleted = client.delete(f"/api/v1/conversations/{conversation['session_id']}")
         assert deleted.status_code == 204
         assert client.get("/api/v1/conversations").json() == []
 
@@ -846,30 +918,30 @@ def test_conversation_sandbox_upgrade_is_monotonic_and_audited(tmp_path) -> None
 
     with TestClient(create_app(settings)) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
-        conversation_id = conversation["conversation_id"]
+        session_id = conversation["session_id"]
         assert conversation["sandbox_mode"] == SandboxMode.READ_ONLY.value
 
         workspace_write = client.post(
-            f"/api/v1/conversations/{conversation_id}/sandbox/upgrade",
+            f"/api/v1/conversations/{session_id}/sandbox/upgrade",
             json={"target_mode": SandboxMode.WORKSPACE_WRITE.value},
         )
         assert workspace_write.status_code == 200
         assert workspace_write.json()["sandbox_mode"] == SandboxMode.WORKSPACE_WRITE.value
 
         danger = client.post(
-            f"/api/v1/conversations/{conversation_id}/sandbox/upgrade",
+            f"/api/v1/conversations/{session_id}/sandbox/upgrade",
             json={"target_mode": SandboxMode.DANGER_FULL_ACCESS.value},
         )
         assert danger.status_code == 200
         assert danger.json()["sandbox_mode"] == SandboxMode.DANGER_FULL_ACCESS.value
 
         downgrade = client.post(
-            f"/api/v1/conversations/{conversation_id}/sandbox/upgrade",
+            f"/api/v1/conversations/{session_id}/sandbox/upgrade",
             json={"target_mode": SandboxMode.READ_ONLY.value},
         )
         assert downgrade.status_code == 409
         assert (
-            client.get(f"/api/v1/conversations/{conversation_id}").json()["sandbox_mode"]
+            client.get(f"/api/v1/conversations/{session_id}").json()["sandbox_mode"]
             == SandboxMode.DANGER_FULL_ACCESS.value
         )
 
@@ -891,7 +963,7 @@ def test_native_workspace_selection_persists_and_updates_file_tools(tmp_path: Pa
     with TestClient(
         create_app(
             settings,
-            runtime_factory=lambda _: runtime,
+            chat_agent_runtime_factory=lambda _: runtime,
             workspace_picker=lambda _current: selected,
         )
     ) as client:
@@ -909,7 +981,9 @@ def test_native_workspace_selection_persists_and_updates_file_tools(tmp_path: Pa
         assert client.app.state.workspace_files.root == selected.resolve()
         assert client.app.state.workspace_files.read_only is False
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: FakeChatRuntime())) as restarted:
+    with TestClient(
+        create_app(settings, chat_agent_runtime_factory=lambda _: FakeChatRuntime())
+    ) as restarted:
         assert restarted.get("/api/v1/workspace").json()["path"] == str(selected.resolve())
 
 
@@ -934,7 +1008,7 @@ def test_read_only_workspace_selection_blocks_write_tool_validation(
     with TestClient(
         create_app(
             settings,
-            runtime_factory=lambda _: FakeChatRuntime(),
+            chat_agent_runtime_factory=lambda _: FakeChatRuntime(),
             workspace_picker=lambda _current: selected,
         )
     ) as client:
@@ -972,7 +1046,7 @@ def test_unreadable_workspace_selection_keeps_the_current_root(tmp_path: Path, m
     with TestClient(
         create_app(
             settings,
-            runtime_factory=lambda _: FakeChatRuntime(),
+            chat_agent_runtime_factory=lambda _: FakeChatRuntime(),
             workspace_picker=lambda _current: selected,
         )
     ) as client:
@@ -1161,19 +1235,20 @@ def test_skill_catalog_merges_dual_format_package_and_persists_execution_choice(
         assert len(matches) == 1
         assert matches[0]["detected_formats"] == ["yaml", "skill_md"]
         assert matches[0]["execution_mode"] == "yaml"
-        assert matches[0]["available_execution_modes"] == ["yaml", "deepagents", "both"]
+        assert matches[0]["available_execution_modes"] == ["yaml", "markdown", "both"]
 
         changed = client.patch(
             "/api/v1/skills/execution",
             json={"skill_id": skill_id, "execution_mode": "deepagents"},
         )
         assert changed.status_code == 200
-        assert changed.json()["execution_mode"] == "deepagents"
+        assert changed.json()["execution_mode"] == "markdown"
 
     with TestClient(create_app(settings)) as restarted:
         restored = restarted.get("/api/v1/skills").json()
         item = next(skill for skill in restored["skills"] if skill["skill_id"] == skill_id)
-        assert item["execution_mode"] == "deepagents"
+        assert item["execution_mode"] == "markdown"
+        assert item["available_execution_modes"] == ["yaml", "markdown", "both"]
 
 
 def test_skill_execution_mode_rejects_format_mismatch(tmp_path) -> None:
@@ -1248,8 +1323,8 @@ def test_skill_archive_upload_validates_and_installs_markdown_package(tmp_path) 
         "description": "Turn notes into minutes.",
         "execution_format": "skill_md",
         "detected_formats": ["skill_md"],
-        "execution_mode": "deepagents",
-        "available_execution_modes": ["deepagents"],
+        "execution_mode": "markdown",
+        "available_execution_modes": ["markdown"],
         "enabled": True,
         "source": "user",
     }
@@ -1379,36 +1454,34 @@ class FakeChatRuntime:
     async def aclose(self) -> None:
         self.closed = True
 
-    async def read_messages(self, conversation_id: str) -> tuple[ConversationMessage, ...]:
-        return tuple(self.messages_by_id.get(conversation_id, ()))
+    async def read_messages(self, session_id: str) -> tuple[ConversationMessage, ...]:
+        return tuple(self.messages_by_id.get(session_id, ()))
 
     async def respond(
         self,
         message: str,
-        context: ContextSnapshot,
-        *,
-        budget=None,
-        confirmation_provider=None,
-    ) -> AgentResponse:
-        del confirmation_provider
+        request_context,
+    ) -> ChatAgentResponse:
+        context = request_context.snapshot
         self.contexts.append(context)
-        self.request_budget = budget
-        messages = self.messages_by_id.setdefault(context.conversation_id, [])
+        self.request_context = request_context
+        self.request_budget = request_context.budget
+        messages = self.messages_by_id.setdefault(context.session_id, [])
         messages.extend(
             (
                 ConversationMessage(role=MessageRole.USER, content=message),
                 ConversationMessage(role=MessageRole.ASSISTANT, content="Local test reply"),
             )
         )
-        return AgentResponse("Local test reply", self.token_usage)
+        return ChatAgentResponse("Local test reply", self.token_usage)
 
     async def record_turn(
         self,
-        conversation_id: str,
+        session_id: str,
         user_message: str,
         assistant_message: str,
     ) -> None:
-        self.messages_by_id.setdefault(conversation_id, []).extend(
+        self.messages_by_id.setdefault(session_id, []).extend(
             (
                 ConversationMessage(role=MessageRole.USER, content=user_message),
                 ConversationMessage(role=MessageRole.ASSISTANT, content=assistant_message),
@@ -1422,7 +1495,7 @@ def test_app_runtime_host_manages_chat_runtime_lifecycle(tmp_path) -> None:
     settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
     runtime = FakeChatRuntime()
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         host = client.app.state.runtime_host
         assert host.state is RuntimeHostState.READY
         assert client.app.state.chat_service.runtime is host.context.services.resolve(
@@ -1454,7 +1527,7 @@ def test_app_runtime_host_manages_chat_runtime_lifecycle(tmp_path) -> None:
         } <= set(host.context.services.snapshot())
         conversation = client.post("/api/v1/conversations", json={}).json()
         response = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{conversation['session_id']}/messages",
             json={"message": "Hello"},
         )
         assert response.status_code == 200
@@ -1549,7 +1622,7 @@ def test_runtime_reuses_sandbox_backends_across_initial_and_candidate_providers(
     monkeypatch.setattr(tools_module.mcp, "build_retrieval_mcp_provider", record_builder)
     monkeypatch.setattr(
         api_module,
-        "create_configured_runtime",
+        "create_configured_chat_agent_runtime",
         lambda *_args, **_kwargs: FakeChatRuntime(),
     )
     settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
@@ -1599,7 +1672,7 @@ def test_routing_evaluation_endpoint_never_executes_selected_skill(tmp_path) -> 
     runtime = FakeChatRuntime()
 
     class Selector:
-        async def select(self, message, context, *, budget):
+        async def select(self, message, request_context):
             return SkillSelection(
                 "legacy/office-automation",
                 {"text": "private selector payload"},
@@ -1608,10 +1681,10 @@ def test_routing_evaluation_endpoint_never_executes_selected_skill(tmp_path) -> 
 
     runtime.selector = Selector()
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
         response = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/routing-evaluation",
+            f"/api/v1/conversations/{conversation['session_id']}/routing-evaluation",
             json={"message": "请整理这段文字，但不要读写文件"},
         )
 
@@ -1624,7 +1697,7 @@ def test_routing_evaluation_endpoint_never_executes_selected_skill(tmp_path) -> 
         "reason_code": "matched_skill",
         "token_usage": None,
     } == {key: payload[key] for key in ("route", "skill_id", "reason_code", "token_usage")}
-    assert runtime.messages_by_id.get(conversation["conversation_id"], []) == []
+    assert runtime.messages_by_id.get(conversation["session_id"], []) == []
 
 
 def test_routing_evaluation_accepts_ephemeral_context_without_persisting_it(tmp_path) -> None:
@@ -1635,9 +1708,9 @@ def test_routing_evaluation_accepts_ephemeral_context_without_persisting_it(tmp_
         def __init__(self) -> None:
             self.context = None
 
-        async def select(self, message, context, *, budget):
-            del message, budget
-            self.context = context
+        async def select(self, message, request_context):
+            del message
+            self.request_context = request_context
             return SkillSelection("builtin/clarify", {}, "evaluation_no_match")
 
     selector = ContextCapturingSelector()
@@ -1645,10 +1718,10 @@ def test_routing_evaluation_accepts_ephemeral_context_without_persisting_it(tmp_
     summary = "发布流程只允许维护人员确认上线窗口。"
     memory = "发布前运行回归测试并确认迁移脚本。"
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
         response = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/routing-evaluation",
+            f"/api/v1/conversations/{conversation['session_id']}/routing-evaluation",
             json={
                 "message": "把这段内容整理一下。",
                 "evaluation_context": {
@@ -1659,7 +1732,7 @@ def test_routing_evaluation_accepts_ephemeral_context_without_persisting_it(tmp_
             },
         )
         invalid_context = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/routing-evaluation",
+            f"/api/v1/conversations/{conversation['session_id']}/routing-evaluation",
             json={
                 "message": "把这段内容整理一下。",
                 "evaluation_context": {
@@ -1670,11 +1743,10 @@ def test_routing_evaluation_accepts_ephemeral_context_without_persisting_it(tmp_
 
     assert response.status_code == 200
     assert invalid_context.status_code == 422
-    assert selector.context is not None
-    assert selector.context.messages[0].content == "我们讨论了发布流程。"
-    assert selector.context.session_summary == summary
-    assert selector.context.long_term_memory == memory
-    assert runtime.messages_by_id.get(conversation["conversation_id"], []) == []
+    assert selector.request_context.snapshot.messages[0].content == "我们讨论了发布流程。"
+    assert selector.request_context.snapshot.session_summary == summary
+    assert selector.request_context.snapshot.long_term_memory == memory
+    assert runtime.messages_by_id.get(conversation["session_id"], []) == []
     assert MarkdownMemoryStore(settings.memory_dir).read_long_term_memory() is None
 
 
@@ -1700,16 +1772,16 @@ def test_harness_configuration_is_persisted_and_applied_to_live_chat_runtime(tmp
         "routing_max_business_candidates": 32,
     }
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         initial = client.get("/api/v1/harness/configuration")
         updated = client.put("/api/v1/harness/configuration", json=configuration)
         conversation = client.post("/api/v1/conversations", json={}).json()
         oversized = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{conversation['session_id']}/messages",
             json={"message": "x" * 5001},
         )
         reply = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{conversation['session_id']}/messages",
             json={"message": "hello"},
         )
         invalid = client.put(
@@ -1732,7 +1804,9 @@ def test_harness_configuration_is_persisted_and_applied_to_live_chat_runtime(tmp
         assert client.app.state.chat_service.max_request_chars == 5000
 
     restored_runtime = FakeChatRuntime()
-    with TestClient(create_app(settings, runtime_factory=lambda _: restored_runtime)) as client:
+    with TestClient(
+        create_app(settings, chat_agent_runtime_factory=lambda _: restored_runtime)
+    ) as client:
         restored = client.get("/api/v1/harness/configuration")
         assert restored.status_code == 200
         assert restored.json() == configuration
@@ -1748,16 +1822,16 @@ def test_chat_api_builds_scoped_context_and_returns_runtime_reply(tmp_path) -> N
     runtime.token_usage = ModelTokenUsage(input_tokens=8, output_tokens=3, total_tokens=11)
     memory = MarkdownMemoryStore(settings.memory_dir)
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         conversation = client.post(
             "/api/v1/conversations",
             json={"title": "Context test"},
         ).json()
-        memory.write_session_summary(conversation["conversation_id"], "Session facts")
+        memory.write_session_summary(conversation["session_id"], "Session facts")
         memory.write_long_term_memory("Shared preference")
 
         response = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{conversation['session_id']}/messages",
             json={"message": "Hello"},
         )
 
@@ -1769,7 +1843,7 @@ def test_chat_api_builds_scoped_context_and_returns_runtime_reply(tmp_path) -> N
         assert runtime.contexts[0].long_term_memory == "Shared preference"
         assert runtime.contexts[0].budget.limits.total_tokens == settings.request_token_budget
 
-        history = client.get(f"/api/v1/conversations/{conversation['conversation_id']}/messages")
+        history = client.get(f"/api/v1/conversations/{conversation['session_id']}/messages")
         assert [message["role"] for message in history.json()["messages"]] == [
             "user",
             "assistant",
@@ -1780,19 +1854,19 @@ def test_chat_api_builds_scoped_context_and_returns_runtime_reply(tmp_path) -> N
 
 def test_chat_api_executes_selected_skill_and_persists_routed_turn(tmp_path) -> None:
     from hostpilot.orchestration.skill_runtime import (
-        SkillRuntimeAgentAdapter,
+        SkillEngineAgentAdapter,
         SkillSelection,
     )
     from hostpilot.skills.runtime import SkillExecutionResult, SkillExecutionStatus
 
     class Selector:
-        async def select(self, message, context, *, budget):
-            del message, context, budget
+        async def select(self, message, request_context):
+            del message, request_context
             return SkillSelection(
                 "business/summary", {"notes": "Decision: ship"}, "business_skill_match"
             )
 
-    class SkillRuntime:
+    class SkillEngine:
         async def execute(self, request):
             assert request.skill_id == "business/summary"
             assert request.payload == {"notes": "Decision: ship"}
@@ -1803,15 +1877,15 @@ def test_chat_api_executes_selected_skill_and_persists_routed_turn(tmp_path) -> 
 
     settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
     chat_runtime = FakeChatRuntime()
-    runtime = SkillRuntimeAgentAdapter(chat_runtime, SkillRuntime(), Selector())
+    runtime = SkillEngineAgentAdapter(chat_runtime, SkillEngine(), Selector())
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
         response = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{conversation['session_id']}/messages",
             json={"message": "Summarize these notes"},
         )
-        history = client.get(f"/api/v1/conversations/{conversation['conversation_id']}/messages")
+        history = client.get(f"/api/v1/conversations/{conversation['session_id']}/messages")
 
     assert response.status_code == 200
     assert response.json()["route"] == "skill_execute"
@@ -1831,10 +1905,10 @@ def test_chat_api_reports_provider_tokens_that_exceed_the_request_budget(tmp_pat
     runtime = FakeChatRuntime()
     runtime.token_usage = ModelTokenUsage(input_tokens=4, output_tokens=3, total_tokens=7)
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
         response = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{conversation['session_id']}/messages",
             json={"message": "Hello"},
         )
 
@@ -1851,10 +1925,10 @@ def test_chat_api_rejects_messages_over_the_configured_character_limit(tmp_path)
     )
     runtime = FakeChatRuntime()
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
         response = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{conversation['session_id']}/messages",
             json={"message": "four"},
         )
 
@@ -1864,11 +1938,9 @@ def test_chat_api_rejects_messages_over_the_configured_character_limit(tmp_path)
 
 def test_chat_api_returns_gateway_timeout_when_request_budget_expires(tmp_path) -> None:
     class SlowRuntime(FakeChatRuntime):
-        async def respond(
-            self, message: str, context: ContextSnapshot, *, budget=None
-        ) -> AgentResponse:
+        async def respond(self, message: str, request_context) -> ChatAgentResponse:
             await asyncio.sleep(0.05)
-            return await super().respond(message, context)
+            return await super().respond(message, request_context)
 
     settings = Settings(
         data_dir=tmp_path / "data",
@@ -1877,10 +1949,10 @@ def test_chat_api_returns_gateway_timeout_when_request_budget_expires(tmp_path) 
     )
     runtime = SlowRuntime()
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
         response = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{conversation['session_id']}/messages",
             json={"message": "Hello"},
         )
 
@@ -1895,10 +1967,10 @@ def test_chat_api_rejects_an_oversized_agent_response(tmp_path) -> None:
     )
     runtime = FakeChatRuntime()
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
         response = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{conversation['session_id']}/messages",
             json={"message": "Hello"},
         )
 
@@ -1918,14 +1990,18 @@ def test_chat_api_returns_clarification_from_an_injected_router(tmp_path) -> Non
     runtime = FakeChatRuntime()
 
     with TestClient(
-        create_app(settings, runtime_factory=lambda _: runtime, agent_router=ClarifyingRouter())
+        create_app(
+            settings,
+            chat_agent_runtime_factory=lambda _: runtime,
+            agent_router=ClarifyingRouter(),
+        )
     ) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
         response = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{conversation['session_id']}/messages",
             json={"message": "Continue that"},
         )
-        history = client.get(f"/api/v1/conversations/{conversation['conversation_id']}/messages")
+        history = client.get(f"/api/v1/conversations/{conversation['session_id']}/messages")
 
     assert response.status_code == 200
     assert response.json()["route"] == "clarify"
@@ -1950,11 +2026,15 @@ def test_chat_api_fails_closed_for_routes_without_an_execution_path(tmp_path) ->
     runtime = FakeChatRuntime()
 
     with TestClient(
-        create_app(settings, runtime_factory=lambda _: runtime, agent_router=ToolRouter())
+        create_app(
+            settings,
+            chat_agent_runtime_factory=lambda _: runtime,
+            agent_router=ToolRouter(),
+        )
     ) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
         response = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{conversation['session_id']}/messages",
             json={"message": "Use a tool"},
         )
 
@@ -1968,7 +2048,7 @@ def test_chat_api_reports_missing_agent_runtime(tmp_path) -> None:
     with TestClient(create_app(settings)) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
         response = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{conversation['session_id']}/messages",
             json={"message": "Hello"},
         )
 
@@ -2025,7 +2105,7 @@ def test_rejected_memory_proposal_has_no_file_side_effect(tmp_path) -> None:
             "/api/v1/memory-proposals",
             json={
                 "scope": "session_summary",
-                "conversation_id": conversation["conversation_id"],
+                "session_id": conversation["session_id"],
                 "content": "Must not be saved",
             },
         )
@@ -2036,7 +2116,7 @@ def test_rejected_memory_proposal_has_no_file_side_effect(tmp_path) -> None:
         assert rejection.status_code == 204
         assert (
             MarkdownMemoryStore(settings.memory_dir).read_session_summary(
-                conversation["conversation_id"]
+                conversation["session_id"]
             )
             is None
         )
@@ -2051,14 +2131,13 @@ def test_memory_proposals_for_deleted_conversations_are_discarded(tmp_path) -> N
             "/api/v1/memory-proposals",
             json={
                 "scope": "session_summary",
-                "conversation_id": conversation["conversation_id"],
+                "session_id": conversation["session_id"],
                 "content": "Session proposal",
             },
         )
 
         assert (
-            client.delete(f"/api/v1/conversations/{conversation['conversation_id']}").status_code
-            == 204
+            client.delete(f"/api/v1/conversations/{conversation['session_id']}").status_code == 204
         )
         assert client.get("/api/v1/memory-proposals").json() == []
 
@@ -2133,11 +2212,9 @@ def test_status_websocket_rejects_malformed_and_oversized_messages(tmp_path) -> 
 
 
 class ConfirmingChatRuntime(FakeChatRuntime):
-    async def respond(
-        self, message, context, *, budget=None, confirmation_provider=None
-    ) -> AgentResponse:
-        assert confirmation_provider is not None
-        decision = await confirmation_provider.confirm(
+    async def respond(self, message, request_context) -> ChatAgentResponse:
+        assert request_context.confirmation_provider is not None
+        decision = await request_context.confirmation_provider.confirm(
             ConfirmationRequest(
                 request_id="confirmation-1",
                 tool_name="write_text_file",
@@ -2145,7 +2222,7 @@ class ConfirmingChatRuntime(FakeChatRuntime):
             )
         )
         assert decision is ConfirmationDecision.APPROVED
-        return await super().respond(message, context, budget=budget)
+        return await super().respond(message, request_context)
 
 
 # 测试在确认超时后是否不会写入文件
@@ -2202,13 +2279,13 @@ def test_chat_websocket_waits_for_explicit_tool_confirmation(tmp_path) -> None:
     settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
     runtime = ConfirmingChatRuntime()
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
         with client.websocket_connect("/api/v1/ws/chat") as websocket:
             websocket.send_json(
                 {
                     "type": "chat.send",
-                    "conversation_id": conversation["conversation_id"],
+                    "session_id": conversation["session_id"],
                     "message": "Write an approval demo",
                 }
             )
@@ -2232,7 +2309,27 @@ def test_chat_websocket_waits_for_explicit_tool_confirmation(tmp_path) -> None:
 
     assert response["type"] == "chat.response"
     assert response["data"]["assistant_message"] == "Local test reply"
+    assert "session_id" in response["data"]
+    assert "conversation_id" not in response["data"]
     assert runtime.contexts
+
+
+def test_chat_websocket_rejects_obsolete_conversation_id_field(tmp_path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+
+    with TestClient(create_app(settings)) as client:
+        conversation = client.post("/api/v1/conversations", json={}).json()
+        with client.websocket_connect("/api/v1/ws/chat") as websocket:
+            websocket.send_json(
+                {
+                    "type": "chat.send",
+                    "conversation_id": conversation["session_id"],
+                    "message": "hello",
+                }
+            )
+            response = websocket.receive_json()
+
+    assert response == {"type": "chat.error", "data": {"code": "invalid_message"}}
 
 
 def test_chat_websocket_reports_unknown_remote_tool_outcome(tmp_path) -> None:
@@ -2240,12 +2337,9 @@ def test_chat_websocket_reports_unknown_remote_tool_outcome(tmp_path) -> None:
         async def respond(
             self,
             message,
-            context,
-            *,
-            budget=None,
-            confirmation_provider=None,
-        ) -> AgentResponse:
-            del message, context, budget, confirmation_provider
+            request_context,
+        ) -> ChatAgentResponse:
+            del message, request_context
             raise RemoteToolOutcomeUnknownError(
                 "Remote MCP call timed out; the remote operation outcome is unknown."
             )
@@ -2253,10 +2347,10 @@ def test_chat_websocket_reports_unknown_remote_tool_outcome(tmp_path) -> None:
     settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
     runtime = RemoteTimeoutRuntime()
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         http_conversation = client.post("/api/v1/conversations", json={}).json()
         http_response = client.post(
-            f"/api/v1/conversations/{http_conversation['conversation_id']}/messages",
+            f"/api/v1/conversations/{http_conversation['session_id']}/messages",
             json={"message": "Run a remote action"},
         )
         assert http_response.status_code == 504
@@ -2267,7 +2361,7 @@ def test_chat_websocket_reports_unknown_remote_tool_outcome(tmp_path) -> None:
             websocket.send_json(
                 {
                     "type": "chat.send",
-                    "conversation_id": websocket_conversation["conversation_id"],
+                    "session_id": websocket_conversation["session_id"],
                     "message": "Run a remote action",
                 }
             )
@@ -2287,26 +2381,25 @@ class MCPWriteRuntime(FakeChatRuntime):
         super().__init__()
         self.provider = provider
 
-    async def respond(
-        self, message, context, *, budget=None, confirmation_provider=None
-    ) -> AgentResponse:
-        assert budget is not None
+    async def respond(self, message, request_context) -> ChatAgentResponse:
+        assert request_context.budget is not None
         if not self.provider._started:
             await self.provider.start()
         result = await self.provider.call_tool(
             "write_text_file",
             {"path": "approval-demo.txt", "content": "private content"},
-            budget=budget,
-            confirmation_provider=confirmation_provider,
+            budget=request_context.budget,
+            confirmation_provider=request_context.confirmation_provider,
         )
+        context = request_context.snapshot
         self.contexts.append(context)
-        self.messages_by_id.setdefault(context.conversation_id, []).extend(
+        self.messages_by_id.setdefault(context.session_id, []).extend(
             (
                 ConversationMessage(role=MessageRole.USER, content=message),
                 ConversationMessage(role=MessageRole.ASSISTANT, content=result),
             )
         )
-        return AgentResponse(result)
+        return ChatAgentResponse(result)
 
     async def aclose(self) -> None:
         await self.provider.aclose()
@@ -2320,11 +2413,11 @@ def test_chat_sandbox_mode_is_isolated_between_conversations(tmp_path) -> None:
     provider = build_retrieval_mcp_provider(settings, workspace_root=workspace)
     runtime = MCPWriteRuntime(provider)
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         read_only = client.post("/api/v1/conversations", json={}).json()
         writable = client.post("/api/v1/conversations", json={}).json()
         upgraded = client.post(
-            f"/api/v1/conversations/{writable['conversation_id']}/sandbox/upgrade",
+            f"/api/v1/conversations/{writable['session_id']}/sandbox/upgrade",
             json={"target_mode": SandboxMode.WORKSPACE_WRITE.value},
         )
         assert upgraded.status_code == 200
@@ -2333,7 +2426,7 @@ def test_chat_sandbox_mode_is_isolated_between_conversations(tmp_path) -> None:
             websocket.send_json(
                 {
                     "type": "chat.send",
-                    "conversation_id": read_only["conversation_id"],
+                    "session_id": read_only["session_id"],
                     "message": "Write the approval demo",
                 }
             )
@@ -2346,7 +2439,7 @@ def test_chat_sandbox_mode_is_isolated_between_conversations(tmp_path) -> None:
             websocket.send_json(
                 {
                     "type": "chat.send",
-                    "conversation_id": writable["conversation_id"],
+                    "session_id": writable["session_id"],
                     "message": "Write the approval demo",
                 }
             )
@@ -2363,9 +2456,7 @@ def test_chat_sandbox_mode_is_isolated_between_conversations(tmp_path) -> None:
 
         assert (workspace / "approval-demo.txt").read_text(encoding="utf-8") == "private content"
         assert (
-            client.get(f"/api/v1/conversations/{read_only['conversation_id']}").json()[
-                "sandbox_mode"
-            ]
+            client.get(f"/api/v1/conversations/{read_only['session_id']}").json()["sandbox_mode"]
             == SandboxMode.READ_ONLY.value
         )
 
@@ -2376,10 +2467,10 @@ def test_chat_websocket_mcp_write_requires_browser_approval(tmp_path) -> None:
     provider = build_retrieval_mcp_provider(settings, workspace_root=tmp_path)
     runtime = MCPWriteRuntime(provider)
 
-    with TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client:
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
         conversation = client.post("/api/v1/conversations", json={}).json()
         upgraded = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/sandbox/upgrade",
+            f"/api/v1/conversations/{conversation['session_id']}/sandbox/upgrade",
             json={"target_mode": SandboxMode.WORKSPACE_WRITE.value},
         )
         assert upgraded.status_code == 200
@@ -2387,7 +2478,7 @@ def test_chat_websocket_mcp_write_requires_browser_approval(tmp_path) -> None:
             websocket.send_json(
                 {
                     "type": "chat.send",
-                    "conversation_id": conversation["conversation_id"],
+                    "session_id": conversation["session_id"],
                     "message": "Write the approval demo",
                 }
             )
@@ -2421,11 +2512,11 @@ def test_chat_websocket_mcp_write_rejection_and_cancellation_do_not_write(tmp_pa
         runtime = MCPWriteRuntime(provider)
 
         with TestClient(
-            create_app(settings, runtime_factory=lambda _, runtime=runtime: runtime)
+            create_app(settings, chat_agent_runtime_factory=lambda _, runtime=runtime: runtime)
         ) as client:
             conversation = client.post("/api/v1/conversations", json={}).json()
             upgraded = client.post(
-                f"/api/v1/conversations/{conversation['conversation_id']}/sandbox/upgrade",
+                f"/api/v1/conversations/{conversation['session_id']}/sandbox/upgrade",
                 json={"target_mode": SandboxMode.WORKSPACE_WRITE.value},
             )
             assert upgraded.status_code == 200
@@ -2433,7 +2524,7 @@ def test_chat_websocket_mcp_write_rejection_and_cancellation_do_not_write(tmp_pa
                 websocket.send_json(
                     {
                         "type": "chat.send",
-                        "conversation_id": conversation["conversation_id"],
+                        "session_id": conversation["session_id"],
                         "message": "Write the approval demo",
                     }
                 )
@@ -2464,11 +2555,11 @@ def test_chat_websocket_mcp_write_confirmation_timeout_does_not_write(tmp_path) 
 
     with (
         patch("hostpilot.api.app.CHAT_CONFIRMATION_TIMEOUT_SECONDS", 0.01),
-        TestClient(create_app(settings, runtime_factory=lambda _: runtime)) as client,
+        TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client,
     ):
         conversation = client.post("/api/v1/conversations", json={}).json()
         upgraded = client.post(
-            f"/api/v1/conversations/{conversation['conversation_id']}/sandbox/upgrade",
+            f"/api/v1/conversations/{conversation['session_id']}/sandbox/upgrade",
             json={"target_mode": SandboxMode.WORKSPACE_WRITE.value},
         )
         assert upgraded.status_code == 200
@@ -2476,7 +2567,7 @@ def test_chat_websocket_mcp_write_confirmation_timeout_does_not_write(tmp_path) 
             websocket.send_json(
                 {
                     "type": "chat.send",
-                    "conversation_id": conversation["conversation_id"],
+                    "session_id": conversation["session_id"],
                     "message": "Write the approval demo",
                 }
             )

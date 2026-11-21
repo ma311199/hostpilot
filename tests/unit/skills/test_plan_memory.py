@@ -2,6 +2,7 @@ import asyncio
 
 from hostpilot.budget import RequestBudget
 from hostpilot.contracts import BudgetContext, BudgetLimits, ContextSnapshot
+from hostpilot.runtime import RequestContext
 from hostpilot.skills.model_plan import GovernedPlanTaskExecutor
 from hostpilot.skills.orchestration import (
     BlackboardSnapshot,
@@ -25,7 +26,7 @@ class FakeMemoryController:
         return context.model_copy(update={"long_term_memory": "memory for this subtask"})
 
 
-class FakeSkillRuntime:
+class FakeSkillEngine:
     def __init__(self) -> None:
         self.request: SkillExecutionRequest | None = None
 
@@ -38,22 +39,24 @@ def test_plan_business_skill_receives_controller_recalled_subtask_context() -> N
     async def scenario() -> None:
         context = ContextSnapshot(
             request_id="plan-request",
-            conversation_id="conversation-1",
+            session_id="conversation-1",
             long_term_memory="old entry memory",
         )
         request = SkillExecutionRequest(
             skill_id="builtin/orchestrator_plan",
             payload={"task_description": "Complete the larger request"},
-            context=context,
-            budget=RequestBudget.start(
-                BudgetContext(
-                    limits=BudgetLimits(
-                        total_tokens=100,
-                        tool_calls=4,
-                        retrieval_calls=2,
-                        timeout_seconds=10,
+            request_context=RequestContext(
+                snapshot=context,
+                budget=RequestBudget.start(
+                    BudgetContext(
+                        limits=BudgetLimits(
+                            total_tokens=100,
+                            tool_calls=4,
+                            retrieval_calls=2,
+                            timeout_seconds=10,
+                        )
                     )
-                )
+                ),
             ),
         )
         task = PlanTask(
@@ -71,7 +74,7 @@ def test_plan_business_skill_receives_controller_recalled_subtask_context() -> N
             idempotency_key="task-key",
         )
         memory = FakeMemoryController()
-        skill_runtime = FakeSkillRuntime()
+        skill_runtime = FakeSkillEngine()
         executor = GovernedPlanTaskExecutor(
             provider=None,
             skills=skill_runtime,
@@ -85,7 +88,10 @@ def test_plan_business_skill_receives_controller_recalled_subtask_context() -> N
         assert result.succeeded is True
         assert memory.queries == [task.description]
         assert skill_runtime.request is not None
-        assert skill_runtime.request.context.long_term_memory == "memory for this subtask"
-        assert request.context.long_term_memory == "old entry memory"
+        assert (
+            skill_runtime.request.request_context.snapshot.long_term_memory
+            == "memory for this subtask"
+        )
+        assert request.request_context.snapshot.long_term_memory == "old entry memory"
 
     asyncio.run(scenario())

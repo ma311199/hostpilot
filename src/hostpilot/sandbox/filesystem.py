@@ -13,7 +13,7 @@ from hostpilot.tools.filesystem import WorkspaceFileError, WorkspaceFiles
 
 MountMode = Literal["--ro-bind", "--bind"]
 
-_FILE_OPERATION_SOURCE = r'''
+_FILE_OPERATION_SOURCE = r"""
 import base64
 import fnmatch
 import json
@@ -134,7 +134,7 @@ else:
     raise ValueError("Unsupported sandbox file operation.")
 
 print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-'''
+"""
 
 
 class LinuxWorkspaceSandbox:
@@ -183,9 +183,7 @@ class LinuxWorkspaceSandbox:
         result = await self._runner.run(source, extra_mounts=mounts)
         if result.status != "completed":
             detail = result.stderr.strip()[:512]
-            raise WorkspaceFileError(
-                f"Sandboxed file operation failed ({result.status}): {detail}"
-            )
+            raise WorkspaceFileError(f"Sandboxed file operation failed ({result.status}): {detail}")
         try:
             decoded = json.loads(result.stdout)
         except json.JSONDecodeError as error:

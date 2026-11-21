@@ -32,10 +32,10 @@ from hostpilot.contracts import (
 )
 from hostpilot.evaluation.fixtures import write_fixture_skills
 from hostpilot.evaluation.model_config import model_configuration_from_environment
-from hostpilot.models import create_model_runtime
+from hostpilot.models import create_model_runtime_components
 from hostpilot.observability import AuditEvent
-from hostpilot.orchestration.runtime import AgentResponse
-from hostpilot.orchestration.skill_runtime import SkillRuntimeAgentAdapter, SkillSelection
+from hostpilot.orchestration.runtime import ChatAgentResponse
+from hostpilot.orchestration.skill_runtime import SkillEngineAgentAdapter, SkillSelection
 from hostpilot.policy import PolicyEngine
 from hostpilot.policy.confirmation import ConfirmationDecision, ConfirmationRequest
 from hostpilot.routing.skill_selector import ModelProviderSkillSelector
@@ -48,9 +48,9 @@ from hostpilot.skills.model_plan import (
 from hostpilot.skills.model_provider_adapter import ProviderSingleTurnLLM
 from hostpilot.skills.runtime import (
     BuiltinExecutorRegistry,
+    SkillEngine,
     SkillExecutionRequest,
     SkillExecutionResult,
-    SkillRuntime,
     StepActionCall,
     StepActionRegistration,
     StepActionRegistry,
@@ -82,19 +82,19 @@ class StubChatRuntime:
     def __init__(self) -> None:
         self.turns: list[tuple[str, str, str]] = []
 
-    async def read_messages(self, conversation_id: str) -> tuple[Any, ...]:
-        del conversation_id
+    async def read_messages(self, session_id: str) -> tuple[Any, ...]:
+        del session_id
         return ()
 
-    async def respond(self, *args: Any, **kwargs: Any) -> AgentResponse:
+    async def respond(self, *args: Any, **kwargs: Any) -> ChatAgentResponse:
         del args, kwargs
         raise RuntimeError("Selector-only Runtime fallback was not expected in this harness.")
 
-    async def record_turn(self, conversation_id: str, user_message: str, reply: str) -> None:
-        self.turns.append((conversation_id, user_message, reply))
+    async def record_turn(self, session_id: str, user_message: str, reply: str) -> None:
+        self.turns.append((session_id, user_message, reply))
 
 
-class RecordingSkillRuntime(SkillRuntime):
+class RecordingSkillEngine(SkillEngine):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.last_result: SkillExecutionResult | None = None
@@ -765,7 +765,7 @@ async def _run_case(
         register_llm_completion_action(actions, model)
         builtins = BuiltinExecutorRegistry()
         assessor = LLMSkillAssessor(model)
-        skill_runtime = RecordingSkillRuntime(registry, actions, builtins, assessor, assessor)
+        skill_runtime = RecordingSkillEngine(registry, actions, builtins, assessor, assessor)
         plan_executor = build_model_plan_executor(
             model,
             skills=registry,
@@ -789,7 +789,7 @@ async def _run_case(
         )
         selector = RecordingSelector(ModelProviderSkillSelector(registry, model))
         chat_runtime = StubChatRuntime()
-        adapter = SkillRuntimeAgentAdapter(chat_runtime, skill_runtime, selector)
+        adapter = SkillEngineAgentAdapter(chat_runtime, skill_runtime, selector)
         confirmation = StubConfirmationProvider()
         budget = RequestBudget.start(
             BudgetContext(
@@ -803,7 +803,7 @@ async def _run_case(
         )
         context = ContextSnapshot(
             request_id=str(uuid.uuid4()),
-            conversation_id=str(uuid.uuid4()),
+            session_id=str(uuid.uuid4()),
         )
         started_at = time.monotonic()
         try:
@@ -1061,7 +1061,7 @@ async def _run(args: argparse.Namespace) -> int:
         model_base_url=base_url,
         model_streaming=streaming,
     )
-    model = create_model_runtime(settings).provider
+    model = create_model_runtime_components(settings).provider
 
     results = []
     for case in cases:

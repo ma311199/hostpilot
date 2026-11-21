@@ -246,7 +246,7 @@ describe('Skill library page', () => {
       execution_format: 'yaml',
       detected_formats: ['yaml', 'skill_md'],
       execution_mode: 'yaml',
-      available_execution_modes: ['yaml', 'deepagents', 'both'],
+      available_execution_modes: ['yaml', 'markdown', 'both'],
       enabled: true,
       source: 'user',
     }
@@ -259,7 +259,7 @@ describe('Skill library page', () => {
         }),
       )
       .mockResolvedValueOnce(
-        new Response(JSON.stringify({ ...dualSkill, execution_mode: 'both' }), {
+        new Response(JSON.stringify({ ...dualSkill, execution_mode: 'markdown' }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         }),
@@ -271,14 +271,15 @@ describe('Skill library page', () => {
     await flushPromises()
     expect(wrapper.findAll('.skill-card')).toHaveLength(1)
     expect(wrapper.text()).toContain('YAML + SKILL.md')
-    await wrapper.get('select[aria-label="Combined 执行方式"]').setValue('both')
+    expect(wrapper.text()).toContain('Markdown (SKILL.md)')
+    await wrapper.get('select[aria-label="Combined 执行方式"]').setValue('markdown')
     await flushPromises()
 
     expect(window.confirm).toHaveBeenCalledOnce()
     expect(fetchMock.mock.calls[1][1]?.body).toBe(
-      JSON.stringify({ skill_id: 'business/combined', execution_mode: 'both' }),
+      JSON.stringify({ skill_id: 'business/combined', execution_mode: 'markdown' }),
     )
-    expect(wrapper.text()).toContain('执行方式已更新为两种入口')
+    expect(wrapper.text()).toContain('执行方式已更新为Markdown (SKILL.md)')
     wrapper.unmount()
   })
 })

@@ -86,9 +86,7 @@ def test_host_rejects_missing_dependencies_and_cycles(plugins, message: str) -> 
     async def scenario() -> RuntimeHost:
         host = RuntimeHost(RuntimeContext())
         for plugin_id, dependencies in plugins:
-            host.register_plugin(
-                RecordingPlugin(plugin_id, [], dependencies=dependencies)
-            )
+            host.register_plugin(RecordingPlugin(plugin_id, [], dependencies=dependencies))
         with pytest.raises(RuntimePluginError, match=message):
             await host.start()
         return host

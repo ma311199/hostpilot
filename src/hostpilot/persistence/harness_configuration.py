@@ -10,7 +10,7 @@ import aiosqlite
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class HarnessRuntimeConfiguration(BaseModel):
+class HarnessConfiguration(BaseModel):
     """Runtime limits that can be changed without rebuilding model or MCP clients."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -57,7 +57,7 @@ class SQLiteHarnessConfigurationStore:
             await connection.commit()
         os.chmod(self.database_path, 0o600)
 
-    async def get(self) -> HarnessRuntimeConfiguration | None:
+    async def get(self) -> HarnessConfiguration | None:
         """Load the persisted runtime controls, if a user has saved them."""
         async with aiosqlite.connect(self.database_path) as connection:
             cursor = await connection.execute(
@@ -67,9 +67,9 @@ class SQLiteHarnessConfigurationStore:
         if row is None:
             return None
         payload = json.loads(str(row[0]))
-        return HarnessRuntimeConfiguration.model_validate(payload)
+        return HarnessConfiguration.model_validate(payload)
 
-    async def save(self, configuration: HarnessRuntimeConfiguration) -> None:
+    async def save(self, configuration: HarnessConfiguration) -> None:
         """Replace the complete validated configuration atomically."""
         async with aiosqlite.connect(self.database_path) as connection:
             await connection.execute(
@@ -82,4 +82,4 @@ class SQLiteHarnessConfigurationStore:
             await connection.commit()
 
 
-__all__ = ["HarnessRuntimeConfiguration", "SQLiteHarnessConfigurationStore"]
+__all__ = ["HarnessConfiguration", "SQLiteHarnessConfigurationStore"]

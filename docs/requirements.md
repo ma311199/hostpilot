@@ -13,11 +13,11 @@ Agentic RAG 是独立项目。HostPilot 通过检索工具调用其服务，不�
 | 编号 | 需求 | 阶段 |
 | --- | --- | --- |
 | F-01 | 接收本地 Web 客户端请求，完成输入校验、归一化、限流及 PII / 注入初筛；当前单用户本地部署免登录 | 基础层 |
-| F-02 | Context Builder 按 conversation_id 从 SQLite 恢复会话状态，读取相关 Markdown 记忆并初始化预算，输出 ContextSnapshot | 基础层 |
+| F-02 | Context Builder 按 session_id 从 SQLite 恢复会话状态，读取相关 Markdown 记忆并初始化预算，输出 ContextSnapshot | 基础层 |
 | F-03 | Router 从已注册的业务 Skill 和内置 Skill 中选择一个 skill_id；Router 负责选择，不负责执行 Skill 或工具 | 新架构基础层 |
 | F-04 | Tool Registry 管理检索、动作和代码工具及其信任级别、执行环境和超时配置 | 基础层 |
 | F-05 | Policy Engine 在工具执行前校验用户授权、参数、数据范围和 capability | 基础层 |
-| F-06 | Skill Runtime 通过统一 Tool Facade 调用 MCP 工具；内置 FastMCP Server 沿用进程内连接，外部 MCP Server 支持本地 STDIO 子进程和独立 Streamable HTTP Client；所有调用均经 HostPilot 准入校验、Tool Registry、Policy Engine、预算和结果验证 | 新架构基础层 |
+| F-06 | SkillEngine 通过统一 Tool Facade 调用 MCP 工具；内置 FastMCP Server 沿用进程内连接，外部 MCP Server 支持本地 STDIO 子进程和独立 Streamable HTTP Client；所有调用均经 HostPilot 准入校验、Tool Registry、Policy Engine、预算和结果验证 | 新架构基础层 |
 | F-07 | 知识库启用前，FastMCP 工具作为普通工具受治理并返回明确的未开启提示；服务启用后再调用独立 RAG 服务并校验 EvidenceSet | Phase 1 起 |
 | F-08 | L4 对输出做校验、策略复核、记忆写入提案和响应格式化 | 基础层 |
 | F-09 | 横向治理记录 Trace、Cost、Audit、Eval 和 Policy 决策；模型用量记录提供方实际 Token 数 | 基础层，逐步完善 |
@@ -25,9 +25,9 @@ Agentic RAG 是独立项目。HostPilot 通过检索工具调用其服务，不�
 | F-11 | HostPilot 将检索请求和预算传给独立 RAG 服务；Agentic Retrieval 内部循环由该服务负责 | 外部服务能力，按接口演进 |
 | F-12 | LLM 生成脚本及不可信工具按策略路由到隔离沙箱 | Phase 3 |
 | F-13 | Sandbox Router 可按平台和信任等级选择 WASM、OS 原生或远程后端 | Phase 3，后端待决策 |
-| F-14 | Skill Registry 支持 DeepAgents `SKILL.md` 与 Skill Runtime `skill.yaml` 两种执行形式；按包文件默认选择，存在 `skill.yaml` 时走 YAML（契约无效则禁用且不回退），只有 `SKILL.md` 时使用 DeepAgents；Skill 管理配置允许选择 YAML、DeepAgents 或两者 | 新架构基础层，Web 配置后续交付 |
+| F-14 | Skill Registry 支持 Markdown `SKILL.md` 与 SkillEngine `skill.yaml` 两种执行格式；按包文件默认选择，存在 `skill.yaml` 时走 YAML（契约无效则禁用且不回退），只有 `SKILL.md` 时使用 Markdown 执行器；Skill 管理配置允许选择 YAML、Markdown 或两者 | 新架构基础层，Web 配置后续交付 |
 | F-15 | 高影响工具操作须在策略授权后取得用户明确确认，拒绝或取消时不执行 | 基础层 |
-| F-16 | 支持同一终端用户创建多个相互隔离的会话，每个会话按独立 conversation_id 读取上下文 | 基础层 |
+| F-16 | 支持同一终端用户创建多个相互隔离的会话，每个会话按独立 session_id 读取上下文 | 基础层 |
 | F-17 | 提供本地项目进度看板，展示后端阶段、已完成模块、下一步事项及 API 健康状态 | 前端首版 |
 | F-18 | 提供本地聊天界面，管理会话列表、加载历史，并通过 WebSocket 发送消息及接收回复 | 前端首版 |
 | F-19 | 在本地页面配置 OpenAI 兼容模型并立即启用运行时；模型凭证不返回前端或持久化到浏览器 | 前端首版 |
@@ -60,7 +60,7 @@ Agentic RAG 是独立项目。HostPilot 通过检索工具调用其服务，不�
 ## 非功能需求
 
 - **安全**：默认拒绝未声明 capability；工具调用遵循最小权限；WASM 默认无网络、无文件系统访问；高影响操作受 Policy Engine 控制。
-- **个人数据保护**：会话读取遵循最小必要原则；不同 conversation_id 的上下文必须隔离；个人数据和服务凭证不得进入不必要的日志或测试夹具。
+- **个人数据保护**：会话读取遵循最小必要原则；不同 session_id 的上下文必须隔离；个人数据和服务凭证不得进入不必要的日志或测试夹具。
 - **本地持久化**：会话目录与检查点存入本地 SQLite；会话摘要和跨会话长期记忆以 Markdown 管理。记忆文本是不可信数据，不构成工具授权。
 - **本地访问边界**：当前版本前后端部署在同一终端，Web 操作免登录；默认仅供该终端本机访问。远程访问不属于当前需求。
 - **工作区权限**：read-only 禁止本会话文件写入；workspace-write 仅允许在用户明确选择的工作区内读写；danger-full-access 允许内置文件工具访问当前操作系统用户有权限访问的任意路径。任何模式均不提升进程权限或修改目录权限；会话级授权与操作系统权限取交集。高影响工具操作仍需逐次审批。
@@ -84,7 +84,7 @@ Agentic RAG 是独立项目。HostPilot 通过检索工具调用其服务，不�
 2. ToolDescriptor：至少描述 tool_type、trust_level、execution_env 和 timeout_profile。
 3. SandboxPolicy：显式描述 capability、资源限制及策略决策，未批准能力默认拒绝。
 4. SkillPackage：本地来源、经校验的元数据、指令内容和受限资源引用；具体字段在实现前确定。
-5. YAML Skill Runtime 读取 `skill.yaml` 并使用其结构化路由签名；DeepAgents Runtime 执行 `SKILL.md`。双格式包默认走 YAML，可通过 Skill 管理配置显式选用一种或两种入口；不得自动转换格式或因一次执行失败而切换入口。
+5. YAML SkillEngine 读取 `skill.yaml` 并使用其结构化路由签名；DeepAgents Runtime 执行 `SKILL.md`。双格式包默认走 YAML，可通过 Skill 管理配置显式选用一种或两种入口；不得自动转换格式或因一次执行失败而切换入口。
 6. Skill 只引用 MCP 工具稳定标识，不在 Skill 契约中指定连接方式；内置工具沿用现有工具名，外部 Server 工具按 Server 名称区分冲突，不采用 `local::` / `team::` 命名。
 7. Provider、Tool Facade、Memory Controller 和 Runtime 的边界契约见 [ADR-0010](decisions/0010-harness-contracts-and-configuration-boundary.md)；新 Skill/Executor 不得直接依赖供应商 SDK、MCP Transport 或持久记忆实现。
 8. 业务 Skill 快速路径、执行前/后评估、`side_effect_level` 和带快照的 Plan 兜底按 [ADR-0012](decisions/0012-business-skill-fast-path-and-plan-fallback.md) 执行；评估不等于工具授权，所有副作用仍受 Policy Engine 与 Tool Executor 治理。

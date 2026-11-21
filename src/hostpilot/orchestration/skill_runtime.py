@@ -1,4 +1,4 @@
-"""Adapt Skill selection and execution to the chat AgentRuntime contract."""
+"""Adapt Skill selection and execution to the chat ChatAgentRuntime contract."""
 
 from __future__ import annotations
 
@@ -10,8 +10,7 @@ from time import perf_counter
 from typing import Any, Literal, Protocol
 from uuid import UUID
 
-from hostpilot.budget import RequestBudget
-from hostpilot.contracts import ContextSnapshot, ConversationMessage, ModelTokenUsage, Route
+from hostpilot.contracts import ConversationMessage, ModelTokenUsage, Route
 from hostpilot.observability import (
     TraceContext,
     TraceEvent,
@@ -19,14 +18,16 @@ from hostpilot.observability import (
     child_trace_context,
     trace_context_scope,
 )
-from hostpilot.orchestration.runtime import AgentResponse, AgentRuntime
+from hostpilot.orchestration.runtime import ChatAgentResponse, ChatAgentRuntime
+from hostpilot.runtime import RequestContext
 from hostpilot.skills.runtime import (
+    SkillEngine,
     SkillExecutionRequest,
     SkillExecutionResult,
     SkillExecutionStatus,
-    SkillRuntime,
+    SkillExecutor,
+    SkillExecutorUnavailableError,
 )
-from hostpilot.tools.executor import AsyncConfirmationProvider
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,7 @@ class SkillSelection:
     payload: Mapping[str, Any]
     reason_code: str
     token_usage: ModelTokenUsage | None = None
-    execution_mode: Literal["yaml", "deepagents"] | None = None
+    execution_mode: Literal["yaml", "markdown"] | None = None
     candidate_skill_ids: tuple[str, ...] = ()
 
 
@@ -45,29 +46,66 @@ class SkillSelectionPort(Protocol):
     """Select one builtin or business Skill without granting tool permissions."""
 
     async def select(
-        self, message: str, context: ContextSnapshot, *, budget: RequestBudget
+        self, message: str, request_context: RequestContext
     ) -> SkillSelection | None: ...
 
 
-class SkillRuntimeAgentAdapter:
-    """Route selected requests through SkillRuntime and persist them in chat history."""
+class DeepAgentsSkillExecutionAdapter:
+    """Adapt the legacy Markdown Skill hook to the normalized SkillExecutor contract."""
+
+    def __init__(self, chat_agent_runtime: ChatAgentRuntime) -> None:
+        self.chat_agent_runtime = chat_agent_runtime
+
+    async def execute(self, request: SkillExecutionRequest) -> SkillExecutionResult:
+        respond_with_skill = getattr(self.chat_agent_runtime, "respond_with_skill", None)
+        if not callable(respond_with_skill):
+            raise SkillExecutorUnavailableError(
+                "The configured Chat Agent Runtime has no Markdown Skill executor."
+            )
+        response = await respond_with_skill(
+            request.original_goal or "",
+            request.request_context,
+            skill_id=request.skill_id,
+        )
+        if not isinstance(response, ChatAgentResponse):
+            raise TypeError("Markdown Skill executor must return a ChatAgentResponse.")
+        if response.token_usage is not None and not response.budget_usage_accounted:
+            request.request_context.budget.consume_tokens(response.token_usage.total_tokens)
+        return SkillExecutionResult(
+            status=SkillExecutionStatus.COMPLETED,
+            output=response.content,
+            token_usage=response.token_usage,
+        )
+
+
+class SkillEngineAgentAdapter:
+    """Route selected requests through format-specific SkillExecutor adapters."""
 
     def __init__(
         self,
-        chat_runtime: AgentRuntime,
-        skill_runtime: SkillRuntime,
+        chat_agent_runtime: ChatAgentRuntime,
+        skill_runtime: SkillEngine,
         selector: SkillSelectionPort,
         *,
+        skill_executors: Mapping[str, SkillExecutor] | None = None,
         trace_sink: TraceSink | None = None,
     ) -> None:
-        self.chat_runtime = chat_runtime
-        self.skill_runtime = skill_runtime
+        self.chat_agent_runtime = chat_agent_runtime
+        self.skill_engine = skill_runtime
         self.selector = selector
+        self.skill_executors = (
+            {
+                "yaml": skill_runtime,
+                "markdown": DeepAgentsSkillExecutionAdapter(chat_agent_runtime),
+            }
+            if skill_executors is None
+            else dict(skill_executors)
+        )
         self.trace_sink = trace_sink
 
     def set_execution_mode(self, skill_id: str, execution_mode: str) -> None:
         """Update the shared YAML and DeepAgents package filters in place."""
-        preferences = self.skill_runtime.registry.execution_modes
+        preferences = self.skill_engine.registry.execution_modes
         preferences[skill_id] = execution_mode
 
     def configure_harness(self, configuration: Mapping[str, Any]) -> None:
@@ -83,7 +121,7 @@ class SkillRuntimeAgentAdapter:
                 max_plan_candidates=configuration["routing_max_plan_candidates"],
                 max_business_candidates=configuration["routing_max_business_candidates"],
             )
-        fallback = getattr(self.skill_runtime, "plan_fallback", None)
+        fallback = getattr(self.skill_engine, "plan_fallback", None)
         plan_executor = getattr(fallback, "plan_executor", None)
         configure_plan_executor = getattr(plan_executor, "configure_harness", None)
         if callable(configure_plan_executor):
@@ -96,37 +134,23 @@ class SkillRuntimeAgentAdapter:
                 candidate_limit=configuration["plan_tool_candidate_limit"],
             )
 
-    async def read_messages(self, conversation_id: str) -> tuple[ConversationMessage, ...]:
-        return await self.chat_runtime.read_messages(conversation_id)
+    async def read_messages(self, session_id: str) -> tuple[ConversationMessage, ...]:
+        return await self.chat_agent_runtime.read_messages(session_id)
 
     async def respond(
         self,
         message: str,
-        context: ContextSnapshot,
-        *,
-        budget: RequestBudget | None = None,
-        confirmation_provider: AsyncConfirmationProvider | None = None,
-    ) -> AgentResponse:
-        selection = await self.selector.select(message, context, budget=budget) if budget else None
-        if selection is None or budget is None:
-            return await self.chat_runtime.respond(
-                message,
-                context,
-                budget=budget,
-                confirmation_provider=confirmation_provider,
-            )
+        request_context: RequestContext,
+    ) -> ChatAgentResponse:
+        selection = await self.selector.select(message, request_context)
+        if selection is None:
+            return await self.chat_agent_runtime.respond(message, request_context)
 
         if self.trace_sink is None:
-            return await self._execute_selected(
-                selection,
-                message,
-                context,
-                budget,
-                confirmation_provider,
-            )
+            return await self._execute_selected(selection, message, request_context)
         started_at = perf_counter()
         try:
-            span_context = child_trace_context(trace_id=UUID(context.request_id))
+            span_context = child_trace_context(trace_id=UUID(request_context.snapshot.request_id))
         except ValueError:
             span_context = child_trace_context()
         with trace_context_scope(span_context):
@@ -134,9 +158,7 @@ class SkillRuntimeAgentAdapter:
                 response = await self._execute_selected(
                     selection,
                     message,
-                    context,
-                    budget,
-                    confirmation_provider,
+                    request_context,
                 )
             except asyncio.CancelledError:
                 self._record_skill_span(
@@ -176,52 +198,62 @@ class SkillRuntimeAgentAdapter:
         self,
         selection: SkillSelection,
         message: str,
-        context: ContextSnapshot,
-        budget: RequestBudget,
-        confirmation_provider: AsyncConfirmationProvider | None,
-    ) -> AgentResponse:
-        if selection.execution_mode == "deepagents":
-            respond_with_skill = getattr(self.chat_runtime, "respond_with_skill", None)
-            if not callable(respond_with_skill):
-                return await self._fallback_to_plan(
-                    selection,
-                    message,
-                    context,
-                    budget,
-                    confirmation_provider,
-                    reason_code="deepagents_executor_unavailable",
-                )
-            try:
-                response = await respond_with_skill(
-                    message,
-                    context,
-                    skill_id=selection.skill_id,
-                    budget=budget,
-                    confirmation_provider=confirmation_provider,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                return await self._fallback_to_plan(
-                    selection,
-                    message,
-                    context,
-                    budget,
-                    confirmation_provider,
-                    reason_code=f"deepagents_execution_{type(error).__name__}",
-                    outcome_uncertain=True,
-                )
-            if response.token_usage is not None and not response.budget_usage_accounted:
-                budget.consume_tokens(response.token_usage.total_tokens)
-            assess_result = getattr(self.selector, "assess_deepagents_result", None)
+        request_context: RequestContext,
+    ) -> ChatAgentResponse:
+        context = request_context.snapshot
+        execution_mode = selection.execution_mode or "yaml"
+        executor = self.skill_executors.get(execution_mode)
+        execute = getattr(executor, "execute", None)
+        if not callable(execute):
+            return await self._fallback_to_plan(
+                selection,
+                message,
+                request_context,
+                reason_code=f"skill_executor_unavailable:{execution_mode}",
+            )
+        skill_request = SkillExecutionRequest(
+            skill_id=selection.skill_id,
+            payload=selection.payload,
+            request_context=request_context,
+            idempotency_key=context.request_id,
+            original_goal=message,
+            candidate_skill_ids=selection.candidate_skill_ids,
+        )
+        try:
+            result = await execute(skill_request)
+            if not isinstance(result, SkillExecutionResult):
+                raise TypeError("SkillExecutor must return a SkillExecutionResult.")
+        except asyncio.CancelledError:
+            raise
+        except SkillExecutorUnavailableError:
+            return await self._fallback_to_plan(
+                selection,
+                message,
+                request_context,
+                reason_code=f"skill_executor_unavailable:{execution_mode}",
+            )
+        except Exception as error:
+            reason_prefix = (
+                "markdown_execution" if execution_mode == "markdown" else "skill_execution"
+            )
+            return await self._fallback_to_plan(
+                selection,
+                message,
+                request_context,
+                reason_code=f"{reason_prefix}_{type(error).__name__}",
+                outcome_uncertain=True,
+            )
+
+        assessment_usage = None
+        if execution_mode == "markdown":
+            assess_result = getattr(self.selector, "assess_markdown_result", None)
             if callable(assess_result):
                 try:
                     accepted, reason_code, assessment_usage = await assess_result(
                         selection.skill_id,
                         message,
-                        response.content,
-                        context,
-                        budget=budget,
+                        str(result.output),
+                        request_context,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -229,61 +261,21 @@ class SkillRuntimeAgentAdapter:
                     return await self._fallback_to_plan(
                         selection,
                         message,
-                        context,
-                        budget,
-                        confirmation_provider,
-                        reason_code=f"deepagents_result_assessment_{type(error).__name__}",
-                        prior_usage=response.token_usage,
+                        request_context,
+                        reason_code=f"markdown_result_assessment_{type(error).__name__}",
+                        prior_usage=result.token_usage,
                         outcome_uncertain=True,
                     )
                 if not accepted:
                     return await self._fallback_to_plan(
                         selection,
                         message,
-                        context,
-                        budget,
-                        confirmation_provider,
+                        request_context,
                         reason_code=reason_code,
-                        prior_usage=_sum_token_usage(response.token_usage, assessment_usage),
+                        prior_usage=_sum_token_usage(result.token_usage, assessment_usage),
                         outcome_uncertain=True,
                     )
-            else:
-                assessment_usage = None
-            return AgentResponse(
-                content=response.content,
-                token_usage=_sum_token_usage(
-                    selection.token_usage,
-                    _sum_token_usage(response.token_usage, assessment_usage),
-                ),
-                budget_usage_accounted=True,
-                route=Route.SKILL_EXECUTE,
-            )
 
-        try:
-            result = await self.skill_runtime.execute(
-                SkillExecutionRequest(
-                    skill_id=selection.skill_id,
-                    payload=selection.payload,
-                    context=context,
-                    budget=budget,
-                    idempotency_key=context.request_id,
-                    confirmation_provider=confirmation_provider,
-                    original_goal=message,
-                    candidate_skill_ids=selection.candidate_skill_ids,
-                )
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            return await self._fallback_to_plan(
-                selection,
-                message,
-                context,
-                budget,
-                confirmation_provider,
-                reason_code=f"skill_execution_{type(error).__name__}",
-                outcome_uncertain=True,
-            )
         fallback_already_attempted = isinstance(result.output, Mapping) and isinstance(
             result.output.get("evaluation_failure_reason"), str
         )
@@ -302,9 +294,7 @@ class SkillRuntimeAgentAdapter:
             return await self._fallback_to_plan(
                 selection,
                 message,
-                context,
-                budget,
-                confirmation_provider,
+                request_context,
                 reason_code=failure_reason or "skill_execution_failed",
                 prior_usage=result.token_usage,
                 outcome_uncertain=bool(result.snapshot and result.snapshot.side_effects),
@@ -318,14 +308,21 @@ class SkillRuntimeAgentAdapter:
                 else None
             ),
         )
-        if context.conversation_id is None:
-            raise ValueError("Skill-selected chat context must contain a conversation_id.")
-        await self.chat_runtime.record_turn(context.conversation_id, message, response)
-        return AgentResponse(
+        if context.session_id is None:
+            raise ValueError("Skill-selected chat context must contain a session_id.")
+        await self.chat_agent_runtime.record_turn(context.session_id, message, response)
+        return ChatAgentResponse(
             content=response,
-            token_usage=_sum_token_usage(selection.token_usage, result.token_usage),
+            token_usage=_sum_token_usage(
+                selection.token_usage,
+                _sum_token_usage(result.token_usage, assessment_usage),
+            ),
             budget_usage_accounted=True,
-            route=_response_route(selection.skill_id, result.status),
+            route=(
+                Route.SKILL_EXECUTE
+                if execution_mode == "markdown"
+                else _response_route(selection.skill_id, result.status)
+            ),
             clarification_prompt=result.clarification_prompt,
         )
 
@@ -333,15 +330,14 @@ class SkillRuntimeAgentAdapter:
         self,
         selection: SkillSelection,
         message: str,
-        context: ContextSnapshot,
-        budget: RequestBudget,
-        confirmation_provider: AsyncConfirmationProvider | None,
+        request_context: RequestContext,
         *,
         reason_code: str,
         prior_usage: ModelTokenUsage | None = None,
         outcome_uncertain: bool = False,
-    ) -> AgentResponse:
+    ) -> ChatAgentResponse:
         """Continue an unsuccessful Skill attempt through the built-in Plan executor."""
+        context = request_context.snapshot
         plan_payload: dict[str, Any] = {
             "task_description": message,
             "evaluation_failure_reason": reason_code,
@@ -350,22 +346,20 @@ class SkillRuntimeAgentAdapter:
         }
         if selection.candidate_skill_ids:
             plan_payload["candidate_skill_ids"] = list(selection.candidate_skill_ids)
-        result = await self.skill_runtime.execute(
+        result = await self.skill_engine.execute(
             SkillExecutionRequest(
                 skill_id="builtin/orchestrator_plan",
                 payload=plan_payload,
-                context=context,
-                budget=budget,
+                request_context=request_context,
                 idempotency_key=context.request_id,
-                confirmation_provider=confirmation_provider,
                 original_goal=message,
                 candidate_skill_ids=selection.candidate_skill_ids,
             )
         )
         rendered = _render_result(result, evaluation_failure_reason=reason_code)
-        if context.conversation_id is not None:
-            await self.chat_runtime.record_turn(context.conversation_id, message, rendered)
-        return AgentResponse(
+        if context.session_id is not None:
+            await self.chat_agent_runtime.record_turn(context.session_id, message, rendered)
+        return ChatAgentResponse(
             content=rendered,
             token_usage=_sum_token_usage(
                 _sum_token_usage(selection.token_usage, prior_usage), result.token_usage
@@ -403,14 +397,14 @@ class SkillRuntimeAgentAdapter:
 
     async def record_turn(
         self,
-        conversation_id: str,
+        session_id: str,
         user_message: str,
         assistant_message: str,
     ) -> None:
-        await self.chat_runtime.record_turn(conversation_id, user_message, assistant_message)
+        await self.chat_agent_runtime.record_turn(session_id, user_message, assistant_message)
 
     async def aclose(self) -> None:
-        close = getattr(self.chat_runtime, "aclose", None)
+        close = getattr(self.chat_agent_runtime, "aclose", None)
         if close is not None:
             await close()
 
@@ -482,4 +476,4 @@ def _response_route(skill_id: str, status: SkillExecutionStatus) -> Route:
     return Route.DIRECT
 
 
-__all__ = ["SkillRuntimeAgentAdapter", "SkillSelection", "SkillSelectionPort"]
+__all__ = ["SkillEngineAgentAdapter", "SkillSelection", "SkillSelectionPort"]

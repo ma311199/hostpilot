@@ -21,10 +21,10 @@ from hostpilot.contracts import (
 
 
 def test_context_snapshot_is_immutable_and_rejects_unknown_fields() -> None:
-    snapshot = ContextSnapshot(request_id="request-1", conversation_id="conversation-1")
+    snapshot = ContextSnapshot(request_id="request-1", session_id="conversation-1")
 
     with pytest.raises(ValidationError):
-        snapshot.conversation_id = "changed"  # type: ignore[misc]
+        snapshot.session_id = "changed"  # type: ignore[misc]
     with pytest.raises(ValidationError):
         ContextSnapshot(request_id="request-1", unexpected="value")  # type: ignore[call-arg]
 

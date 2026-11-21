@@ -11,7 +11,7 @@ from hostpilot.api.app import create_app
 from hostpilot.budget import RequestBudget
 from hostpilot.config import load_settings
 from hostpilot.contracts import ContextSnapshot, ConversationMessage, MessageRole
-from hostpilot.orchestration.runtime import AgentResponse
+from hostpilot.orchestration.runtime import ChatAgentResponse
 from hostpilot.tools.executor import AsyncConfirmationProvider
 from hostpilot.tools.mcp import MCPToolProvider, build_retrieval_mcp_provider
 
@@ -25,8 +25,8 @@ class ApprovalRuntime:
         self.request_sequence = 0
         self.provider_started = False
 
-    async def read_messages(self, conversation_id: str) -> tuple[ConversationMessage, ...]:
-        return tuple(self.messages_by_id.get(conversation_id, ()))
+    async def read_messages(self, session_id: str) -> tuple[ConversationMessage, ...]:
+        return tuple(self.messages_by_id.get(session_id, ()))
 
     async def respond(
         self,
@@ -35,7 +35,7 @@ class ApprovalRuntime:
         *,
         budget: RequestBudget | None = None,
         confirmation_provider: AsyncConfirmationProvider | None = None,
-    ) -> AgentResponse:
+    ) -> ChatAgentResponse:
         if budget is None or confirmation_provider is None:
             raise RuntimeError("The request budget and browser approval provider are required.")
         self.request_sequence += 1
@@ -44,9 +44,7 @@ class ApprovalRuntime:
             self.provider_started = True
         if message.startswith("Run the sandbox approval check"):
             output = (
-                "sandbox-rejected-output"
-                if "rejected" in message
-                else "sandbox-approved-output"
+                "sandbox-rejected-output" if "rejected" in message else "sandbox-approved-output"
             )
             result = await self.provider.call_tool(
                 "run_python_code",
@@ -54,13 +52,13 @@ class ApprovalRuntime:
                 budget=budget,
                 confirmation_provider=confirmation_provider,
             )
-            self.messages_by_id.setdefault(context.conversation_id, []).extend(
+            self.messages_by_id.setdefault(context.session_id, []).extend(
                 (
                     ConversationMessage(role=MessageRole.USER, content=message),
                     ConversationMessage(role=MessageRole.ASSISTANT, content=result),
                 )
             )
-            return AgentResponse(result)
+            return ChatAgentResponse(result)
         path = f"approval-e2e-{self.request_sequence}.txt"
         result = await self.provider.call_tool(
             "write_text_file",
@@ -68,20 +66,20 @@ class ApprovalRuntime:
             budget=budget,
             confirmation_provider=confirmation_provider,
         )
-        self.messages_by_id.setdefault(context.conversation_id, []).extend(
+        self.messages_by_id.setdefault(context.session_id, []).extend(
             (
                 ConversationMessage(role=MessageRole.USER, content=message),
                 ConversationMessage(role=MessageRole.ASSISTANT, content=result),
             )
         )
-        return AgentResponse(result)
+        return ChatAgentResponse(result)
 
     async def aclose(self) -> None:
         await self.provider.aclose()
 
     async def record_turn(
         self,
-        _conversation_id: str,
+        _session_id: str,
         _user_message: str,
         _assistant_message: str,
     ) -> None:
