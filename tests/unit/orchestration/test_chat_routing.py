@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 from uuid import uuid4
 
 from hostpilot.contracts import ContextSnapshot, Route
@@ -6,7 +7,7 @@ from hostpilot.observability import TraceEvent
 from hostpilot.orchestration.chat import ChatService
 from hostpilot.orchestration.skill_runtime import SkillSelection
 from hostpilot.routing import CommandRouter
-from hostpilot.runtime import RequestContext, TurnLifecycleManager
+from hostpilot.runtime import AgentLifecycleManager, RequestContext, TurnLifecycleManager
 
 
 class FakeConversationStore:
@@ -15,14 +16,25 @@ class FakeConversationStore:
 
 
 class FakeContextBuilder:
-    async def build(self, session_id: str, *, query: str | None = None) -> ContextSnapshot:
+    async def build(
+        self,
+        session_id: str,
+        *,
+        query: str | None = None,
+        state_reader=None,
+    ) -> ContextSnapshot:
         self.query = query
+        self.state_reader = state_reader
         return ContextSnapshot(request_id="request-1", session_id=session_id)
 
 
 class FakeRuntime:
     def __init__(self) -> None:
         self.recorded: tuple[str, str, str] | None = None
+
+    async def read_messages(self, session_id: str):
+        del session_id
+        return ()
 
     async def record_turn(
         self,
@@ -116,6 +128,7 @@ def test_chat_service_carries_request_context_and_unpacks_legacy_tool_arguments(
 
             async def _execute_turn(
                 self,
+                runtime,
                 request_context: RequestContext,
                 session_id: str,
                 message: str,
@@ -123,6 +136,7 @@ def test_chat_service_carries_request_context_and_unpacks_legacy_tool_arguments(
             ):
                 self.request_contexts.append(request_context)
                 return await super()._execute_turn(
+                    runtime,
                     request_context,
                     session_id,
                     message,
@@ -133,8 +147,8 @@ def test_chat_service_carries_request_context_and_unpacks_legacy_tool_arguments(
             def __init__(self) -> None:
                 self.snapshots: list[ContextSnapshot] = []
 
-            async def build(self, session_id: str, *, query: str | None = None):
-                snapshot = await super().build(session_id, query=query)
+            async def build(self, session_id: str, *, query: str | None = None, state_reader=None):
+                snapshot = await super().build(session_id, query=query, state_reader=state_reader)
                 self.snapshots.append(snapshot)
                 return snapshot
 
@@ -195,7 +209,8 @@ def test_chat_service_records_safe_completion_trace_with_request_id() -> None:
         trace_id = uuid4()
 
         class UUIDContextBuilder(FakeContextBuilder):
-            async def build(self, session_id: str, *, query: str | None = None):
+            async def build(self, session_id: str, *, query: str | None = None, state_reader=None):
+                del state_reader
                 return ContextSnapshot(
                     request_id=str(trace_id),
                     session_id=session_id,
@@ -233,6 +248,90 @@ def test_chat_service_records_safe_completion_trace_with_request_id() -> None:
         assert event.attributes["route"] == "tool_call"
         assert event.attributes["status"] == "completed"
         assert "private-note.txt" not in str(event.attributes)
+
+    asyncio.run(scenario())
+
+
+def test_chat_turn_keeps_one_agent_generation_while_configuration_replaces_it() -> None:
+    async def scenario() -> None:
+        old_responding = asyncio.Event()
+        release_old_respond = asyncio.Event()
+
+        class Agent:
+            def __init__(self, name: str, *, block: bool = False) -> None:
+                self.name = name
+                self.block = block
+                self.closed = False
+                self.observed: list[str] = []
+
+            async def read_messages(self, session_id: str):
+                del session_id
+                assert not self.closed
+                self.observed.append("context")
+                return ()
+
+            async def respond(self, message: str, request_context: RequestContext):
+                del message, request_context
+                assert not self.closed
+                self.observed.append("respond")
+                if self.block:
+                    old_responding.set()
+                    await release_old_respond.wait()
+                await self.record_turn("session-1", "user", "assistant")
+                return SimpleNamespace(
+                    content=self.name,
+                    token_usage=None,
+                    route=None,
+                    clarification_prompt=None,
+                    budget_usage_accounted=False,
+                )
+
+            async def record_turn(self, session_id, user_message, assistant_message):
+                del session_id, user_message, assistant_message
+                assert not self.closed
+                self.observed.append("record")
+
+            async def aclose(self):
+                self.closed = True
+
+        class ConversationStore(FakeConversationStore):
+            async def get(self, session_id: str):
+                return SimpleNamespace(session_id=session_id)
+
+        class ContextBuilder:
+            async def build(self, session_id, *, query=None, state_reader=None):
+                del query
+                await state_reader.read_messages(session_id)
+                return ContextSnapshot(request_id="request-1", session_id=session_id)
+
+        old_agent = Agent("old", block=True)
+        new_agent = Agent("new")
+        agents = AgentLifecycleManager(old_agent)
+        service = ChatService(ConversationStore(), ContextBuilder(), agents)
+
+        old_turn = asyncio.create_task(service.send("session-1", "first"))
+        await old_responding.wait()
+        replacement = asyncio.create_task(agents.replace(new_agent))
+
+        async def wait_for_new_generation() -> None:
+            while agents.current is not new_agent:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_new_generation(), timeout=1)
+        new_result = await service.send("session-1", "second")
+        assert new_result.assistant_message == "new"
+        assert old_agent.observed == ["context", "respond"]
+        assert not old_agent.closed
+        assert new_agent.observed == ["context", "respond", "record"]
+
+        release_old_respond.set()
+        old_result = await old_turn
+        await replacement
+        assert old_result.assistant_message == "old"
+        assert old_agent.observed == ["context", "respond", "record"]
+        assert old_agent.closed
+        await agents.aclose()
+        assert new_agent.closed
 
     asyncio.run(scenario())
 

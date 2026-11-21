@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any
+from contextlib import AbstractAsyncContextManager
+from typing import Any, cast
 
-from hostpilot.contracts import ConversationMessage
+from hostpilot.contracts import ConversationMessage, SandboxMode
 from hostpilot.orchestration.runtime import ChatAgentResponse, ChatAgentRuntime
-from hostpilot.runtime import RequestContext, RuntimeContext, RuntimePluginSpec
+from hostpilot.runtime import (
+    AgentLifecycleManager,
+    RequestContext,
+    RuntimeContext,
+    RuntimePluginSpec,
+)
 
 
 class ChatAgentRuntimeHostPlugin:
@@ -23,14 +29,23 @@ class ChatAgentRuntimeHostPlugin:
     service_id = "hostpilot.agent-runtime"
 
     def __init__(self, runtime: ChatAgentRuntime | None = None) -> None:
-        self._runtime = runtime
+        self._agents = AgentLifecycleManager(runtime)
 
     @property
     def selector(self) -> Any:
         """Expose the optional selector used by route-only evaluation."""
-        return getattr(self._require_runtime(), "selector", None)
+        runtime = self._agents.current
+        return getattr(runtime, "selector", None)
+
+    def lease(self) -> AbstractAsyncContextManager[ChatAgentRuntime]:
+        """Lease one Agent generation for the complete caller operation."""
+        return cast(AbstractAsyncContextManager[ChatAgentRuntime], self._agents.lease())
 
     async def setup(self, context: RuntimeContext) -> None:
+        initial_runtime = self._agents.current
+        if initial_runtime is not None:
+            await context.agents.replace(initial_runtime)
+        self._agents = context.agents
         context.services.register(self.service_id, self, owner=self.spec.plugin_id)
 
     async def start(self, context: RuntimeContext) -> None:
@@ -38,26 +53,39 @@ class ChatAgentRuntimeHostPlugin:
 
     async def stop(self, context: RuntimeContext) -> None:
         del context
-        await self.replace(None)
+        await self._agents.aclose()
 
     async def replace(self, runtime: ChatAgentRuntime | None) -> None:
-        previous = self._runtime
-        self._runtime = runtime
-        if previous is None or previous is runtime:
-            return
-        close = getattr(previous, "aclose", None)
-        if callable(close):
-            await close()
+        await self._agents.replace(runtime)
+
+    def set_sandbox_mode(self, mode: SandboxMode | None) -> None:
+        """Forward request sandbox mode through the current Agent's tool providers."""
+        pending = [self._agents.current]
+        seen: set[int] = set()
+        while pending:
+            candidate = pending.pop()
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            set_mode = getattr(candidate, "set_sandbox_mode", None)
+            if callable(set_mode):
+                set_mode(mode)
+            for attribute in ("provider", "tool_provider", "runtime", "_provider", "_runtime"):
+                nested = getattr(candidate, attribute, None)
+                if nested is not None:
+                    pending.append(nested)
 
     async def read_messages(self, session_id: str) -> tuple[ConversationMessage, ...]:
-        return await self._require_runtime().read_messages(session_id)
+        async with self._agents.lease() as runtime:
+            return await cast(ChatAgentRuntime, runtime).read_messages(session_id)
 
     async def respond(
         self,
         message: str,
         request_context: RequestContext,
     ) -> ChatAgentResponse:
-        return await self._require_runtime().respond(message, request_context)
+        async with self._agents.lease() as runtime:
+            return await cast(ChatAgentRuntime, runtime).respond(message, request_context)
 
     async def record_turn(
         self,
@@ -65,13 +93,9 @@ class ChatAgentRuntimeHostPlugin:
         user_message: str,
         assistant_message: str,
     ) -> None:
-        await self._require_runtime().record_turn(
-            session_id,
-            user_message,
-            assistant_message,
-        )
-
-    def _require_runtime(self) -> ChatAgentRuntime:
-        if self._runtime is None:
-            raise RuntimeError("The configured chat Runtime is not available.")
-        return self._runtime
+        async with self._agents.lease() as runtime:
+            await cast(ChatAgentRuntime, runtime).record_turn(
+                session_id,
+                user_message,
+                assistant_message,
+            )
