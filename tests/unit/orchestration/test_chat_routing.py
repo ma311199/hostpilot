@@ -121,6 +121,43 @@ def test_chat_service_does_not_execute_when_turn_start_persistence_fails() -> No
     asyncio.run(scenario())
 
 
+def test_chat_service_blocks_pending_outcome_before_context_or_route_selection() -> None:
+    async def scenario() -> None:
+        class PendingOutcomes:
+            async def pending(self, session_id: str):
+                assert session_id == "session-1"
+                return (SimpleNamespace(tool_name="write_file", tool_call_id="call-1"),)
+
+        class CountingContextBuilder(FakeContextBuilder):
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def build(self, *args, **kwargs):
+                self.calls += 1
+                return await super().build(*args, **kwargs)
+
+        builder = CountingContextBuilder()
+        service = ChatService(
+            FakeConversationStore(),
+            builder,
+            FakeRuntime(),
+            tool_outcome_lifecycle=PendingOutcomes(),
+        )
+
+        result = await service.send("session-1", "hello there")
+
+        assert result.route is Route.CLARIFY
+        assert "核实" in result.assistant_message
+        assert builder.calls == 0
+
+        selection = await service.select_route_only("session-1", "run a skill")
+        assert selection.route is Route.CLARIFY
+        assert selection.reason_code == "unresolved_tool_outcome"
+        assert builder.calls == 0
+
+    asyncio.run(scenario())
+
+
 def test_chat_service_carries_request_context_and_unpacks_legacy_tool_arguments() -> None:
     async def scenario() -> None:
         class CapturingChatService(ChatService):

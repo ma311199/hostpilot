@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from hostpilot.contracts import ToolSideEffect
 from hostpilot.models import ModelToolDefinition
 from hostpilot.runtime import RuntimeExecutionLoop
 
@@ -23,6 +24,7 @@ class ChatAgentRuntimePluginContext:
     runtime_execution_loop: RuntimeExecutionLoop | None = None
     runtime_tool_definitions: tuple[ModelToolDefinition, ...] = ()
     runtime_allowed_tool_ids: frozenset[str] = frozenset()
+    runtime_tool_side_effects: Mapping[str, ToolSideEffect] | None = None
 
 
 ChatAgentRuntimeFactory = Callable[[ChatAgentRuntimePluginContext], Any]

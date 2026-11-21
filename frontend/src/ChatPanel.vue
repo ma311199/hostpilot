@@ -5,10 +5,13 @@ import {
   createConversation,
   deleteConversation,
   getConversationMessages,
+  listPendingToolOutcomes,
   listConversations,
+  resolveToolOutcome,
   upgradeConversationSandbox,
   type ConversationMessage,
   type ConversationSummary,
+  type PendingToolOutcome,
   type SandboxMode,
 } from './api/chat'
 import { getWorkspace, selectWorkspace, type WorkspaceStatus } from './api/workspace'
@@ -30,6 +33,9 @@ const messageList = ref<HTMLElement | null>(null)
 const composerInput = ref<HTMLTextAreaElement | null>(null)
 const chatSocket = new ChatSocketClient()
 const pendingApproval = ref<ToolConfirmationMessage | null>(null)
+const pendingToolOutcomes = ref<PendingToolOutcome[]>([])
+const outcomeResultDrafts = ref<Record<string, string>>({})
+const resolvingToolCallId = ref<string | null>(null)
 interface ConversationPreference {
   title?: string
   pinned?: boolean
@@ -93,6 +99,10 @@ chatSocket.onConfirmation = (request) => {
 
 async function refreshConversations(): Promise<void> {
   conversations.value = await listConversations()
+}
+
+async function refreshPendingToolOutcomes(sessionId: string): Promise<void> {
+  pendingToolOutcomes.value = await listPendingToolOutcomes(sessionId)
 }
 
 function loadConversationPreferences(): Record<string, ConversationPreference> {
@@ -169,11 +179,13 @@ async function openConversation(sessionId: string): Promise<void> {
   renamingSessionId.value = null
   activeSessionId.value = sessionId
   messages.value = []
+  pendingToolOutcomes.value = []
   loading.value = true
   errorMessage.value = ''
   try {
     const history = await getConversationMessages(sessionId)
     messages.value = history.messages
+    await refreshPendingToolOutcomes(sessionId)
     await scrollToLatest()
   } catch (error) {
     errorMessage.value = messageFor(error)
@@ -190,6 +202,7 @@ async function startConversation(): Promise<void> {
     conversations.value = [conversation, ...conversations.value]
     activeSessionId.value = conversation.session_id
     messages.value = []
+    pendingToolOutcomes.value = []
   } catch (error) {
     errorMessage.value = messageFor(error)
   }
@@ -217,6 +230,7 @@ async function removeConversation(conversation: ConversationSummary): Promise<vo
     if (activeSessionId.value === conversation.session_id) {
       activeSessionId.value = null
       messages.value = []
+      pendingToolOutcomes.value = []
       const latest = conversations.value[0]
       if (latest) await openConversation(latest.session_id)
     }
@@ -292,9 +306,14 @@ async function submitMessage(): Promise<void> {
       conversations.value = [conversation, ...conversations.value]
     }
     const sessionId = activeSessionId.value
-    await chatSocket.send(sessionId, message)
+    const chatResponse = await chatSocket.send(sessionId, message)
     const history = await getConversationMessages(sessionId)
     messages.value = history.messages
+    await refreshPendingToolOutcomes(sessionId)
+    if (pendingToolOutcomes.value.length) {
+      draft.value = message
+      errorMessage.value = chatResponse.assistant_message
+    }
     await refreshConversations()
     await scrollToLatest()
   } catch (error) {
@@ -312,6 +331,45 @@ async function submitMessage(): Promise<void> {
     errorMessage.value = messageFor(error)
   } finally {
     sending.value = false
+  }
+}
+
+async function submitToolOutcome(
+  outcome: PendingToolOutcome,
+  resolution: 'completed' | 'not_applied',
+): Promise<void> {
+  const sessionId = activeSessionId.value
+  if (!sessionId || resolvingToolCallId.value) return
+  const resultText = outcomeResultDrafts.value[outcome.tool_call_id]?.trim() || ''
+  if (resolution === 'completed' && !resultText) {
+    errorMessage.value = '请先填写已核实的工具执行结果。'
+    return
+  }
+  if (
+    resolution === 'not_applied'
+    && !window.confirm('确认已核实该工具没有产生任何外部影响？系统不会自动重放原调用。')
+  ) return
+
+  resolvingToolCallId.value = outcome.tool_call_id
+  errorMessage.value = ''
+  try {
+    await resolveToolOutcome(
+      sessionId,
+      outcome.tool_call_id,
+      resolution === 'completed'
+        ? { resolution, result_text: resultText }
+        : { resolution },
+    )
+    await refreshPendingToolOutcomes(sessionId)
+    const history = await getConversationMessages(sessionId)
+    messages.value = history.messages
+    const drafts = { ...outcomeResultDrafts.value }
+    delete drafts[outcome.tool_call_id]
+    outcomeResultDrafts.value = drafts
+  } catch (error) {
+    errorMessage.value = messageFor(error)
+  } finally {
+    resolvingToolCallId.value = null
   }
 }
 
@@ -619,6 +677,55 @@ onUnmounted(() => chatSocket.close())
         </div>
       </header>
 
+      <section
+        v-if="pendingToolOutcomes.length"
+        class="tool-outcome-recovery"
+        aria-label="待核实的工具结果"
+        role="alert"
+      >
+        <div class="tool-outcome-recovery-heading">
+          <strong>需要核实工具执行结果</strong>
+          <p>确认结果前，此会话会暂停新的任务，系统不会自动重放这些调用。请依据目标系统的实际状态核实；系统不会独立验证你填写的结果。</p>
+        </div>
+        <article
+          v-for="outcome in pendingToolOutcomes"
+          :key="outcome.tool_call_id"
+          class="tool-outcome-item"
+        >
+          <div class="tool-outcome-meta">
+            <span>工具：{{ outcome.tool_name }}</span>
+            <code>调用 ID：{{ outcome.tool_call_id }}</code>
+            <time :datetime="outcome.created_at">{{ new Date(outcome.created_at).toLocaleString() }}</time>
+          </div>
+          <label :for="`tool-outcome-${outcome.tool_call_id}`">已核实的执行结果</label>
+          <textarea
+            :id="`tool-outcome-${outcome.tool_call_id}`"
+            v-model="outcomeResultDrafts[outcome.tool_call_id]"
+            :disabled="resolvingToolCallId !== null"
+            maxlength="32768"
+            rows="3"
+            placeholder="填写外部系统或目标状态中实际观察到的结果"
+          />
+          <div class="tool-outcome-actions">
+            <button
+              type="button"
+              :disabled="resolvingToolCallId !== null"
+              @click="submitToolOutcome(outcome, 'not_applied')"
+            >
+              确认未产生影响
+            </button>
+            <button
+              type="button"
+              class="tool-outcome-complete"
+              :disabled="resolvingToolCallId !== null || !outcomeResultDrafts[outcome.tool_call_id]?.trim()"
+              @click="submitToolOutcome(outcome, 'completed')"
+            >
+              {{ resolvingToolCallId === outcome.tool_call_id ? '正在保存…' : '提交核实结果' }}
+            </button>
+          </div>
+        </article>
+      </section>
+
       <div
         ref="messageList"
         class="message-list"
@@ -721,7 +828,7 @@ onUnmounted(() => chatSocket.close())
             ref="composerInput"
             v-model="draft"
             aria-label="输入消息"
-            :disabled="sending"
+            :disabled="sending || pendingToolOutcomes.length > 0"
             placeholder="写下你的问题或想法…"
             rows="3"
             @keydown="handleComposerKeydown"
@@ -730,7 +837,7 @@ onUnmounted(() => chatSocket.close())
             <span>Enter 发送 · Shift + Enter 换行</span>
             <button
               type="submit"
-              :disabled="!draft.trim() || sending"
+              :disabled="!draft.trim() || sending || pendingToolOutcomes.length > 0"
             >
               {{ sending ? '发送中…' : '发送' }} <span aria-hidden="true">↗</span>
             </button>

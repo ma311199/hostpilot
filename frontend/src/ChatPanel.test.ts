@@ -9,6 +9,8 @@ const chatMocks = vi.hoisted(() => ({
   deleteConversation: vi.fn(),
   upgradeConversationSandbox: vi.fn(),
   getConversationMessages: vi.fn(),
+  listPendingToolOutcomes: vi.fn(),
+  resolveToolOutcome: vi.fn(),
   getWorkspace: vi.fn(),
   selectWorkspace: vi.fn(),
   confirmationHandler: null as ((request: {
@@ -26,6 +28,8 @@ vi.mock('./api/chat', () => ({
   deleteConversation: chatMocks.deleteConversation,
   upgradeConversationSandbox: chatMocks.upgradeConversationSandbox,
   getConversationMessages: chatMocks.getConversationMessages,
+  listPendingToolOutcomes: chatMocks.listPendingToolOutcomes,
+  resolveToolOutcome: chatMocks.resolveToolOutcome,
 }))
 
 vi.mock('./api/workspace', () => ({
@@ -61,6 +65,8 @@ describe('chat tool approval dialog', () => {
       selected: true,
       message: null,
     })
+    chatMocks.listPendingToolOutcomes.mockResolvedValue([])
+    chatMocks.resolveToolOutcome.mockResolvedValue({ resolved: true })
   })
 
   it('shows a safe summary and sends an explicit rejection', async () => {
@@ -128,6 +134,78 @@ describe('chat tool approval dialog', () => {
     expect(wrapper.text()).toContain('已完成。文件已写入。')
     expect(wrapper.text()).not.toContain('已写入 approval-smoke.txt（20 字节）。')
     expect(wrapper.findAll('.message-row')).toHaveLength(2)
+    wrapper.unmount()
+  })
+
+  it('blocks chat and submits a verified result for an unresolved side-effecting call', async () => {
+    const conversation = {
+      session_id: 'session-recovery',
+      title: 'Recovery',
+      created_at: '2026-11-21T10:00:00Z',
+      updated_at: '2026-11-21T10:00:00Z',
+      sandbox_mode: 'workspace-write',
+    }
+    chatMocks.listConversations.mockResolvedValue([conversation])
+    chatMocks.getConversationMessages.mockResolvedValue({ conversation, messages: [] })
+    chatMocks.listPendingToolOutcomes
+      .mockResolvedValueOnce([{
+        tool_call_id: 'call-uncertain',
+        tool_name: 'write_text_file',
+        created_at: '2026-11-21T10:00:00Z',
+        state: 'pending',
+      }])
+      .mockResolvedValueOnce([])
+
+    const wrapper = mount(ChatPanel)
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('需要核实工具执行结果')
+    expect(wrapper.text()).toContain('call-uncertain')
+    expect((wrapper.get('textarea[aria-label="输入消息"]').element as HTMLTextAreaElement).disabled).toBe(true)
+    await wrapper.get('.tool-outcome-item textarea').setValue('目标文件已经写入')
+    await wrapper.get('.tool-outcome-complete').trigger('click')
+    await flushPromises()
+
+    expect(chatMocks.resolveToolOutcome).toHaveBeenCalledWith(
+      conversation.session_id,
+      'call-uncertain',
+      { resolution: 'completed', result_text: '目标文件已经写入' },
+    )
+    expect(wrapper.find('.tool-outcome-recovery').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('requires explicit confirmation before marking a tool outcome not applied', async () => {
+    const conversation = {
+      session_id: 'session-no-effect',
+      title: 'Recovery',
+      created_at: '2026-11-21T10:00:00Z',
+      updated_at: '2026-11-21T10:00:00Z',
+      sandbox_mode: 'workspace-write',
+    }
+    chatMocks.listConversations.mockResolvedValue([conversation])
+    chatMocks.getConversationMessages.mockResolvedValue({ conversation, messages: [] })
+    chatMocks.listPendingToolOutcomes
+      .mockResolvedValueOnce([{
+        tool_call_id: 'call-not-applied',
+        tool_name: 'remote_action',
+        created_at: '2026-11-21T10:00:00Z',
+        state: 'pending',
+      }])
+      .mockResolvedValueOnce([])
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
+
+    const wrapper = mount(ChatPanel)
+    await flushPromises()
+    await wrapper.get('.tool-outcome-actions button:first-child').trigger('click')
+    await flushPromises()
+
+    expect(window.confirm).toHaveBeenCalledOnce()
+    expect(chatMocks.resolveToolOutcome).toHaveBeenCalledWith(
+      conversation.session_id,
+      'call-not-applied',
+      { resolution: 'not_applied' },
+    )
     wrapper.unmount()
   })
 

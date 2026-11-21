@@ -125,3 +125,5 @@ v4 direct/clarify 首批 10 例路由与 Skill 匹配均为 10/10；总 Token 43
 
 
 会议用例第二轮（每例 30,000 Token）路由匹配 0/4、Skill 匹配 4/4，Runtime 完成 0/4；Provider 总用量 102,178 Token，耗时 P50/P95 为 61.603/69.359 秒，3 次只读 stub 读取，无写入或副作用。四例均因评测脚本错误地把 OrchestratorPlanExecutor 赋给 SkillEngine fallback 而触发 AttributeError。脚本接线和会议 fixture 已修复，单测/格式检查通过；修复后 40,000 Token 会议复测 4/4 完成（52,885 Token、P50/P95 27.043/38.908 秒）；正文 JSON 包装问题已在 renderer 修复，定向测试 13 项通过，两例抽样复测通过：skill-meeting-001/skill-code-002 路由与 Skill 匹配 2/2、Runtime 完成并获接受；分别 13,161/12,925 Token、24.152/29.183 秒，合计 26,086 Token，P50/P95 26.668/29.183 秒，0 工具调用/副作用，终端正文无 JSON 包装。详见[业务 Skill 报告](test-results/2026-11-17-stage-c-v4-business-skill-runtime.md)。
+
+2026-11-22 Runtime 工具结果核实：全量 Python 测试 **641 passed**；新增跨 Host 重启、Checkpoint 写入确认丢失和只读失败注入 **3 passed**。确认只读工具不创建 pending，可能产生副作用的工具先写 pending，失败关闭；Session 有未决记录时 Chat 和 route-only 都在上下文/路由前阻断。前端 **84 passed**，TypeScript、ESLint、生产构建通过；全仓 Ruff、127 源文件 mypy 和 `git diff --check` 通过。首次全量运行有 1 项因旧提示语断言失败（其余 640 通过），更新为匹配新的“尚未核实”门禁提示后重跑全量通过。详见[Runtime 工具结果核实与恢复验证](test-results/2026-11-21-runtime-tool-outcome-resolution.md)。

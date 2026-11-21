@@ -28,6 +28,7 @@ from hostpilot.contracts.models import (
     ToolConnectionStatus,
     ToolConnectionTransport,
     ToolDescriptor,
+    ToolSideEffect,
     ToolType,
     TrustLevel,
 )
@@ -57,6 +58,7 @@ __all__ = [
     "SandboxResourceLimits",
     "TimeoutProfile",
     "ToolDescriptor",
+    "ToolSideEffect",
     "ToolConnectionState",
     "ToolConnectionStatus",
     "ToolConnectionTransport",

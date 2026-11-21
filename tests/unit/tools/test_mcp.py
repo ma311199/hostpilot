@@ -22,6 +22,7 @@ from hostpilot.contracts import (
     TimeoutProfile,
     ToolConnectionState,
     ToolDescriptor,
+    ToolSideEffect,
     ToolType,
     TrustLevel,
 )
@@ -253,6 +254,29 @@ def test_rag_mcp_schema_hides_configured_identity_and_secret(tmp_path) -> None:
         assert schema["properties"] == {"query": {"type": "string"}}
         assert "private-key" not in str(schema)
         assert "configured-user" not in str(schema)
+        await provider.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_builtin_tool_descriptors_mark_only_reads_as_side_effect_free() -> None:
+    async def scenario() -> None:
+        provider = build_retrieval_mcp_provider(Settings())
+        await provider.start()
+        effects = {
+            descriptor.name: descriptor.side_effect
+            for descriptor in provider.registry.descriptors()
+        }
+        assert effects["retrieve_knowledge"] is ToolSideEffect.NONE
+        assert effects["read_text_file"] is ToolSideEffect.NONE
+        assert effects["read_text_range"] is ToolSideEffect.NONE
+        assert effects["list_directory"] is ToolSideEffect.NONE
+        assert effects["search_files"] is ToolSideEffect.NONE
+        assert effects["write_text_file"] is ToolSideEffect.POSSIBLE
+        assert effects["write_existing_text_file"] is ToolSideEffect.POSSIBLE
+        assert effects["run_python_code"] is ToolSideEffect.POSSIBLE
+        assert effects["run_javascript_code"] is ToolSideEffect.POSSIBLE
+        assert effects["run_shell_script"] is ToolSideEffect.POSSIBLE
         await provider.aclose()
 
     asyncio.run(scenario())

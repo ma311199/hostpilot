@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from time import perf_counter
 from typing import Any, Protocol, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from hostpilot.budget import RequestBudget
 from hostpilot.context import ContextBuilder, ConversationNotFoundError
@@ -92,6 +92,7 @@ class ChatService:
         turn_lifecycle: TurnLifecycleManager | None = None,
         task_lifecycle: TaskLifecycleManager | None = None,
         session_lifecycle: SessionLifecycleManager | None = None,
+        tool_outcome_lifecycle: Any | None = None,
     ) -> None:
         self.conversations = conversations
         self.context_builder = context_builder
@@ -111,6 +112,7 @@ class ChatService:
         self.turn_lifecycle = turn_lifecycle
         self.task_lifecycle = task_lifecycle
         self.session_lifecycle = session_lifecycle
+        self.tool_outcome_lifecycle = tool_outcome_lifecycle
 
     async def send(
         self,
@@ -123,6 +125,9 @@ class ChatService:
         if len(message) > self.max_request_chars:
             raise RequestTooLargeError("Message exceeds the configured request size limit.")
         async with _lease_session(self.session_lifecycle, session_id):
+            pending = await self._pending_tool_outcomes(session_id)
+            if pending:
+                return _blocked_tool_outcome_result(session_id)
             return await self._send_leased(
                 session_id,
                 message,
@@ -256,6 +261,13 @@ class ChatService:
         if len(message) > self.max_request_chars:
             raise RequestTooLargeError("Message exceeds the configured request size limit.")
         async with _lease_session(self.session_lifecycle, session_id):
+            if await self._pending_tool_outcomes(session_id):
+                return RouteSelectionResult(
+                    request_id=str(uuid4()),
+                    route=Route.CLARIFY,
+                    skill_id="builtin/clarify",
+                    reason_code="unresolved_tool_outcome",
+                )
             return await self._select_route_only_leased(
                 session_id,
                 message,
@@ -263,6 +275,12 @@ class ChatService:
                 evaluation_session_summary=evaluation_session_summary,
                 evaluation_long_term_memory=evaluation_long_term_memory,
             )
+
+    async def _pending_tool_outcomes(self, session_id: str) -> tuple[Any, ...]:
+        """Read the durable Session gate before any routing or model work."""
+        if self.tool_outcome_lifecycle is None:
+            return ()
+        return cast(tuple[Any, ...], await self.tool_outcome_lifecycle.pending(session_id))
 
     async def _select_route_only_leased(
         self,
@@ -370,6 +388,20 @@ class ChatService:
 
 class UnsupportedRouteError(RuntimeError):
     """Raised when a route has not yet been connected to an execution path."""
+
+
+def _blocked_tool_outcome_result(session_id: str) -> ChatTurnResult:
+    """Return a local recovery prompt without starting a Turn or invoking a model."""
+    return ChatTurnResult(
+        session_id=session_id,
+        request_id=str(uuid4()),
+        assistant_message=(
+            "上一次可能产生副作用的工具调用结果尚未核实。为避免重复执行，当前会话暂时不能继续；"
+            "请先核实该调用是否生效，并提交实际结果或确认未生效。"
+        ),
+        route=Route.CLARIFY,
+        clarification_prompt="请先核实未决工具调用的结果。",
+    )
 
 
 @asynccontextmanager

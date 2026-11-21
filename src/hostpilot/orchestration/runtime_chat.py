@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
-from hostpilot.contracts import ConversationMessage, MessageRole, Route
+from hostpilot.contracts import ConversationMessage, MessageRole, Route, ToolSideEffect
 from hostpilot.models import ModelMessage, ModelRole, ModelToolDefinition
 from hostpilot.orchestration.runtime import (
     ChatAgentResponse,
@@ -18,6 +18,7 @@ from hostpilot.runtime import (
     RuntimeExecutionRequest,
     RuntimeExecutionStatus,
     RuntimeSessionStatePort,
+    RuntimeToolOutcomePort,
     RuntimeToolReplay,
     runtime_tool_call_key,
 )
@@ -42,6 +43,7 @@ class RuntimeChatAgentRuntime:
         allowed_tool_ids: frozenset[str] | None = None,
         max_steps: int = 8,
         skill_runtime: Any | None = None,
+        tool_side_effects: Mapping[str, ToolSideEffect] | None = None,
     ) -> None:
         self.execution_loop = execution_loop
         self.session_state = session_state
@@ -55,6 +57,16 @@ class RuntimeChatAgentRuntime:
         )
         self.max_steps = max_steps
         self.skill_runtime = skill_runtime
+        self.tool_side_effects = dict(tool_side_effects or {})
+        self.tool_outcomes: RuntimeToolOutcomePort | None = None
+
+    def configure_tool_outcomes(self, lifecycle: RuntimeToolOutcomePort) -> None:
+        """Attach the Host-owned outcome lifecycle before Runtime readiness."""
+        if self.tool_outcomes is lifecycle:
+            return
+        if self.tool_outcomes is not None:
+            raise RuntimeError("Tool outcome lifecycle is already configured.")
+        self.tool_outcomes = lifecycle
 
     async def read_messages(self, session_id: str) -> tuple[ConversationMessage, ...]:
         """Expose stored model history through the existing Chat Runtime contract."""
@@ -74,8 +86,11 @@ class RuntimeChatAgentRuntime:
         if session_id is None:
             raise ValueError("Chat context must contain a session_id.")
         history = await self.session_state.load_messages(session_id)
-        tool_replays, recovery_messages = _interrupted_tool_replays(history)
-        if any(replay.result is None for replay in tool_replays):
+        tool_replays, recovery_messages, has_uncertain_side_effect = _interrupted_tool_replays(
+            history,
+            self.tool_side_effects,
+        )
+        if has_uncertain_side_effect:
             await self.session_state.append_messages(
                 session_id,
                 (ModelMessage(role=ModelRole.USER, content=message),),
@@ -113,6 +128,8 @@ class RuntimeChatAgentRuntime:
                 allowed_tool_ids=self.allowed_tool_ids,
                 max_steps=self.max_steps,
                 tool_replays=tool_replays,
+                tool_side_effects=self.tool_side_effects,
+                tool_outcomes=self.tool_outcomes,
                 message_sink=persist_message_delta,
             )
         )
@@ -170,6 +187,46 @@ class RuntimeChatAgentRuntime:
             ),
         )
 
+    async def resolve_tool_outcome(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        *,
+        result_text: str,
+    ) -> None:
+        """Append a verified result to its original call and then clear pending state."""
+        if self.tool_outcomes is None:
+            raise RuntimeError("Tool outcome persistence is not configured.")
+        if not await self.tool_outcomes.claim_resolution(session_id, tool_call_id):
+            raise ValueError("Tool outcome is missing or is being resolved by another Host.")
+        try:
+            history = await self.session_state.load_messages(session_id)
+            existing = tuple(
+                message
+                for message in history
+                if message.role is ModelRole.TOOL and message.tool_call_id == tool_call_id
+            )
+            if existing:
+                if any(message.content != result_text for message in existing):
+                    raise ValueError(
+                        "A different result is already checkpointed for this tool call."
+                    )
+            else:
+                await self.session_state.append_messages(
+                    session_id,
+                    (
+                        ModelMessage(
+                            role=ModelRole.TOOL,
+                            content=result_text,
+                            tool_call_id=tool_call_id,
+                        ),
+                    ),
+                )
+            await self.tool_outcomes.result_checkpointed(session_id, tool_call_id)
+        except BaseException:
+            await self.tool_outcomes.release_resolution_claim(session_id, tool_call_id)
+            raise
+
     async def aclose(self) -> None:
         """Release the delegated Skill runtime when it owns external model clients."""
         close = getattr(self.skill_runtime, "aclose", None)
@@ -182,11 +239,13 @@ __all__ = ["RuntimeChatAgentRuntime"]
 
 def _interrupted_tool_replays(
     history: tuple[ModelMessage, ...],
-) -> tuple[tuple[RuntimeToolReplay, ...], tuple[ModelMessage, ...]]:
+    side_effects: Mapping[str, ToolSideEffect],
+) -> tuple[tuple[RuntimeToolReplay, ...], tuple[ModelMessage, ...], bool]:
     """Find tools proposed since the latest completed assistant turn for replay fencing."""
     call_keys: dict[str, tuple[str, str]] = {}
     results: dict[tuple[str, str], str | None] = {}
     unresolved_calls: dict[str, tuple[str, str]] = {}
+    has_uncertain_side_effect = False
 
     for message in history:
         if message.role is ModelRole.ASSISTANT:
@@ -194,6 +253,7 @@ def _interrupted_tool_replays(
                 call_keys.clear()
                 results.clear()
                 unresolved_calls.clear()
+                has_uncertain_side_effect = False
                 continue
             for tool_call in message.tool_calls:
                 key = runtime_tool_call_key(tool_call)
@@ -203,22 +263,34 @@ def _interrupted_tool_replays(
         elif message.role is ModelRole.TOOL and message.tool_call_id in call_keys:
             key = call_keys[message.tool_call_id]
             results[key] = message.content
+            unresolved_calls.pop(message.tool_call_id, None)
+
+    has_uncertain_side_effect = any(
+        side_effects.get(name, ToolSideEffect.POSSIBLE) is not ToolSideEffect.NONE
+        for name, _ in unresolved_calls.values()
+    )
 
     replays = tuple(
         RuntimeToolReplay(tool_name=name, arguments_json=arguments_json, result=result)
         for (name, arguments_json), result in results.items()
+        if result is not None
     )
     recovery_messages = tuple(
         ModelMessage(
             role=ModelRole.TOOL,
             content=(
-                f"The previous {name} call was interrupted and its outcome is uncertain. "
-                "It was not repeated. Ask the user to verify whether it took effect "
-                "before proceeding."
+                f"The previous read-only {name} call did not save a result. "
+                "It is safe to repeat this read operation if needed."
+                if side_effects.get(name, ToolSideEffect.POSSIBLE) is ToolSideEffect.NONE
+                else (
+                    f"The previous {name} call was interrupted and its outcome is uncertain. "
+                    "It was not repeated. Ask the user to verify whether it took effect "
+                    "before proceeding."
+                )
             ),
             tool_call_id=call_id,
         )
         for call_id, (name, arguments_json) in unresolved_calls.items()
         if results[(name, arguments_json)] is None
     )
-    return replays, recovery_messages
+    return replays, recovery_messages, has_uncertain_side_effect

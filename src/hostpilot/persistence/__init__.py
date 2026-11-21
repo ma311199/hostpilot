@@ -40,6 +40,7 @@ from hostpilot.persistence.ports import (
     MemoryStoreFactory,
     ModelConfigurationStore,
     ModelConfigurationStoreFactory,
+    PendingToolOutcome,
     RoutingModelConfigurationStore,
     RoutingModelConfigurationStoreFactory,
     SessionLifecycleStore,
@@ -48,6 +49,8 @@ from hostpilot.persistence.ports import (
     SkillExecutionStoreFactory,
     TaskStore,
     TaskStoreFactory,
+    ToolOutcomeStore,
+    ToolOutcomeStoreFactory,
     TraceStore,
     TraceStoreFactory,
     TurnStore,
@@ -70,6 +73,7 @@ from hostpilot.persistence.skill_execution import (
     SQLiteSkillExecutionStore,
 )
 from hostpilot.persistence.tasks import SQLiteTaskStore, StoredTaskRun
+from hostpilot.persistence.tool_outcomes import SQLiteToolOutcomeStore
 from hostpilot.persistence.traces import SQLiteTraceStore, StoredTraceEvent, TraceSummary
 from hostpilot.persistence.turns import SQLiteTurnStore, StoredTurn
 from hostpilot.persistence.workspace_configuration import SQLiteWorkspaceConfigurationStore
@@ -94,6 +98,7 @@ __all__ = [
     "ModelConfigurationStoreFactory",
     "RoutingModelConfigurationStore",
     "RoutingModelConfigurationStoreFactory",
+    "PendingToolOutcome",
     "SessionLifecycleStore",
     "SessionLifecycleStoreFactory",
     "SkillExecutionStore",
@@ -102,6 +107,8 @@ __all__ = [
     "TraceStoreFactory",
     "TurnStore",
     "TurnStoreFactory",
+    "ToolOutcomeStore",
+    "ToolOutcomeStoreFactory",
     "TaskStore",
     "TaskStoreFactory",
     "WorkspaceConfigurationStore",
@@ -118,6 +125,7 @@ __all__ = [
     "SQLiteTraceStore",
     "SQLiteTurnStore",
     "SQLiteSessionLifecycleStore",
+    "SQLiteToolOutcomeStore",
     "SessionLeasesActiveError",
     "SessionUnavailableError",
     "SQLiteTaskStore",

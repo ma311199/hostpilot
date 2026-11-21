@@ -259,6 +259,13 @@ class ToolType(StrEnum):
     CODE = "code"
 
 
+class ToolSideEffect(StrEnum):
+    """Whether executing a tool may change state outside its own response."""
+
+    NONE = "none"
+    POSSIBLE = "possible"
+
+
 class TrustLevel(StrEnum):
     """Declared trust class for a tool implementation."""
 
@@ -297,6 +304,7 @@ class ToolDescriptor(ContractModel):
     name: NonEmptyString
     description: NonEmptyString
     tool_type: ToolType
+    side_effect: ToolSideEffect = ToolSideEffect.POSSIBLE
     trust_level: TrustLevel
     execution_env: ExecutionEnvironment
     timeout_profile: TimeoutProfile

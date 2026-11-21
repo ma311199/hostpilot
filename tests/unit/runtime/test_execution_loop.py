@@ -8,7 +8,13 @@ from collections.abc import Sequence
 import pytest
 
 from hostpilot.budget import BudgetExceededError, RequestBudget
-from hostpilot.contracts import BudgetContext, BudgetLimits, ContextSnapshot, ModelTokenUsage
+from hostpilot.contracts import (
+    BudgetContext,
+    BudgetLimits,
+    ContextSnapshot,
+    ModelTokenUsage,
+    ToolSideEffect,
+)
 from hostpilot.models import (
     ModelMessage,
     ModelRequest,
@@ -52,6 +58,9 @@ def request(
     tools: tuple[ModelToolDefinition, ...] = (),
     allowed_tool_ids: frozenset[str] = frozenset(),
     max_steps: int = 4,
+    tool_side_effects=None,
+    tool_outcomes=None,
+    message_sink=None,
 ) -> RuntimeExecutionRequest:
     return RuntimeExecutionRequest(
         request_context=context,
@@ -59,6 +68,13 @@ def request(
         tools=tools,
         allowed_tool_ids=allowed_tool_ids,
         max_steps=max_steps,
+        tool_side_effects=(
+            {tool.name: ToolSideEffect.NONE for tool in tools}
+            if tool_side_effects is None
+            else tool_side_effects
+        ),
+        tool_outcomes=tool_outcomes,
+        message_sink=message_sink,
     )
 
 
@@ -82,6 +98,108 @@ class RecordingToolPort:
     async def execute(self, request_context: RequestContext, tool_call: ModelToolCall) -> str:
         self.calls.append((request_context, tool_call))
         return self.outputs.get(tool_call.call_id, f"result:{tool_call.call_id}")
+
+
+class RecordingOutcomeLifecycle:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def begin_invocation(self, **kwargs) -> None:
+        self.events.append(f"registered:{kwargs['tool_call_id']}")
+
+    async def result_checkpointed(self, session_id: str, tool_call_id: str) -> None:
+        del session_id
+        self.events.append(f"cleared:{tool_call_id}")
+
+
+def test_loop_registers_side_effect_before_dispatch_and_clears_after_checkpoint() -> None:
+    context = execution_context()
+    call = ModelToolCall("write-1", "write_file", {"path": "report.txt"})
+    model = SequenceModelPort(
+        [ModelResponse(text="", tool_calls=(call,)), ModelResponse(text="Done.")]
+    )
+    events: list[str] = []
+
+    class OrderedToolPort(RecordingToolPort):
+        async def execute(self, request_context, tool_call):
+            events.append(f"executed:{tool_call.call_id}")
+            return await super().execute(request_context, tool_call)
+
+    async def message_sink(messages):
+        if messages[0].role is ModelRole.TOOL:
+            events.append(f"checkpointed:{messages[0].tool_call_id}")
+
+    loop = DefaultRuntimeExecutionLoop(model, OrderedToolPort())
+    outcome_lifecycle = RecordingOutcomeLifecycle(events)
+
+    asyncio.run(
+        loop.run(
+            request(
+                context,
+                tools=(definition("write_file"),),
+                allowed_tool_ids=frozenset({"write_file"}),
+                tool_side_effects={"write_file": ToolSideEffect.POSSIBLE},
+                tool_outcomes=outcome_lifecycle,
+                message_sink=message_sink,
+            )
+        )
+    )
+
+    assert events == [
+        "registered:write-1",
+        "executed:write-1",
+        "checkpointed:write-1",
+        "cleared:write-1",
+    ]
+
+
+def test_loop_does_not_dispatch_unknown_effect_tool_without_outcome_store() -> None:
+    context = execution_context()
+    call = ModelToolCall("unknown-1", "custom_tool", {})
+    model = SequenceModelPort([ModelResponse(text="", tool_calls=(call,))])
+    tools = RecordingToolPort()
+    loop = DefaultRuntimeExecutionLoop(model, tools)
+
+    with pytest.raises(RuntimeError, match="requires outcome persistence"):
+        asyncio.run(
+            loop.run(
+                request(
+                    context,
+                    tools=(definition("custom_tool"),),
+                    allowed_tool_ids=frozenset({"custom_tool"}),
+                    tool_side_effects={},
+                )
+            )
+        )
+
+    assert tools.calls == []
+
+
+def test_loop_does_not_dispatch_if_pending_record_cannot_be_written() -> None:
+    context = execution_context()
+    call = ModelToolCall("write-1", "write_file", {})
+    model = SequenceModelPort([ModelResponse(text="", tool_calls=(call,))])
+    tools = RecordingToolPort()
+
+    class FailingOutcomeLifecycle(RecordingOutcomeLifecycle):
+        async def begin_invocation(self, **kwargs) -> None:
+            del kwargs
+            raise OSError("outcome store unavailable")
+
+    with pytest.raises(OSError, match="outcome store unavailable"):
+        asyncio.run(
+            DefaultRuntimeExecutionLoop(model, tools).run(
+                request(
+                    context,
+                    tools=(definition("write_file"),),
+                    allowed_tool_ids=frozenset({"write_file"}),
+                    tool_side_effects={"write_file": ToolSideEffect.POSSIBLE},
+                    tool_outcomes=FailingOutcomeLifecycle([]),
+                )
+            )
+        )
+
+    assert tools.calls == []
 
 
 def test_loop_returns_model_final_text_and_accounts_unmanaged_usage() -> None:
