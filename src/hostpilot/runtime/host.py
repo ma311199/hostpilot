@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from hostpilot.runtime.lifecycle import (
     AgentLifecycleManager,
+    SessionLifecycleManager,
     TaskLifecycleManager,
     TurnLifecycleManager,
 )
@@ -86,6 +87,7 @@ class RuntimeContext:
     shutdown_event: asyncio.Event = field(default_factory=asyncio.Event)
     runtime_host_id: str = field(default_factory=lambda: str(uuid4()))
     agents: AgentLifecycleManager = field(default_factory=AgentLifecycleManager)
+    sessions: SessionLifecycleManager = field(default_factory=SessionLifecycleManager)
     turns: TurnLifecycleManager = field(default_factory=TurnLifecycleManager)
     tasks: TaskLifecycleManager = field(default_factory=TaskLifecycleManager)
 
@@ -183,6 +185,8 @@ class RuntimeHost:
                 self._started_plugins.append(plugin)
             self.state = RuntimeHostState.READY
         except BaseException:
+            await self.context.sessions.begin_shutdown()
+            await self.context.sessions.aclose()
             await self._stop_started_plugins()
             self.state = RuntimeHostState.FAILED
             raise
@@ -192,20 +196,26 @@ class RuntimeHost:
             return
         if self.state is RuntimeHostState.CREATED:
             await self.context.agents.begin_shutdown()
+            await self.context.sessions.begin_shutdown()
+            await self.context.sessions.aclose()
             self.context.shutdown_event.set()
             self.state = RuntimeHostState.STOPPED
             return
         self.state = RuntimeHostState.STOPPING
         self.context.shutdown_event.set()
         await self.context.agents.begin_shutdown()
+        await self.context.sessions.begin_shutdown()
         try:
             await self.context.turns.cancel_all()
         finally:
             try:
                 await self.context.tasks.cancel_all()
             finally:
-                await self._stop_started_plugins()
-                self.state = RuntimeHostState.STOPPED
+                try:
+                    await self.context.sessions.aclose()
+                finally:
+                    await self._stop_started_plugins()
+                    self.state = RuntimeHostState.STOPPED
 
     def _resolve_order(self) -> list[RuntimePlugin]:
         for plugin in self._plugins.values():

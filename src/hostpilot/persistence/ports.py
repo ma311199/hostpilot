@@ -84,6 +84,31 @@ class TurnStore(Protocol):
 TurnStoreFactory = Callable[[Path], TurnStore]
 
 
+class SessionLifecycleStore(Protocol):
+    """Coordinate durable Session state and operation leases across Runtime Hosts."""
+
+    async def initialize(self) -> None: ...
+
+    async def register_session(self, session_id: str) -> None: ...
+
+    async def acquire_lease(
+        self, session_id: str, lease_id: str, runtime_host_id: str, now: datetime
+    ) -> None: ...
+
+    async def release_lease(self, lease_id: str, runtime_host_id: str) -> None: ...
+
+    async def begin_close(self, session_id: str, runtime_host_id: str) -> bool | None: ...
+
+    async def release_close_claim(self, session_id: str, runtime_host_id: str) -> None: ...
+
+    async def active_lease_count(self, session_id: str, now: datetime) -> int: ...
+
+    async def finish_delete(self, session_id: str) -> None: ...
+
+
+SessionLifecycleStoreFactory = Callable[[Path], SessionLifecycleStore]
+
+
 class TaskStore(Protocol):
     """Persist payload-free Runtime TaskRun lifecycle metadata."""
 

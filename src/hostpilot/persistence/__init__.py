@@ -42,6 +42,8 @@ from hostpilot.persistence.ports import (
     ModelConfigurationStoreFactory,
     RoutingModelConfigurationStore,
     RoutingModelConfigurationStoreFactory,
+    SessionLifecycleStore,
+    SessionLifecycleStoreFactory,
     SkillExecutionStore,
     SkillExecutionStoreFactory,
     TaskStore,
@@ -56,6 +58,11 @@ from hostpilot.persistence.ports import (
 from hostpilot.persistence.routing_model_configuration import (
     RoutingModelConfiguration,
     SQLiteRoutingModelConfigurationStore,
+)
+from hostpilot.persistence.sessions import (
+    SessionLeasesActiveError,
+    SessionUnavailableError,
+    SQLiteSessionLifecycleStore,
 )
 from hostpilot.persistence.skill_execution import (
     SkillExecutionMode,
@@ -87,6 +94,8 @@ __all__ = [
     "ModelConfigurationStoreFactory",
     "RoutingModelConfigurationStore",
     "RoutingModelConfigurationStoreFactory",
+    "SessionLifecycleStore",
+    "SessionLifecycleStoreFactory",
     "SkillExecutionStore",
     "SkillExecutionStoreFactory",
     "TraceStore",
@@ -108,6 +117,9 @@ __all__ = [
     "SQLiteRoutingModelConfigurationStore",
     "SQLiteTraceStore",
     "SQLiteTurnStore",
+    "SQLiteSessionLifecycleStore",
+    "SessionLeasesActiveError",
+    "SessionUnavailableError",
     "SQLiteTaskStore",
     "SQLiteSkillExecutionStore",
     "SkillExecutionMode",

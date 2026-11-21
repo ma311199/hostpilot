@@ -1,8 +1,13 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 from hostpilot.orchestration.state_services_host_plugin import StateServicesHostPlugin
-from hostpilot.persistence import SQLiteTaskStore, SQLiteTurnStore
+from hostpilot.persistence import (
+    SQLiteSessionLifecycleStore,
+    SQLiteTaskStore,
+    SQLiteTurnStore,
+)
 from hostpilot.runtime import RuntimeContext, RuntimeHost
 
 
@@ -28,6 +33,9 @@ class FakeConversationStore:
 
     async def initialize(self) -> None:
         self.initialized = True
+
+    async def list(self) -> tuple[object, ...]:
+        return ()
 
     async def aclose(self) -> None:
         self.closed = True
@@ -57,6 +65,7 @@ def test_state_plugin_registers_and_unregisters_injected_store_ports(tmp_path) -
         assert context.services.resolve(plugin.checkpointer_service_id) is checkpointer
         assert context.services.resolve(plugin.turn_store_service_id) is plugin._turn_store
         assert context.services.resolve(plugin.task_store_service_id) is plugin._task_store
+        assert context.services.resolve(plugin.session_store_service_id) is plugin._session_store
         await host.close()
         return conversations, checkpointer, context, checkpointer_context
 
@@ -66,6 +75,39 @@ def test_state_plugin_registers_and_unregisters_injected_store_ports(tmp_path) -
     assert conversations.closed
     assert checkpointer_context.entered
     assert checkpointer_context.exited
+
+
+def test_state_plugin_injects_session_store_and_backfills_legacy_sessions(tmp_path) -> None:
+    async def scenario() -> None:
+        database_path = tmp_path / "runtime.sqlite3"
+        context = RuntimeContext()
+        host = RuntimeHost(context)
+        session_store = SQLiteSessionLifecycleStore(database_path)
+
+        class LegacyConversationStore(FakeConversationStore):
+            async def list(self) -> tuple[object, ...]:
+                return (SimpleNamespace(session_id="legacy-session"),)
+
+        plugin = StateServicesHostPlugin(
+            lambda _: LegacyConversationStore(),
+            database_path,
+            FakeCheckpointerContext(object()),
+            session_store_factory=lambda _: session_store,
+        )
+        host.register_plugin(plugin)
+        await host.start()
+
+        assert context.services.resolve(plugin.session_store_service_id) is session_store
+        await session_store.acquire_lease(
+            "legacy-session",
+            "legacy-lease",
+            context.runtime_host_id,
+            datetime.now(UTC),
+        )
+        await session_store.release_lease("legacy-lease", context.runtime_host_id)
+        await host.close()
+
+    asyncio.run(scenario())
 
 
 def test_state_plugin_heartbeat_keeps_live_host_turn_from_recovery(tmp_path) -> None:

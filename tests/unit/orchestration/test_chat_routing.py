@@ -1,10 +1,12 @@
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
 
 from hostpilot.contracts import ContextSnapshot, Route
 from hostpilot.observability import TraceEvent
 from hostpilot.orchestration.chat import ChatService
+from hostpilot.orchestration.runtime import ChatAgentResponse
 from hostpilot.orchestration.skill_runtime import SkillSelection
 from hostpilot.routing import CommandRouter
 from hostpilot.runtime import AgentLifecycleManager, RequestContext, TurnLifecycleManager
@@ -368,5 +370,103 @@ def test_route_only_evaluation_selects_skill_without_executing_runtime_or_tools(
         assert not hasattr(conversations, "touched")
         assert runtime.selector.request_context.snapshot.session_summary is None
         assert runtime.selector.request_context.snapshot.long_term_memory is None
+
+    asyncio.run(scenario())
+
+
+def test_chat_service_holds_session_lease_across_context_and_model_work() -> None:
+    async def scenario() -> None:
+        context_started = asyncio.Event()
+        continue_context = asyncio.Event()
+        model_started = asyncio.Event()
+        continue_model = asyncio.Event()
+        lease_events: list[str] = []
+
+        class SessionLifecycle:
+            @asynccontextmanager
+            async def lease(self, session_id: str):
+                lease_events.append(f"acquire:{session_id}")
+                try:
+                    yield
+                finally:
+                    lease_events.append(f"release:{session_id}")
+
+        class BlockingContextBuilder(FakeContextBuilder):
+            async def build(self, session_id, *, query=None, state_reader=None):
+                context_started.set()
+                await continue_context.wait()
+                return await super().build(session_id, query=query, state_reader=state_reader)
+
+        class BlockingRuntime(FakeRuntime):
+            async def respond(self, message, request_context):
+                del message, request_context
+                model_started.set()
+                await continue_model.wait()
+                return ChatAgentResponse("completed")
+
+        service = ChatService(
+            FakeConversationStore(),
+            BlockingContextBuilder(),
+            BlockingRuntime(),
+            session_lifecycle=SessionLifecycle(),
+        )
+        sending = asyncio.create_task(service.send("session-1", "hello"))
+        await context_started.wait()
+        assert lease_events == ["acquire:session-1"]
+
+        continue_context.set()
+        await model_started.wait()
+        assert lease_events == ["acquire:session-1"]
+
+        continue_model.set()
+        result = await sending
+        assert result.assistant_message == "completed"
+        assert lease_events == ["acquire:session-1", "release:session-1"]
+
+    asyncio.run(scenario())
+
+
+def test_chat_history_and_route_evaluation_hold_session_leases() -> None:
+    async def scenario() -> None:
+        lease_events: list[str] = []
+
+        class SessionLifecycle:
+            @asynccontextmanager
+            async def lease(self, session_id: str):
+                lease_events.append(f"acquire:{session_id}")
+                try:
+                    yield
+                finally:
+                    lease_events.append(f"release:{session_id}")
+
+        class ConversationStore(FakeConversationStore):
+            async def get(self, session_id: str):
+                return SimpleNamespace(session_id=session_id)
+
+        class Selector:
+            async def select(self, message, request_context):
+                del message, request_context
+                return SkillSelection("builtin/clarify", {}, "needs_clarification")
+
+        runtime = FakeRuntime()
+        runtime.selector = Selector()
+        service = ChatService(
+            ConversationStore(),
+            FakeContextBuilder(),
+            runtime,
+            session_lifecycle=SessionLifecycle(),
+        )
+
+        conversation, messages = await service.history("session-1")
+        assert conversation.session_id == "session-1"
+        assert messages == ()
+        selected = await service.select_route_only("session-1", "help")
+        assert selected.skill_id == "builtin/clarify"
+        assert lease_events == [
+            "acquire:session-1",
+            "release:session-1",
+            "acquire:session-1",
+            "release:session-1",
+        ]
 
     asyncio.run(scenario())

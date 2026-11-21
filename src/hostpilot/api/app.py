@@ -124,6 +124,8 @@ from hostpilot.persistence import (
     RoutingModelConfiguration,
     RoutingModelConfigurationStore,
     RoutingModelConfigurationStoreFactory,
+    SessionLifecycleStoreFactory,
+    SessionUnavailableError,
     SkillExecutionMode,
     SkillExecutionStore,
     SkillExecutionStoreFactory,
@@ -134,6 +136,7 @@ from hostpilot.persistence import (
     SQLiteMCPConfigurationStore,
     SQLiteModelConfigurationStore,
     SQLiteRoutingModelConfigurationStore,
+    SQLiteSessionLifecycleStore,
     SQLiteSkillExecutionStore,
     SQLiteTaskStore,
     SQLiteTraceStore,
@@ -1555,7 +1558,7 @@ async def chat_websocket(websocket: WebSocket) -> None:
                         _set_runtime_sandbox_mode(websocket.scope["app"], None)
             except RequestTooLargeError:
                 code = "message_too_large"
-            except (ConversationNotFoundError, ValueError):
+            except (ConversationNotFoundError, SessionUnavailableError, ValueError):
                 code = "conversation_not_found"
             except BudgetExceededError:
                 code = "budget_exceeded"
@@ -1608,7 +1611,15 @@ async def create_conversation(
 ) -> ConversationSummary:
     """Create an isolated conversation ID for the local user."""
     store: ConversationStore = request.app.state.conversations
-    return await store.create(body.title)
+    conversation = await store.create(body.title)
+    try:
+        await request.app.state.runtime_host.context.sessions.register_session(
+            conversation.session_id
+        )
+    except BaseException:
+        await store.delete(conversation.session_id)
+        raise
+    return conversation
 
 
 @router.get(
@@ -1634,8 +1645,9 @@ async def get_conversation(
     """Return metadata for one conversation."""
     store: ConversationStore = request.app.state.conversations
     try:
-        conversation = await store.get(session_id)
-    except ValueError as error:
+        async with request.app.state.runtime_host.context.sessions.lease(session_id):
+            conversation = await store.get(session_id)
+    except (ValueError, SessionUnavailableError) as error:
         raise HTTPException(status_code=404, detail="Conversation not found.") from error
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found.")
@@ -1653,6 +1665,17 @@ async def upgrade_conversation_sandbox(
     request: Request,
 ) -> ConversationSummary:
     """Persist one user-approved privilege increase and audit the transition."""
+    try:
+        async with request.app.state.runtime_host.context.sessions.lease(session_id):
+            return await _upgrade_conversation_sandbox(request, session_id, body.target_mode)
+    except SessionUnavailableError as error:
+        raise HTTPException(status_code=404, detail="Conversation not found.") from error
+
+
+async def _upgrade_conversation_sandbox(
+    request: Request, session_id: str, target_mode: SandboxMode
+) -> ConversationSummary:
+    """Apply and audit a SandboxMode upgrade while the Session lease is held."""
     store: ConversationStore = request.app.state.conversations
     async with request.app.state.model_components_lock:
         try:
@@ -1661,7 +1684,7 @@ async def upgrade_conversation_sandbox(
             raise HTTPException(status_code=404, detail="Conversation not found.") from error
         if current is None:
             raise HTTPException(status_code=404, detail="Conversation not found.")
-        if body.target_mode.rank <= current.sandbox_mode.rank:
+        if target_mode.rank <= current.sandbox_mode.rank:
             request.app.state.audit_sink.record(
                 AuditEvent(
                     action="sandbox.upgrade",
@@ -1676,7 +1699,7 @@ async def upgrade_conversation_sandbox(
                 detail="会话沙箱级别只能向上升级，不能降级或重复升级。",
             )
         try:
-            upgraded = await store.upgrade_sandbox_mode(current.session_id, body.target_mode)
+            upgraded = await store.upgrade_sandbox_mode(current.session_id, target_mode)
         except ConversationNotFoundError as error:
             raise HTTPException(status_code=404, detail="Conversation not found.") from error
         except ValueError as error:
@@ -1709,17 +1732,21 @@ async def delete_conversation(session_id: str, request: Request) -> Response:
     store: ConversationStore = request.app.state.conversations
     memory: MemoryStore = request.app.state.memory
     checkpointer = request.app.state.checkpointer
-    try:
-        conversation = await store.get(session_id)
-    except ValueError as error:
-        raise HTTPException(status_code=404, detail="Conversation not found.") from error
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found.")
 
-    await checkpointer.adelete_thread(conversation.session_id)
-    await store.delete(conversation.session_id)
-    memory.delete_session_summary(conversation.session_id)
-    await request.app.state.memory_review.remove_for_conversation(conversation.session_id)
+    async def cleanup() -> None:
+        await checkpointer.adelete_thread(session_id)
+        await store.delete(session_id)
+        memory.delete_session_summary(session_id)
+        await request.app.state.memory_review.remove_for_conversation(session_id)
+
+    try:
+        deleted = await request.app.state.runtime_host.context.sessions.close_session(
+            session_id, cleanup
+        )
+    except SessionUnavailableError as error:
+        raise HTTPException(status_code=404, detail="Conversation not found.") from error
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -1831,7 +1858,7 @@ async def send_message(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Agent response failed output validation.",
         ) from error
-    except (ConversationNotFoundError, ValueError) as error:
+    except (ConversationNotFoundError, SessionUnavailableError, ValueError) as error:
         raise HTTPException(status_code=404, detail="Conversation not found.") from error
     except BudgetExceededError as error:
         raise HTTPException(
@@ -1930,7 +1957,7 @@ async def evaluate_conversation_route(
             )
     except RequestTooLargeError as error:
         raise HTTPException(status_code=413, detail=str(error)) from error
-    except (ConversationNotFoundError, ValueError) as error:
+    except (ConversationNotFoundError, SessionUnavailableError, ValueError) as error:
         raise HTTPException(status_code=404, detail="Conversation not found.") from error
     except BudgetExceededError as error:
         raise HTTPException(
@@ -1992,6 +2019,7 @@ def create_app(
     conversation_store_factory: ConversationStoreFactory | None = None,
     turn_store_factory: TurnStoreFactory | None = None,
     task_store_factory: TaskStoreFactory | None = None,
+    session_store_factory: SessionLifecycleStoreFactory | None = None,
     checkpointer_factory: CheckpointerFactory | None = None,
     model_configuration_store_factory: ModelConfigurationStoreFactory | None = None,
     routing_model_configuration_store_factory: RoutingModelConfigurationStoreFactory | None = None,
@@ -2284,6 +2312,7 @@ def create_app(
                 trace_sink=trace_store,
                 turn_lifecycle=runtime_context.turns,
                 task_lifecycle=runtime_context.tasks,
+                session_lifecycle=runtime_context.sessions,
             )
 
         def hosted_chat_agent_runtime() -> ChatAgentRuntime:
@@ -3171,6 +3200,7 @@ def create_app(
             (checkpointer_factory or open_sqlite_checkpointer)(database_path),
             turn_store_factory=turn_store_factory or SQLiteTurnStore,
             task_store_factory=task_store_factory or SQLiteTaskStore,
+            session_store_factory=session_store_factory or SQLiteSessionLifecycleStore,
         )
         chat_agent_runtime_plugin = ChatAgentRuntimeHostPlugin()
         runtime_host.register_plugin(configuration_plugin)

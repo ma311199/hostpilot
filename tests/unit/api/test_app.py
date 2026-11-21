@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -903,6 +904,12 @@ def test_local_api_manages_conversations_and_deletes_checkpoints(tmp_path) -> No
         conversation = response.json()
         assert "session_id" in conversation
         assert "conversation_id" not in conversation
+        with sqlite3.connect(settings.data_dir / "hostpilot.sqlite3") as connection:
+            state = connection.execute(
+                "SELECT state FROM runtime_sessions WHERE session_id = ?",
+                (conversation["session_id"],),
+            ).fetchone()
+        assert state == ("active",)
 
         listed = client.get("/api/v1/conversations")
         assert [item["session_id"] for item in listed.json()] == [conversation["session_id"]]
@@ -910,7 +917,40 @@ def test_local_api_manages_conversations_and_deletes_checkpoints(tmp_path) -> No
 
         deleted = client.delete(f"/api/v1/conversations/{conversation['session_id']}")
         assert deleted.status_code == 204
+        with sqlite3.connect(settings.data_dir / "hostpilot.sqlite3") as connection:
+            state = connection.execute(
+                "SELECT state FROM runtime_sessions WHERE session_id = ?",
+                (conversation["session_id"],),
+            ).fetchone()
+        assert state == ("deleted",)
         assert client.get("/api/v1/conversations").json() == []
+
+
+def test_single_session_metadata_read_rejects_a_closing_session(tmp_path) -> None:
+    from contextlib import asynccontextmanager
+
+    from hostpilot.persistence import SessionUnavailableError
+
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+
+    with TestClient(create_app(settings)) as client:
+        conversation = client.post("/api/v1/conversations", json={}).json()
+
+        @asynccontextmanager
+        async def reject_session_lease(session_id: str):
+            del session_id
+            raise SessionUnavailableError("Session is closing or unavailable.")
+            yield
+
+        client.app.state.runtime_host.context.sessions.lease = reject_session_lease
+        response = client.get(f"/api/v1/conversations/{conversation['session_id']}")
+        upgrade = client.post(
+            f"/api/v1/conversations/{conversation['session_id']}/sandbox/upgrade",
+            json={"target_mode": SandboxMode.WORKSPACE_WRITE.value},
+        )
+
+    assert response.status_code == 404
+    assert upgrade.status_code == 404
 
 
 def test_conversation_sandbox_upgrade_is_monotonic_and_audited(tmp_path) -> None:

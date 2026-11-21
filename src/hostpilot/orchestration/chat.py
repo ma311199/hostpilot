@@ -36,7 +36,12 @@ from hostpilot.orchestration.runtime import ChatAgentRuntime
 from hostpilot.output import OutputProcessor
 from hostpilot.persistence import ConversationStore
 from hostpilot.routing import DirectRouter, Router
-from hostpilot.runtime import RequestContext, TaskLifecycleManager, TurnLifecycleManager
+from hostpilot.runtime import (
+    RequestContext,
+    SessionLifecycleManager,
+    TaskLifecycleManager,
+    TurnLifecycleManager,
+)
 from hostpilot.tools.executor import AsyncConfirmationProvider
 
 
@@ -86,6 +91,7 @@ class ChatService:
         trace_sink: TraceSink | None = None,
         turn_lifecycle: TurnLifecycleManager | None = None,
         task_lifecycle: TaskLifecycleManager | None = None,
+        session_lifecycle: SessionLifecycleManager | None = None,
     ) -> None:
         self.conversations = conversations
         self.context_builder = context_builder
@@ -104,6 +110,7 @@ class ChatService:
         self.trace_sink = trace_sink
         self.turn_lifecycle = turn_lifecycle
         self.task_lifecycle = task_lifecycle
+        self.session_lifecycle = session_lifecycle
 
     async def send(
         self,
@@ -115,6 +122,21 @@ class ChatService:
         """Run one chat turn and update the session activity timestamp."""
         if len(message) > self.max_request_chars:
             raise RequestTooLargeError("Message exceeds the configured request size limit.")
+        async with _lease_session(self.session_lifecycle, session_id):
+            return await self._send_leased(
+                session_id,
+                message,
+                confirmation_provider=confirmation_provider,
+            )
+
+    async def _send_leased(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        confirmation_provider: AsyncConfirmationProvider | None,
+    ) -> ChatTurnResult:
+        """Run chat after the caller has acquired its Session operation lease."""
         async with _lease_runtime(self.runtime) as runtime:
             started_at = perf_counter()
             budget = RequestBudget.start(BudgetContext(limits=self.budget_limits))
@@ -233,6 +255,25 @@ class ChatService:
         """Run top-level routing without invoking a Skill executor or any tool."""
         if len(message) > self.max_request_chars:
             raise RequestTooLargeError("Message exceeds the configured request size limit.")
+        async with _lease_session(self.session_lifecycle, session_id):
+            return await self._select_route_only_leased(
+                session_id,
+                message,
+                evaluation_messages=evaluation_messages,
+                evaluation_session_summary=evaluation_session_summary,
+                evaluation_long_term_memory=evaluation_long_term_memory,
+            )
+
+    async def _select_route_only_leased(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        evaluation_messages: tuple[ConversationMessage, ...] | None,
+        evaluation_session_summary: str | None,
+        evaluation_long_term_memory: str | None,
+    ) -> RouteSelectionResult:
+        """Run route evaluation after acquiring the Session operation lease."""
         async with _lease_runtime(self.runtime) as runtime:
             budget = RequestBudget.start(BudgetContext(limits=self.budget_limits))
             async with asyncio.timeout(self.budget_limits.timeout_seconds):
@@ -318,12 +359,13 @@ class ChatService:
         self, session_id: str
     ) -> tuple[ConversationSummary, tuple[ConversationMessage, ...]]:
         """Return one session's messages and metadata."""
-        conversation = await self.conversations.get(session_id)
-        if conversation is None:
-            raise ConversationNotFoundError(session_id)
-        async with _lease_runtime(self.runtime) as runtime:
-            messages = await runtime.read_messages(session_id)
-        return conversation, messages
+        async with _lease_session(self.session_lifecycle, session_id):
+            conversation = await self.conversations.get(session_id)
+            if conversation is None:
+                raise ConversationNotFoundError(session_id)
+            async with _lease_runtime(self.runtime) as runtime:
+                messages = await runtime.read_messages(session_id)
+            return conversation, messages
 
 
 class UnsupportedRouteError(RuntimeError):
@@ -339,6 +381,18 @@ async def _lease_runtime(runtime: ChatAgentRuntime) -> AsyncIterator[ChatAgentRu
             yield cast(ChatAgentRuntime, leased_runtime)
         return
     yield runtime
+
+
+@asynccontextmanager
+async def _lease_session(
+    lifecycle: SessionLifecycleManager | None, session_id: str
+) -> AsyncIterator[None]:
+    """Use a Session operation lease when the Runtime provider is configured."""
+    if lifecycle is None:
+        yield
+        return
+    async with lifecycle.lease(session_id):
+        yield
 
 
 def _selected_route(skill_id: str) -> Route:

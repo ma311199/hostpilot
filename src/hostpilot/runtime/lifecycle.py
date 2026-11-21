@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
-    from hostpilot.persistence.ports import TaskStore, TurnStore
+    from hostpilot.persistence.ports import SessionLifecycleStore, TaskStore, TurnStore
 
 
 class TurnState(StrEnum):
@@ -164,6 +164,130 @@ class TurnLifecycleManager:
             ]
             if failures:
                 raise failures[0]
+
+
+class SessionLifecycleManager:
+    """Coordinate Runtime-owned Session operations and cross-Host deletion."""
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        poll_interval_seconds: float = 0.05,
+    ) -> None:
+        if poll_interval_seconds <= 0:
+            raise ValueError("Session lifecycle polling interval must be positive.")
+        self._condition = asyncio.Condition()
+        self._close_lock = asyncio.Lock()
+        self._store: SessionLifecycleStore | None = None
+        self._runtime_host_id: str | None = None
+        self._clock = clock
+        self._poll_interval_seconds = poll_interval_seconds
+        self._active_operations = 0
+        self._closing = False
+        self._closed = False
+
+    def configure_persistence(self, store: SessionLifecycleStore, runtime_host_id: str) -> None:
+        """Bind durable state before the Runtime Host accepts requests."""
+        if self._active_operations:
+            raise RuntimeError("Session persistence cannot change during active operations.")
+        if self._store is not None:
+            raise RuntimeError("Session persistence is already configured.")
+        if not runtime_host_id or runtime_host_id.strip() != runtime_host_id:
+            raise ValueError("Runtime Host ID must be non-empty and trimmed.")
+        self._store = store
+        self._runtime_host_id = runtime_host_id
+
+    async def register_session(self, session_id: str) -> None:
+        """Register a Session with the injected persistence provider."""
+        store, _ = self._require_persistence()
+        async with self._condition:
+            self._ensure_accepting()
+            self._active_operations += 1
+        try:
+            await store.register_session(session_id)
+        finally:
+            await self._finish_operation()
+
+    @asynccontextmanager
+    async def lease(self, session_id: str) -> AsyncIterator[None]:
+        """Hold a durable Session lease for one complete Runtime operation."""
+        store, host_id = self._require_persistence()
+        lease_id = str(uuid4())
+        async with self._condition:
+            self._ensure_accepting()
+            self._active_operations += 1
+        acquired = False
+        try:
+            await store.acquire_lease(session_id, lease_id, host_id, self._clock())
+            acquired = True
+            yield
+        finally:
+            try:
+                if acquired:
+                    await store.release_lease(lease_id, host_id)
+            finally:
+                await self._finish_operation()
+
+    async def close_session(self, session_id: str, cleanup: Callable[[], Awaitable[None]]) -> bool:
+        """Reject new leases, drain active work, then run retryable cleanup once."""
+        store, host_id = self._require_persistence()
+        async with self._condition:
+            self._ensure_accepting()
+            self._active_operations += 1
+        try:
+            async with self._close_lock:
+                waited_for_close = False
+                while True:
+                    claim = await store.begin_close(session_id, host_id)
+                    if claim is None:
+                        return waited_for_close
+                    if claim:
+                        break
+                    waited_for_close = True
+                    await asyncio.sleep(self._poll_interval_seconds)
+
+                try:
+                    while await store.active_lease_count(session_id, self._clock()):
+                        await asyncio.sleep(self._poll_interval_seconds)
+                    await cleanup()
+                    await store.finish_delete(session_id)
+                    return True
+                except BaseException:
+                    await store.release_close_claim(session_id, host_id)
+                    raise
+        finally:
+            await self._finish_operation()
+
+    async def begin_shutdown(self) -> None:
+        """Reject new Session operations before Runtime Host cancellation begins."""
+        async with self._condition:
+            self._closing = True
+
+    async def aclose(self) -> None:
+        """Reject new operations and drain local leases before Host ownership ends."""
+        async with self._condition:
+            self._closing = True
+            while self._active_operations:
+                await self._condition.wait()
+            self._closed = True
+
+    def _require_persistence(self) -> tuple[SessionLifecycleStore, str]:
+        store = self._store
+        host_id = self._runtime_host_id
+        if store is None or host_id is None:
+            raise RuntimeError("Session lifecycle persistence is not configured.")
+        return store, host_id
+
+    def _ensure_accepting(self) -> None:
+        if self._closing or self._closed:
+            raise RuntimeError("Session lifecycle manager is shutting down.")
+
+    async def _finish_operation(self) -> None:
+        async with self._condition:
+            self._active_operations -= 1
+            if self._active_operations == 0:
+                self._condition.notify_all()
 
 
 @dataclass

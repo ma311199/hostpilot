@@ -1,7 +1,9 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from hostpilot.persistence import SQLiteSessionLifecycleStore, SQLiteTurnStore
 from hostpilot.runtime import (
     RuntimeContext,
     RuntimeHost,
@@ -146,6 +148,66 @@ def test_host_rejects_agent_leases_before_cancelling_active_turns() -> None:
         return turn.cancelled(), agent.close_calls
 
     assert asyncio.run(scenario()) == (True, 1)
+
+
+def test_host_drains_session_leases_before_state_plugin_releases_host(tmp_path) -> None:
+    async def scenario() -> tuple[bool, bool]:
+        database_path = tmp_path / "runtime.sqlite3"
+        context = RuntimeContext()
+        host = RuntimeHost(context)
+        released_host = asyncio.Event()
+
+        class SessionStatePlugin(RecordingPlugin):
+            async def setup(self, plugin_context: RuntimeContext) -> None:
+                self.host_store = SQLiteTurnStore(database_path)
+                self.session_store = SQLiteSessionLifecycleStore(database_path)
+                await self.host_store.initialize()
+                await self.session_store.initialize()
+                await self.session_store.register_session("session-1")
+
+            async def start(self, plugin_context: RuntimeContext) -> None:
+                now = datetime.now(UTC)
+                await self.host_store.register_host(
+                    plugin_context.runtime_host_id,
+                    now=now,
+                    lease_expires_at=now + timedelta(minutes=1),
+                )
+                plugin_context.sessions.configure_persistence(
+                    self.session_store, plugin_context.runtime_host_id
+                )
+
+            async def stop(self, plugin_context: RuntimeContext) -> None:
+                await self.host_store.release_host(
+                    plugin_context.runtime_host_id, now=datetime.now(UTC)
+                )
+                released_host.set()
+
+        host.register_plugin(SessionStatePlugin("state", []))
+        await host.start()
+        lease_started = asyncio.Event()
+        release_lease = asyncio.Event()
+
+        async def hold_session() -> None:
+            async with context.sessions.lease("session-1"):
+                lease_started.set()
+                await release_lease.wait()
+
+        operation = asyncio.create_task(hold_session())
+        await lease_started.wait()
+        closing = asyncio.create_task(host.close())
+        await asyncio.sleep(0.02)
+
+        assert not released_host.is_set()
+        with pytest.raises(RuntimeError, match="shutting down"):
+            async with context.sessions.lease("session-1"):
+                pytest.fail("Host shutdown must reject new Session leases")
+
+        release_lease.set()
+        await operation
+        await closing
+        return released_host.is_set(), closing.done()
+
+    assert asyncio.run(scenario()) == (True, True)
 
 
 def test_host_starts_by_dependency_and_stops_in_reverse_order() -> None:
