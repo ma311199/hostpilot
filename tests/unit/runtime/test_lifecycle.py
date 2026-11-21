@@ -1,18 +1,20 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from hostpilot.persistence import SQLiteTurnStore
 from hostpilot.runtime import RuntimeContext, RuntimeHost, TurnLifecycleManager, TurnState
 
 
 def test_turn_manager_records_completed_and_failed_turns() -> None:
     async def scenario() -> TurnLifecycleManager:
         manager = TurnLifecycleManager()
-        with manager.track("turn-ok", "session-1"):
+        async with manager.track("turn-ok", "session-1"):
             assert manager.active_turns[0].state is TurnState.RUNNING
 
         with pytest.raises(ValueError, match="expected"):
-            with manager.track("turn-failed", "session-1"):
+            async with manager.track("turn-failed", "session-1"):
                 raise ValueError("expected")
         return manager
 
@@ -29,7 +31,7 @@ def test_turn_manager_cancels_turns_by_session() -> None:
         started = asyncio.Event()
 
         async def run_turn(turn_id: str, session_id: str) -> None:
-            with manager.track(turn_id, session_id):
+            async with manager.track(turn_id, session_id):
                 started.set()
                 await asyncio.Event().wait()
 
@@ -52,7 +54,7 @@ def test_host_shutdown_cancels_active_turns_before_stopping_plugins() -> None:
         started = asyncio.Event()
 
         async def run_turn() -> None:
-            with context.turns.track("turn-1", "session-1"):
+            async with context.turns.track("turn-1", "session-1"):
                 started.set()
                 await asyncio.Event().wait()
 
@@ -66,3 +68,111 @@ def test_host_shutdown_cancels_active_turns_before_stopping_plugins() -> None:
     assert task.cancelled()
     assert context.turns.active_turns == ()
     assert context.turns.history[0].state is TurnState.CANCELLED
+
+
+def test_turn_manager_persists_lifecycle_transitions(tmp_path) -> None:
+    async def scenario():
+        store = SQLiteTurnStore(tmp_path / "runtime.sqlite3")
+        await store.initialize()
+        await store.register_host(
+            "host-1",
+            now=datetime.now(UTC),
+            lease_expires_at=datetime.now(UTC) + timedelta(seconds=30),
+        )
+        manager = TurnLifecycleManager(store=store, runtime_host_id="host-1")
+        async with manager.track("turn-ok", "session-1"):
+            assert (await store.list_turns())[0].state == "running"
+        with pytest.raises(ValueError, match="expected"):
+            async with manager.track("turn-failed", "session-1"):
+                raise ValueError("expected")
+
+        started = asyncio.Event()
+
+        async def run_cancelled_turn() -> None:
+            async with manager.track("turn-cancelled", "session-1"):
+                started.set()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(run_cancelled_turn())
+        await started.wait()
+        assert manager.cancel_turn("turn-cancelled")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return manager, await store.list_turns()
+
+    manager, records = asyncio.run(scenario())
+
+    assert [record.state for record in records] == ["completed", "failed", "cancelled"]
+    assert all(record.finished_at is not None for record in records)
+    assert [turn.state for turn in manager.history] == [
+        TurnState.COMPLETED,
+        TurnState.FAILED,
+        TurnState.CANCELLED,
+    ]
+
+
+def test_turn_manager_cleans_active_index_when_terminal_persistence_fails(tmp_path) -> None:
+    async def scenario() -> TurnLifecycleManager:
+        store = SQLiteTurnStore(tmp_path / "runtime.sqlite3")
+        await store.initialize()
+        now = datetime.now(UTC)
+        await store.register_host(
+            "host-1",
+            now=now,
+            lease_expires_at=now + timedelta(seconds=30),
+        )
+
+        class FailingTerminalStore:
+            async def create_turn(self, **kwargs) -> None:
+                await store.create_turn(**kwargs)
+
+            async def finish_turn(self, *args, **kwargs) -> None:
+                del args, kwargs
+                raise OSError("terminal write failed")
+
+        manager = TurnLifecycleManager(store=FailingTerminalStore(), runtime_host_id="host-1")
+        with pytest.raises(OSError, match="terminal write failed"):
+            async with manager.track("turn-1", "session-1"):
+                pass
+        return manager
+
+    manager = asyncio.run(scenario())
+
+    assert manager.active_turns == ()
+    assert manager.history[0].state is TurnState.COMPLETED
+
+
+def test_cancel_all_reports_terminal_persistence_failure(tmp_path) -> None:
+    async def scenario() -> None:
+        store = SQLiteTurnStore(tmp_path / "runtime.sqlite3")
+        await store.initialize()
+        now = datetime.now(UTC)
+        await store.register_host(
+            "host-1",
+            now=now,
+            lease_expires_at=now + timedelta(seconds=30),
+        )
+
+        class FailingTerminalStore:
+            async def create_turn(self, **kwargs) -> None:
+                await store.create_turn(**kwargs)
+
+            async def finish_turn(self, *args, **kwargs) -> None:
+                del args, kwargs
+                raise OSError("terminal write failed")
+
+        manager = TurnLifecycleManager(store=FailingTerminalStore(), runtime_host_id="host-1")
+        started = asyncio.Event()
+
+        async def run_turn() -> None:
+            async with manager.track("turn-1", "session-1"):
+                started.set()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(run_turn())
+        await started.wait()
+        with pytest.raises(OSError, match="terminal write failed"):
+            await manager.cancel_all()
+        assert task.done()
+
+    asyncio.run(scenario())

@@ -135,10 +135,14 @@ from hostpilot.persistence import (
     SQLiteModelConfigurationStore,
     SQLiteRoutingModelConfigurationStore,
     SQLiteSkillExecutionStore,
+    SQLiteTaskStore,
     SQLiteTraceStore,
+    SQLiteTurnStore,
     SQLiteWorkspaceConfigurationStore,
+    TaskStoreFactory,
     TraceStore,
     TraceStoreFactory,
+    TurnStoreFactory,
     WorkspaceConfigurationStore,
     WorkspaceConfigurationStoreFactory,
     open_sqlite_checkpointer,
@@ -1986,6 +1990,8 @@ def create_app(
     chat_agent_runtime_registry: ChatAgentRuntimeRegistry | None = None,
     model_provider_registry: ModelProviderRegistry | None = None,
     conversation_store_factory: ConversationStoreFactory | None = None,
+    turn_store_factory: TurnStoreFactory | None = None,
+    task_store_factory: TaskStoreFactory | None = None,
     checkpointer_factory: CheckpointerFactory | None = None,
     model_configuration_store_factory: ModelConfigurationStoreFactory | None = None,
     routing_model_configuration_store_factory: RoutingModelConfigurationStoreFactory | None = None,
@@ -2277,6 +2283,7 @@ def create_app(
                 output_processor=OutputProcessor(max_chars=app_settings.max_response_chars),
                 trace_sink=trace_store,
                 turn_lifecycle=runtime_context.turns,
+                task_lifecycle=runtime_context.tasks,
             )
 
         def hosted_chat_agent_runtime() -> ChatAgentRuntime:
@@ -3162,6 +3169,8 @@ def create_app(
             conversation_store_builder,
             database_path,
             (checkpointer_factory or open_sqlite_checkpointer)(database_path),
+            turn_store_factory=turn_store_factory or SQLiteTurnStore,
+            task_store_factory=task_store_factory or SQLiteTaskStore,
         )
         chat_agent_runtime_plugin = ChatAgentRuntimeHostPlugin()
         runtime_host.register_plugin(configuration_plugin)
@@ -3179,6 +3188,11 @@ def create_app(
         application.state.chat_agent_runtime_plugin = chat_agent_runtime_plugin
         try:
             await runtime_host.start()
+            runtime_host.create_task(
+                state_services_plugin.spec.plugin_id,
+                state_services_plugin.heartbeat(runtime_context),
+                name="runtime-host-turn-lease-heartbeat",
+            )
             async with lifespan_body(application):
                 yield
         finally:

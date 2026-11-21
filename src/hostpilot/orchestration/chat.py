@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from contextlib import nullcontext
 from dataclasses import dataclass
 from decimal import Decimal
 from time import perf_counter
@@ -36,7 +35,7 @@ from hostpilot.orchestration.runtime import ChatAgentRuntime
 from hostpilot.output import OutputProcessor
 from hostpilot.persistence import ConversationStore
 from hostpilot.routing import DirectRouter, Router
-from hostpilot.runtime import RequestContext, TurnLifecycleManager
+from hostpilot.runtime import RequestContext, TaskLifecycleManager, TurnLifecycleManager
 from hostpilot.tools.executor import AsyncConfirmationProvider
 
 
@@ -85,6 +84,7 @@ class ChatService:
         cost_sink: CostSink | None = None,
         trace_sink: TraceSink | None = None,
         turn_lifecycle: TurnLifecycleManager | None = None,
+        task_lifecycle: TaskLifecycleManager | None = None,
     ) -> None:
         self.conversations = conversations
         self.context_builder = context_builder
@@ -102,6 +102,7 @@ class ChatService:
         self.cost_sink = cost_sink or StructuredCostSink()
         self.trace_sink = trace_sink
         self.turn_lifecycle = turn_lifecycle
+        self.task_lifecycle = task_lifecycle
 
     async def send(
         self,
@@ -122,13 +123,20 @@ class ChatService:
                 snapshot=context,
                 budget=budget,
                 confirmation_provider=confirmation_provider,
+                task_lifecycle=self.task_lifecycle,
             )
-            tracking = (
-                self.turn_lifecycle.track(request_context.snapshot.request_id, session_id)
-                if self.turn_lifecycle is not None
-                else nullcontext()
-            )
-            with tracking:
+            if self.turn_lifecycle is not None:
+                async with self.turn_lifecycle.track(
+                    request_context.snapshot.request_id,
+                    session_id,
+                ):
+                    return await self._execute_turn(
+                        request_context,
+                        session_id,
+                        message,
+                        started_at,
+                    )
+            else:
                 return await self._execute_turn(
                     request_context,
                     session_id,

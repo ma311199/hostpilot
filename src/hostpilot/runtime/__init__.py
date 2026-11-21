@@ -28,7 +28,15 @@ from hostpilot.runtime.host import (
     RuntimePluginSpec,
     RuntimeServiceRegistry,
 )
-from hostpilot.runtime.lifecycle import TurnLifecycleManager, TurnRecord, TurnState
+from hostpilot.runtime.lifecycle import (
+    TaskLifecycleManager,
+    TaskRecord,
+    TaskRunHandle,
+    TaskState,
+    TurnLifecycleManager,
+    TurnRecord,
+    TurnState,
+)
 
 __all__ = [
     "RuntimeContext",
@@ -56,4 +64,8 @@ __all__ = [
     "TurnLifecycleManager",
     "TurnRecord",
     "TurnState",
+    "TaskLifecycleManager",
+    "TaskRecord",
+    "TaskRunHandle",
+    "TaskState",
 ]

@@ -44,6 +44,55 @@ class RecordingPlugin:
         self.events.append(f"stop:{self.spec.plugin_id}")
 
 
+def test_runtime_context_assigns_distinct_host_ids() -> None:
+    first = RuntimeContext()
+    second = RuntimeContext()
+
+    assert first.runtime_host_id
+    assert first.runtime_host_id != second.runtime_host_id
+
+
+def test_host_closes_plugins_and_reports_turn_store_error_on_shutdown() -> None:
+    async def scenario() -> tuple[list[str], RuntimeHost, asyncio.Task[None]]:
+        events: list[str] = []
+
+        class FailingTurnStore:
+            async def create_turn(self, **kwargs) -> None:
+                del kwargs
+
+            async def finish_turn(self, *args, **kwargs) -> None:
+                del args, kwargs
+                raise OSError("turn terminal persistence failed")
+
+        context = RuntimeContext()
+        context.turns.configure_persistence(FailingTurnStore(), context.runtime_host_id)
+        host = RuntimeHost(context)
+        host.register_plugin(RecordingPlugin("worker", events))
+        await host.start()
+        started = asyncio.Event()
+
+        async def run_turn() -> None:
+            async with context.turns.track("turn-1", "session-1"):
+                started.set()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(run_turn())
+        await started.wait()
+        try:
+            await host.close()
+        except OSError as error:
+            assert str(error) == "turn terminal persistence failed"
+        else:
+            raise AssertionError("Host shutdown must surface terminal persistence errors")
+        return events, host, task
+
+    events, host, task = asyncio.run(scenario())
+
+    assert task.done()
+    assert events[-1] == "stop:worker"
+    assert host.state is RuntimeHostState.STOPPED
+
+
 def test_host_starts_by_dependency_and_stops_in_reverse_order() -> None:
     async def scenario() -> tuple[list[str], RuntimeHost]:
         events: list[str] = []

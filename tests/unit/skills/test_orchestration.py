@@ -1,12 +1,16 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 from typing import Any
+
+import pytest
 
 from hostpilot.budget import RequestBudget
 from hostpilot.contracts import BudgetContext, BudgetLimits, ContextSnapshot, ModelTokenUsage
 from hostpilot.models import ModelMessage, ModelRequest, ModelResponse, ModelRole
 from hostpilot.models.budget import complete_with_budget
 from hostpilot.observability import TraceContext, TraceEvent, trace_context_scope
-from hostpilot.runtime import RequestContext
+from hostpilot.persistence import SQLiteTaskStore, SQLiteTurnStore
+from hostpilot.runtime import RequestContext, TaskLifecycleManager
 from hostpilot.skills.compensation import (
     CompensationRegistry,
     CompensationStatus,
@@ -29,7 +33,11 @@ from hostpilot.skills.runtime import (
 from hostpilot.skills.yaml_registry import SideEffectLevel
 
 
-def request(*, total_tokens: int = 100) -> SkillExecutionRequest:
+def request(
+    *,
+    total_tokens: int = 100,
+    task_lifecycle: TaskLifecycleManager | None = None,
+) -> SkillExecutionRequest:
     return SkillExecutionRequest(
         "builtin/orchestrator_plan",
         {"task_description": "Prepare the requested report"},
@@ -45,6 +53,7 @@ def request(*, total_tokens: int = 100) -> SkillExecutionRequest:
                     )
                 )
             ),
+            task_lifecycle=task_lifecycle,
         ),
     )
 
@@ -711,3 +720,71 @@ def test_replan_failure_preserves_failure_state() -> None:
     assert result.status is SkillExecutionStatus.FAILED
     assert result.output["error_code"] == "replanner_RuntimeError"
     assert result.output["task_results"] == {"first": {"task": "first"}}
+
+
+def test_plan_task_attempts_persist_status_without_reusing_run_ids(tmp_path) -> None:
+    async def scenario():
+        database_path = tmp_path / "runtime.sqlite3"
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        now = datetime.now(UTC)
+        await turns.register_host(
+            "host-1",
+            now=now,
+            lease_expires_at=now + timedelta(seconds=30),
+        )
+        store = SQLiteTaskStore(database_path)
+        lifecycle = TaskLifecycleManager(store=store, runtime_host_id="host-1")
+        plan = ExecutionPlan((task("summarize"),))
+
+        failed_executor = FakeTaskExecutor(fail_first=True)
+        failed = await OrchestratorPlanExecutor(
+            FakePlanner(plan),
+            FakeValidator(),
+            failed_executor,
+            FakeVerifier(),
+            FakeReplanner(),
+            max_replans=0,
+        ).execute(request(task_lifecycle=lifecycle))
+        completed = await OrchestratorPlanExecutor(
+            FakePlanner(plan),
+            FakeValidator(),
+            FakeTaskExecutor(),
+            FakeVerifier(),
+            FakeReplanner(),
+            max_replans=0,
+        ).execute(request(task_lifecycle=lifecycle))
+        return failed, completed, await store.list_task_runs()
+
+    failed, completed, records = asyncio.run(scenario())
+
+    assert failed.status is SkillExecutionStatus.FAILED
+    assert completed.status is SkillExecutionStatus.COMPLETED
+    assert [record.state for record in records] == ["failed", "completed"]
+    assert records[0].task_id == records[1].task_id == "summarize"
+    assert records[0].task_run_id != records[1].task_run_id
+
+
+def test_plan_does_not_call_task_executor_when_task_start_write_fails() -> None:
+    class FailingTaskStore:
+        async def create_task_run(self, **kwargs) -> None:
+            del kwargs
+            raise OSError("task store unavailable")
+
+    async def scenario():
+        task_executor = FakeTaskExecutor()
+        lifecycle = TaskLifecycleManager(store=FailingTaskStore(), runtime_host_id="host-1")
+        executor = OrchestratorPlanExecutor(
+            FakePlanner(ExecutionPlan((task("read_source"),))),
+            FakeValidator(),
+            task_executor,
+            FakeVerifier(),
+            FakeReplanner(),
+            max_replans=0,
+        )
+        with pytest.raises(OSError, match="task store unavailable"):
+            await executor.execute(request(task_lifecycle=lifecycle))
+        return task_executor
+
+    task_executor = asyncio.run(scenario())
+    assert task_executor.calls == []

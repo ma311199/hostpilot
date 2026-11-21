@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from time import perf_counter
@@ -34,6 +35,25 @@ from hostpilot.skills.runtime import (
     SkillExecutionStatus,
     SkillSideEffect,
 )
+
+
+@asynccontextmanager
+async def _task_run_scope(request: SkillExecutionRequest, task: PlanTask) -> AsyncIterator[Any]:
+    """Track the Plan task when ChatService supplied a Runtime lifecycle manager."""
+    lifecycle = request.request_context.task_lifecycle
+    if lifecycle is None:
+        yield None
+        return
+    session_id = request.request_context.snapshot.session_id
+    if session_id is None:
+        raise RuntimeError("Cannot persist a Plan TaskRun without a Session ID.")
+    async with lifecycle.track(
+        task.task_id,
+        request.request_context.snapshot.request_id,
+        session_id,
+    ) as handle:
+        yield handle
+
 
 PLAN_TASK_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
@@ -390,49 +410,52 @@ class OrchestratorPlanExecutor:
                     }
                     async with concurrency_gate:
                         operation_started = False
-                        try:
-                            request.request_context.budget.ensure_available()
-                            operation_started = True
-                            in_flight_operations.add(task_item.task_id)
-                            with trace_context_scope(task_trace):
-                                result = await self.task_executor.execute_task(
-                                    PlanTaskCall(
-                                        request=request,
-                                        task=task_item,
-                                        dependencies=MappingProxyType(dependencies),
-                                        blackboard=board_snapshot,
-                                        idempotency_key=key,
+                        async with _task_run_scope(request, task_item) as task_run:
+                            try:
+                                request.request_context.budget.ensure_available()
+                                operation_started = True
+                                in_flight_operations.add(task_item.task_id)
+                                with trace_context_scope(task_trace):
+                                    result = await self.task_executor.execute_task(
+                                        PlanTaskCall(
+                                            request=request,
+                                            task=task_item,
+                                            dependencies=MappingProxyType(dependencies),
+                                            blackboard=board_snapshot,
+                                            idempotency_key=key,
+                                        )
                                     )
+                            except asyncio.CancelledError:
+                                self._record_task_event(
+                                    task_trace,
+                                    task_item,
+                                    status="interrupted",
+                                    duration_ms=int((perf_counter() - started_at) * 1000),
+                                    reason_code="request_cancelled",
+                                    outcome_uncertain=task_item.task_id in in_flight_operations,
                                 )
-                        except asyncio.CancelledError:
-                            self._record_task_event(
-                                task_trace,
-                                task_item,
-                                status="interrupted",
-                                duration_ms=int((perf_counter() - started_at) * 1000),
-                                reason_code="request_cancelled",
-                                outcome_uncertain=task_item.task_id in in_flight_operations,
-                            )
-                            raise
-                        except BudgetExceededError:
-                            if not operation_started:
+                                raise
+                            except BudgetExceededError:
+                                if not operation_started:
+                                    in_flight_operations.discard(task_item.task_id)
+                                result = PlanTaskResult(False, error_code="budget_exceeded")
+                            except Exception as error:
+                                if not operation_started:
+                                    in_flight_operations.discard(task_item.task_id)
+                                result = PlanTaskResult(False, error_code=type(error).__name__)
+                            else:
                                 in_flight_operations.discard(task_item.task_id)
-                            result = PlanTaskResult(False, error_code="budget_exceeded")
-                        except Exception as error:
-                            if not operation_started:
-                                in_flight_operations.discard(task_item.task_id)
-                            result = PlanTaskResult(False, error_code=type(error).__name__)
-                        else:
-                            in_flight_operations.discard(task_item.task_id)
-                            completed_effects.extend(result.side_effects)
-                    if result.idempotency_key not in {None, key}:
-                        result = PlanTaskResult(
-                            False,
-                            error_code="idempotency_key_mismatch",
-                            side_effects=result.side_effects,
-                            invoked_tool_ids=result.invoked_tool_ids,
-                            idempotency_key=result.idempotency_key,
-                        )
+                                completed_effects.extend(result.side_effects)
+                            if result.idempotency_key not in {None, key}:
+                                result = PlanTaskResult(
+                                    False,
+                                    error_code="idempotency_key_mismatch",
+                                    side_effects=result.side_effects,
+                                    invoked_tool_ids=result.invoked_tool_ids,
+                                    idempotency_key=result.idempotency_key,
+                                )
+                            if task_run is not None and not result.succeeded:
+                                task_run.fail()
                     self._record_task_event(
                         task_trace,
                         task_item,

@@ -9,6 +9,7 @@ from hostpilot.budget import RequestBudget
 from hostpilot.contracts import ContextSnapshot
 
 if TYPE_CHECKING:
+    from hostpilot.runtime.lifecycle import TaskLifecycleManager
     from hostpilot.tools.executor import AsyncConfirmationProvider
 
 
@@ -19,3 +20,4 @@ class RequestContext:
     snapshot: ContextSnapshot
     budget: RequestBudget
     confirmation_provider: AsyncConfirmationProvider | None = None
+    task_lifecycle: TaskLifecycleManager | None = None

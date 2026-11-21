@@ -6,7 +6,7 @@ from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 from hostpilot.contracts import ConversationSummary, MemoryRawArchive, SandboxMode
@@ -45,6 +45,74 @@ class ConversationCheckpointer(Protocol):
     """Checkpoint operations directly required by the conversation API."""
 
     async def adelete_thread(self, thread_id: str) -> None: ...
+
+
+class TurnStore(Protocol):
+    """Persist Turn lifecycle metadata and Runtime Host lease ownership."""
+
+    async def initialize(self) -> None: ...
+
+    async def register_host(
+        self, host_id: str, *, now: datetime, lease_expires_at: datetime
+    ) -> None: ...
+
+    async def heartbeat_host(
+        self, host_id: str, *, now: datetime, lease_expires_at: datetime
+    ) -> bool: ...
+
+    async def release_host(self, host_id: str, *, now: datetime) -> None: ...
+
+    async def create_turn(
+        self,
+        *,
+        turn_id: str,
+        session_id: str,
+        runtime_host_id: str,
+        started_at: datetime,
+    ) -> None: ...
+
+    async def finish_turn(
+        self,
+        turn_id: str,
+        *,
+        runtime_host_id: str,
+        state: Literal["completed", "failed", "cancelled"],
+        finished_at: datetime,
+    ) -> None: ...
+
+
+TurnStoreFactory = Callable[[Path], TurnStore]
+
+
+class TaskStore(Protocol):
+    """Persist payload-free Runtime TaskRun lifecycle metadata."""
+
+    async def initialize(self) -> None: ...
+
+    async def create_task_run(
+        self,
+        *,
+        task_run_id: str,
+        task_id: str,
+        turn_id: str,
+        session_id: str,
+        runtime_host_id: str,
+        started_at: datetime,
+    ) -> None: ...
+
+    async def finish_task_run(
+        self,
+        task_run_id: str,
+        *,
+        runtime_host_id: str,
+        state: Literal["completed", "failed", "cancelled"],
+        finished_at: datetime,
+    ) -> None: ...
+
+    async def interrupt_inactive_host_tasks(self, *, now: datetime) -> int: ...
+
+
+TaskStoreFactory = Callable[[Path], TaskStore]
 
 
 class ModelConfigurationStore(Protocol):
@@ -214,6 +282,10 @@ __all__ = [
     "ConversationCheckpointer",
     "ConversationStore",
     "ConversationStoreFactory",
+    "TurnStore",
+    "TurnStoreFactory",
+    "TaskStore",
+    "TaskStoreFactory",
     "MCPConfigurationStore",
     "MCPConfigurationStoreFactory",
     "HarnessConfigurationStore",
