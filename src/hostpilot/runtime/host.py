@@ -9,7 +9,11 @@ from enum import StrEnum
 from typing import Any, Protocol
 from uuid import uuid4
 
-from hostpilot.runtime.lifecycle import TaskLifecycleManager, TurnLifecycleManager
+from hostpilot.runtime.lifecycle import (
+    AgentLifecycleManager,
+    TaskLifecycleManager,
+    TurnLifecycleManager,
+)
 
 
 class RuntimeHostState(StrEnum):
@@ -81,6 +85,7 @@ class RuntimeContext:
     services: RuntimeServiceRegistry = field(default_factory=RuntimeServiceRegistry)
     shutdown_event: asyncio.Event = field(default_factory=asyncio.Event)
     runtime_host_id: str = field(default_factory=lambda: str(uuid4()))
+    agents: AgentLifecycleManager = field(default_factory=AgentLifecycleManager)
     turns: TurnLifecycleManager = field(default_factory=TurnLifecycleManager)
     tasks: TaskLifecycleManager = field(default_factory=TaskLifecycleManager)
 
@@ -186,11 +191,13 @@ class RuntimeHost:
         if self.state in {RuntimeHostState.STOPPING, RuntimeHostState.STOPPED}:
             return
         if self.state is RuntimeHostState.CREATED:
+            await self.context.agents.begin_shutdown()
             self.context.shutdown_event.set()
             self.state = RuntimeHostState.STOPPED
             return
         self.state = RuntimeHostState.STOPPING
         self.context.shutdown_event.set()
+        await self.context.agents.begin_shutdown()
         try:
             await self.context.turns.cancel_all()
         finally:

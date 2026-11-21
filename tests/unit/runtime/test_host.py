@@ -93,6 +93,61 @@ def test_host_closes_plugins_and_reports_turn_store_error_on_shutdown() -> None:
     assert host.state is RuntimeHostState.STOPPED
 
 
+def test_host_rejects_agent_leases_before_cancelling_active_turns() -> None:
+    async def scenario() -> tuple[bool, int]:
+        class Agent:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            async def aclose(self) -> None:
+                self.close_calls += 1
+
+        class AgentOwnerPlugin(RecordingPlugin):
+            async def stop(self, context: RuntimeContext) -> None:
+                await context.agents.aclose()
+
+        agent = Agent()
+        context = RuntimeContext()
+        await context.agents.replace(agent)
+        host = RuntimeHost(context)
+        host.register_plugin(AgentOwnerPlugin("agent-owner", []))
+        await host.start()
+
+        active_turn_started = asyncio.Event()
+        cancellation_started = asyncio.Event()
+        continue_cancellation = asyncio.Event()
+        original_cancel_all = context.turns.cancel_all
+
+        async def pause_cancellation() -> None:
+            cancellation_started.set()
+            await continue_cancellation.wait()
+            await original_cancel_all()
+
+        context.turns.cancel_all = pause_cancellation
+
+        async def active_turn() -> None:
+            async with context.agents.lease():
+                async with context.turns.track("turn-1", "session-1"):
+                    active_turn_started.set()
+                    await asyncio.Event().wait()
+
+        turn = asyncio.create_task(active_turn())
+        await active_turn_started.wait()
+        closing = asyncio.create_task(host.close())
+        await cancellation_started.wait()
+
+        with pytest.raises(RuntimeError, match="shutting down"):
+            async with context.agents.lease():
+                pytest.fail("Host shutdown must reject new Agent leases immediately")
+        assert agent.close_calls == 0
+
+        continue_cancellation.set()
+        await closing
+        return turn.cancelled(), agent.close_calls
+
+    assert asyncio.run(scenario()) == (True, 1)
+
+
 def test_host_starts_by_dependency_and_stops_in_reverse_order() -> None:
     async def scenario() -> tuple[list[str], RuntimeHost]:
         events: list[str] = []

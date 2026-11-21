@@ -29,6 +29,7 @@ from hostpilot.runtime.host import (
     RuntimeServiceRegistry,
 )
 from hostpilot.runtime.lifecycle import (
+    AgentLifecycleManager,
     TaskLifecycleManager,
     TaskRecord,
     TaskRunHandle,
@@ -54,6 +55,7 @@ __all__ = [
     "DefaultRuntimeExecutionLoop",
     "RuntimeExecutionRequest",
     "RuntimeExecutionResult",
+    "AgentLifecycleManager",
     "RuntimeExecutionStatus",
     "RuntimeModelPort",
     "RuntimeSkillPort",

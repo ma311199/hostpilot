@@ -16,7 +16,12 @@ from hostpilot.orchestration.runtime_plugins import (
     ChatAgentRuntimePluginContext,
     ChatAgentRuntimeRegistry,
 )
-from hostpilot.runtime import RequestContext, RuntimeExecutionResult, RuntimeExecutionStatus
+from hostpilot.runtime import (
+    RequestContext,
+    RuntimeContext,
+    RuntimeExecutionResult,
+    RuntimeExecutionStatus,
+)
 
 
 class FakeChatRuntime:
@@ -173,3 +178,136 @@ def test_chat_agent_runtime_host_plugin_forwards_the_request_context_object() ->
 
     assert response.content == "hello"
     assert runtime.request_context is request_context
+
+
+def test_chat_agent_runtime_host_plugin_uses_runtime_agent_manager_and_closes_on_stop() -> None:
+    class CloseableRuntime(FakeChatRuntime):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    async def scenario() -> None:
+        runtime = CloseableRuntime()
+        plugin = ChatAgentRuntimeHostPlugin(runtime)
+        context = RuntimeContext()
+        await plugin.setup(context)
+        assert context.services.resolve(plugin.service_id) is plugin
+        assert context.agents.current is runtime
+
+        lease_entered = asyncio.Event()
+        release_lease = asyncio.Event()
+
+        async def hold_lease() -> None:
+            async with plugin.lease() as leased_runtime:
+                assert leased_runtime is runtime
+                lease_entered.set()
+                await release_lease.wait()
+
+        active_turn = asyncio.create_task(hold_lease())
+        await lease_entered.wait()
+        stopping = asyncio.create_task(plugin.stop(context))
+        await asyncio.sleep(0)
+        assert not stopping.done()
+        with pytest.raises(RuntimeError, match="shutting down"):
+            async with plugin.lease():
+                pytest.fail("the plugin must reject leases once stopping starts")
+        assert runtime.close_calls == 0
+
+        release_lease.set()
+        await active_turn
+        await stopping
+        assert runtime.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_chat_agent_runtime_host_plugin_forwards_sandbox_mode_to_current_agent() -> None:
+    class SandboxAwareRuntime(FakeChatRuntime):
+        def __init__(self) -> None:
+            self.sandbox_mode = None
+
+        def set_sandbox_mode(self, mode) -> None:
+            self.sandbox_mode = mode
+
+    from hostpilot.contracts import SandboxMode
+
+    runtime = SandboxAwareRuntime()
+    plugin = ChatAgentRuntimeHostPlugin(runtime)
+
+    plugin.set_sandbox_mode(SandboxMode.WORKSPACE_WRITE)
+
+    assert runtime.sandbox_mode is SandboxMode.WORKSPACE_WRITE
+
+
+def test_chat_agent_runtime_host_plugin_forwards_sandbox_mode_to_agent_provider() -> None:
+    from hostpilot.contracts import SandboxMode
+
+    class ToolProvider:
+        def __init__(self) -> None:
+            self.sandbox_mode = None
+
+        def set_sandbox_mode(self, mode) -> None:
+            self.sandbox_mode = mode
+
+    class AgentWithProvider(FakeChatRuntime):
+        def __init__(self) -> None:
+            self.provider = ToolProvider()
+
+    runtime = AgentWithProvider()
+    plugin = ChatAgentRuntimeHostPlugin(runtime)
+
+    plugin.set_sandbox_mode(SandboxMode.WORKSPACE_WRITE)
+
+    assert runtime.provider.sandbox_mode is SandboxMode.WORKSPACE_WRITE
+
+
+def test_chat_agent_runtime_host_plugin_publishes_replacement_while_old_turn_drains() -> None:
+    class CloseableRuntime(FakeChatRuntime):
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    async def scenario() -> tuple[int, int]:
+        old_runtime = CloseableRuntime("old")
+        new_runtime = CloseableRuntime("new")
+        plugin = ChatAgentRuntimeHostPlugin(old_runtime)
+        await plugin.setup(RuntimeContext())
+        lease_entered = asyncio.Event()
+        release_lease = asyncio.Event()
+
+        async def hold_old_turn() -> None:
+            async with plugin.lease() as runtime:
+                assert runtime is old_runtime
+                lease_entered.set()
+                await release_lease.wait()
+
+        old_turn = asyncio.create_task(hold_old_turn())
+        await lease_entered.wait()
+        replacement = asyncio.create_task(plugin.replace(new_runtime))
+
+        async def wait_for_new_generation() -> None:
+            while True:
+                async with plugin.lease() as runtime:
+                    if runtime is new_runtime:
+                        return
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_new_generation(), timeout=1)
+
+        async with plugin.lease() as runtime:
+            assert runtime is new_runtime
+        assert old_runtime.close_calls == 0
+
+        release_lease.set()
+        await old_turn
+        await replacement
+        assert old_runtime.close_calls == 1
+        await plugin.stop(RuntimeContext())
+        return old_runtime.close_calls, new_runtime.close_calls
+
+    assert asyncio.run(scenario()) == (1, 1)

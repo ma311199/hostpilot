@@ -51,14 +51,20 @@ class ContextBuilder:
         self.max_messages = max_messages
         self.max_memory_chars = max_memory_chars
 
-    async def build(self, session_id: str, *, query: str | None = None) -> ContextSnapshot:
+    async def build(
+        self,
+        session_id: str,
+        *,
+        query: str | None = None,
+        state_reader: ConversationStateReader | None = None,
+    ) -> ContextSnapshot:
         """Validate the session, then load bounded history and scoped Markdown memory."""
         conversation = await self.conversations.get(session_id)
         if conversation is None:
             raise ConversationNotFoundError(session_id)
 
         request_id = str(uuid4())
-        messages = await self.runtime.read_messages(conversation.session_id)
+        messages = await (state_reader or self.runtime).read_messages(conversation.session_id)
         chunks = await self.memory.recall(
             session_id=conversation.session_id,
             query=query or (messages[-1].content if messages else "conversation context"),

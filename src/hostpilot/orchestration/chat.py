@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from decimal import Decimal
 from time import perf_counter
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from hostpilot.budget import RequestBudget
@@ -114,30 +115,36 @@ class ChatService:
         """Run one chat turn and update the session activity timestamp."""
         if len(message) > self.max_request_chars:
             raise RequestTooLargeError("Message exceeds the configured request size limit.")
-        started_at = perf_counter()
-        budget = RequestBudget.start(BudgetContext(limits=self.budget_limits))
-        async with asyncio.timeout(self.budget_limits.timeout_seconds):
-            context = await self.context_builder.build(session_id, query=message)
-            context = context.model_copy(update={"budget": budget.snapshot()})
-            request_context = RequestContext(
-                snapshot=context,
-                budget=budget,
-                confirmation_provider=confirmation_provider,
-                task_lifecycle=self.task_lifecycle,
-            )
-            if self.turn_lifecycle is not None:
-                async with self.turn_lifecycle.track(
-                    request_context.snapshot.request_id,
+        async with _lease_runtime(self.runtime) as runtime:
+            started_at = perf_counter()
+            budget = RequestBudget.start(BudgetContext(limits=self.budget_limits))
+            async with asyncio.timeout(self.budget_limits.timeout_seconds):
+                context = await self.context_builder.build(
                     session_id,
-                ):
-                    return await self._execute_turn(
-                        request_context,
+                    query=message,
+                    state_reader=runtime,
+                )
+                context = context.model_copy(update={"budget": budget.snapshot()})
+                request_context = RequestContext(
+                    snapshot=context,
+                    budget=budget,
+                    confirmation_provider=confirmation_provider,
+                    task_lifecycle=self.task_lifecycle,
+                )
+                if self.turn_lifecycle is not None:
+                    async with self.turn_lifecycle.track(
+                        request_context.snapshot.request_id,
                         session_id,
-                        message,
-                        started_at,
-                    )
-            else:
+                    ):
+                        return await self._execute_turn(
+                            runtime,
+                            request_context,
+                            session_id,
+                            message,
+                            started_at,
+                        )
                 return await self._execute_turn(
+                    runtime,
                     request_context,
                     session_id,
                     message,
@@ -146,6 +153,7 @@ class ChatService:
 
     async def _execute_turn(
         self,
+        runtime: ChatAgentRuntime,
         request_context: RequestContext,
         session_id: str,
         message: str,
@@ -164,7 +172,7 @@ class ChatService:
         token_usage = None
         if decision.route is Route.DIRECT:
             with trace_context_scope(request_trace):
-                agent_response = await self.runtime.respond(message, request_context)
+                agent_response = await runtime.respond(message, request_context)
             assistant_message = agent_response.content
             token_usage = agent_response.token_usage
             response_route = agent_response.route or response_route
@@ -182,7 +190,7 @@ class ChatService:
                     budget.consume_tokens(token_usage.total_tokens)
         elif decision.route is Route.CLARIFY:
             assistant_message = decision.clarification_prompt or "Please clarify your request."
-            await self.runtime.record_turn(session_id, message, assistant_message)
+            await runtime.record_turn(session_id, message, assistant_message)
         elif decision.route is Route.TOOL_CALL:
             if self.tool_provider is None or decision.tool_name is None:
                 raise UnsupportedRouteError(decision.route.value)
@@ -193,7 +201,7 @@ class ChatService:
                     budget=budget,
                     confirmation_provider=confirmation_provider,
                 )
-            await self.runtime.record_turn(session_id, message, assistant_message)
+            await runtime.record_turn(session_id, message, assistant_message)
         else:
             raise UnsupportedRouteError(decision.route.value)
         assistant_message = self.output_processor.process(assistant_message)
@@ -225,51 +233,56 @@ class ChatService:
         """Run top-level routing without invoking a Skill executor or any tool."""
         if len(message) > self.max_request_chars:
             raise RequestTooLargeError("Message exceeds the configured request size limit.")
-        budget = RequestBudget.start(BudgetContext(limits=self.budget_limits))
-        async with asyncio.timeout(self.budget_limits.timeout_seconds):
-            context = await self.context_builder.build(session_id, query=message)
-            context_update: dict[str, Any] = {
-                "budget": budget.snapshot(),
-                "session_summary": None,
-                "long_term_memory": None,
-            }
-            if evaluation_messages is not None:
-                context_update.update(
-                    {
-                        "messages": evaluation_messages,
-                        "session_summary": evaluation_session_summary,
-                        "long_term_memory": evaluation_long_term_memory,
-                    }
+        async with _lease_runtime(self.runtime) as runtime:
+            budget = RequestBudget.start(BudgetContext(limits=self.budget_limits))
+            async with asyncio.timeout(self.budget_limits.timeout_seconds):
+                context = await self.context_builder.build(
+                    session_id,
+                    query=message,
+                    state_reader=runtime,
                 )
-            context = context.model_copy(update=context_update)
-            try:
-                request_trace = TraceContext(trace_id=UUID(context.request_id))
-            except ValueError:
-                request_trace = TraceContext()
-            decision = self.router.decide(message, context)
-            if decision.route is Route.CLARIFY:
-                return RouteSelectionResult(
-                    request_id=context.request_id,
-                    route=Route.CLARIFY,
-                    skill_id="builtin/clarify",
-                    reason_code="deterministic_router_clarification",
-                )
-            if decision.route is not Route.DIRECT:
-                raise UnsupportedRouteError(
-                    "route-only evaluation supports selector routes, not direct tool commands"
-                )
-            selector = getattr(self.runtime, "selector", None)
-            if selector is None:
-                raise UnsupportedRouteError("runtime does not expose a Skill selector")
-            with trace_context_scope(request_trace):
-                selection = await selector.select(message, RequestContext(context, budget))
-        return RouteSelectionResult(
-            request_id=context.request_id,
-            route=_selected_route(selection.skill_id),
-            skill_id=selection.skill_id,
-            reason_code=selection.reason_code,
-            token_usage=selection.token_usage,
-        )
+                context_update: dict[str, Any] = {
+                    "budget": budget.snapshot(),
+                    "session_summary": None,
+                    "long_term_memory": None,
+                }
+                if evaluation_messages is not None:
+                    context_update.update(
+                        {
+                            "messages": evaluation_messages,
+                            "session_summary": evaluation_session_summary,
+                            "long_term_memory": evaluation_long_term_memory,
+                        }
+                    )
+                context = context.model_copy(update=context_update)
+                try:
+                    request_trace = TraceContext(trace_id=UUID(context.request_id))
+                except ValueError:
+                    request_trace = TraceContext()
+                decision = self.router.decide(message, context)
+                if decision.route is Route.CLARIFY:
+                    return RouteSelectionResult(
+                        request_id=context.request_id,
+                        route=Route.CLARIFY,
+                        skill_id="builtin/clarify",
+                        reason_code="deterministic_router_clarification",
+                    )
+                if decision.route is not Route.DIRECT:
+                    raise UnsupportedRouteError(
+                        "route-only evaluation supports selector routes, not direct tool commands"
+                    )
+                selector = getattr(runtime, "selector", None)
+                if selector is None:
+                    raise UnsupportedRouteError("runtime does not expose a Skill selector")
+                with trace_context_scope(request_trace):
+                    selection = await selector.select(message, RequestContext(context, budget))
+            return RouteSelectionResult(
+                request_id=context.request_id,
+                route=_selected_route(selection.skill_id),
+                skill_id=selection.skill_id,
+                reason_code=selection.reason_code,
+                token_usage=selection.token_usage,
+            )
 
     def _record_completed_trace(
         self,
@@ -308,12 +321,24 @@ class ChatService:
         conversation = await self.conversations.get(session_id)
         if conversation is None:
             raise ConversationNotFoundError(session_id)
-        messages = await self.runtime.read_messages(session_id)
+        async with _lease_runtime(self.runtime) as runtime:
+            messages = await runtime.read_messages(session_id)
         return conversation, messages
 
 
 class UnsupportedRouteError(RuntimeError):
     """Raised when a route has not yet been connected to an execution path."""
+
+
+@asynccontextmanager
+async def _lease_runtime(runtime: ChatAgentRuntime) -> AsyncIterator[ChatAgentRuntime]:
+    """Use a provider lease for a complete operation when the runtime has one."""
+    lease = getattr(runtime, "lease", None)
+    if callable(lease):
+        async with lease() as leased_runtime:
+            yield cast(ChatAgentRuntime, leased_runtime)
+        return
+    yield runtime
 
 
 def _selected_route(skill_id: str) -> Route:

@@ -93,6 +93,7 @@ src/hostpilot/plugins/
 - Runtime Tool Invocation Coordinator 验证：治理/MCP/API 回归（排除已知沙箱失败）**96 项通过**；Ruff 检查/格式和 `src/hostpilot/tools` 定向 mypy 通过。全量测试 **490 项通过、1 项失败**，唯一失败仍是隔离文件沙箱写 pytest 临时目录的 `verification_failed`。详见[Runtime Turn 与工具调用协调器报告](../test-results/2026-11-18-runtime-turn-lifecycle.md)。
 - 命名与会话 ID 后续统一：进程宿主继续使用 `RuntimeHost`/`RuntimeContext`；聊天执行契约为 `ChatAgentRuntime`，Skill 执行核心为 `SkillEngine`，模型组件与注册表为 `ModelRuntimeComponents`/`ModelProviderRegistry`。会话标识在 Python、HTTP、WebSocket、前端与 SQLite 中统一为 `session_id`，Conversation 资源名称和 `/conversations` 路径不变。SQLite schema v2 到 v3 原位重命名标识列，保留现有 UUID 与 LangGraph checkpoint thread ID。
 - Turn 与 Plan TaskRun 生命周期持久化：`builtin.state-services` 持有可替换的 `TurnStore`、`TaskStore`，SQLite 记录 Turn/TaskRun 的 ID、Session ID、Runtime Host ID、状态和时间戳。Host 租约以默认 5 秒心跳、30 秒过期窗口协调共享数据库的多个 ASGI worker；启动时将过期 Host，或正常停止后遗留 `running` 状态的 Host，其残留 TaskRun 标记为 `interrupted`。TaskRun 由 Runtime-owned `TaskLifecycleManager` 包裹每个实际 Plan 子任务调用。持久化不包含请求正文、任务输入/输出、工具参数、凭证或异常文本，也不恢复执行游标或自动重放工具；重试会产生新的 Turn/TaskRun。Turn/TaskRun 元数据暂未设置保留期。
+- Chat Agent 实例生命周期已迁入 Runtime：共享 `AgentLifecycleManager` 为每个 Chat Turn 提供单代 Agent 租约，配置刷新会先发布新代供新 Turn 使用，旧代等待在途租约结束后再关闭；Runtime Host 关闭时拒绝新租约并在 Turn 取消、释放租约后关闭当前 Agent。Context 历史读取、响应和 Agent 内部记录均使用同一实例；关闭异常传回替换或 Host 生命周期调用方。Agent 具体创建仍由现有工厂负责，Session 状态机和 Agent 的持久恢复状态仍待后续迁移。
 
 ## 验收标准
 

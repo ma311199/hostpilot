@@ -166,6 +166,106 @@ class TurnLifecycleManager:
                 raise failures[0]
 
 
+@dataclass
+class _AgentGeneration:
+    runtime: object
+    active_leases: int = 0
+
+
+class AgentLifecycleManager:
+    """Lease Chat Agent generations and close them only after active Turns drain."""
+
+    def __init__(self, runtime: object | None = None) -> None:
+        self._condition = asyncio.Condition()
+        self._replacement_lock = asyncio.Lock()
+        self._current = _AgentGeneration(runtime) if runtime is not None else None
+        self._retirements: set[asyncio.Task[None]] = set()
+        self._closing = False
+        self._closed = False
+
+    @property
+    def current(self) -> object | None:
+        """Expose the current generation for synchronous capability inspection."""
+        generation = self._current
+        return generation.runtime if generation is not None else None
+
+    @asynccontextmanager
+    async def lease(self) -> AsyncIterator[object]:
+        """Lease the current Agent generation for one complete request."""
+        async with self._condition:
+            if self._closing:
+                raise RuntimeError("Agent lifecycle manager is shutting down.")
+            generation = self._current
+            if generation is None:
+                raise RuntimeError("The configured Chat Agent is not available.")
+            generation.active_leases += 1
+        try:
+            yield generation.runtime
+        finally:
+            async with self._condition:
+                generation.active_leases -= 1
+                if generation.active_leases == 0:
+                    self._condition.notify_all()
+
+    async def replace(self, runtime: object | None) -> None:
+        """Publish a new Agent immediately, then close the old one after its leases drain."""
+        async with self._replacement_lock:
+            async with self._condition:
+                if self._closing:
+                    raise RuntimeError("Cannot replace an Agent while shutting down.")
+                previous = self._current
+                if previous is not None and previous.runtime is runtime:
+                    return
+                self._current = _AgentGeneration(runtime) if runtime is not None else None
+                retirement = self._start_retirement(previous)
+            if retirement is not None:
+                try:
+                    await asyncio.shield(retirement)
+                except asyncio.CancelledError:
+                    raise
+                finally:
+                    if retirement.done():
+                        self._retirements.discard(retirement)
+
+    async def aclose(self) -> None:
+        """Reject new leases, drain current and retired Agents, then close them once."""
+        async with self._replacement_lock:
+            async with self._condition:
+                if self._closed:
+                    return
+                self._closing = True
+                current = self._current
+                self._current = None
+                self._start_retirement(current)
+                retirements = tuple(self._retirements)
+            results = await asyncio.gather(*retirements, return_exceptions=True)
+            self._closed = True
+            failures = [result for result in results if isinstance(result, BaseException)]
+            if failures:
+                raise failures[0]
+
+    async def begin_shutdown(self) -> None:
+        """Reject new leases before the Host starts cancelling active Turns."""
+        async with self._condition:
+            self._closing = True
+
+    def _start_retirement(self, generation: _AgentGeneration | None) -> asyncio.Task[None] | None:
+        if generation is None:
+            return None
+        task = asyncio.create_task(self._retire(generation))
+        self._retirements.add(task)
+        return task
+
+    async def _retire(self, generation: _AgentGeneration) -> None:
+        async with self._condition:
+            await self._condition.wait_for(lambda: generation.active_leases == 0)
+        close = getattr(generation.runtime, "aclose", None)
+        if callable(close):
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
+
 class TaskState(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
