@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
 
-from hostpilot.contracts import ModelTokenUsage
+from hostpilot.contracts import ModelTokenUsage, ToolSideEffect
 from hostpilot.models import (
     ModelMessage,
     ModelRequest,
@@ -65,6 +65,26 @@ def runtime_tool_call_key(tool_call: ModelToolCall) -> tuple[str, str]:
 RuntimeExecutionMessageSink = Callable[[tuple[ModelMessage, ...]], Awaitable[None]]
 
 
+class RuntimeToolOutcomePort(Protocol):
+    """Persist side-effecting calls until their tool result is checkpointed."""
+
+    async def begin_invocation(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        task_run_id: str | None,
+        tool_call_id: str,
+        tool_name: str,
+    ) -> None: ...
+
+    async def result_checkpointed(self, session_id: str, tool_call_id: str) -> None: ...
+
+    async def claim_resolution(self, session_id: str, tool_call_id: str) -> bool: ...
+
+    async def release_resolution_claim(self, session_id: str, tool_call_id: str) -> None: ...
+
+
 @dataclass(frozen=True)
 class RuntimeExecutionRequest:
     """Input and bounded capabilities for one execution loop invocation."""
@@ -75,6 +95,8 @@ class RuntimeExecutionRequest:
     allowed_tool_ids: frozenset[str] = frozenset()
     max_steps: int = 8
     tool_replays: tuple[RuntimeToolReplay, ...] = ()
+    tool_side_effects: Mapping[str, ToolSideEffect] = field(default_factory=dict)
+    tool_outcomes: RuntimeToolOutcomePort | None = None
     message_sink: RuntimeExecutionMessageSink | None = None
 
     def __post_init__(self) -> None:
@@ -84,10 +106,12 @@ class RuntimeExecutionRequest:
         tools = tuple(self.tools)
         allowed_tool_ids = frozenset(self.allowed_tool_ids)
         tool_replays = tuple(self.tool_replays)
+        tool_side_effects = dict(self.tool_side_effects)
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "allowed_tool_ids", allowed_tool_ids)
         object.__setattr__(self, "tool_replays", tool_replays)
+        object.__setattr__(self, "tool_side_effects", tool_side_effects)
 
         if not messages:
             raise ValueError("Runtime execution requires at least one message.")
@@ -109,6 +133,8 @@ class RuntimeExecutionRequest:
             raise ValueError("Runtime execution allowlist contains an unknown tool ID.")
         if any(not isinstance(replay, RuntimeToolReplay) for replay in tool_replays):
             raise TypeError("Runtime execution tool_replays must use RuntimeToolReplay values.")
+        if any(not isinstance(effect, ToolSideEffect) for effect in tool_side_effects.values()):
+            raise TypeError("Runtime tool side-effect classifications must use ToolSideEffect.")
         if self.message_sink is not None and not callable(self.message_sink):
             raise TypeError("Runtime execution message_sink must be callable or None.")
 
@@ -185,6 +211,7 @@ __all__ = [
     "RuntimeModelPort",
     "RuntimeSkillPort",
     "RuntimeToolReplay",
+    "RuntimeToolOutcomePort",
     "RuntimeToolPort",
     "runtime_tool_call_key",
 ]

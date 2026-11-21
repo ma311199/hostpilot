@@ -13,7 +13,13 @@ from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
-    from hostpilot.persistence.ports import SessionLifecycleStore, TaskStore, TurnStore
+    from hostpilot.persistence.ports import (
+        PendingToolOutcome,
+        SessionLifecycleStore,
+        TaskStore,
+        ToolOutcomeStore,
+        TurnStore,
+    )
 
 
 class TurnState(StrEnum):
@@ -288,6 +294,79 @@ class SessionLifecycleManager:
             self._active_operations -= 1
             if self._active_operations == 0:
                 self._condition.notify_all()
+
+
+class ToolOutcomeLifecycleManager:
+    """Track side-effecting tool results until their checkpoint commit is durable."""
+
+    def __init__(self, *, clock: Callable[[], datetime] = lambda: datetime.now(UTC)) -> None:
+        self._store: ToolOutcomeStore | None = None
+        self._runtime_host_id: str | None = None
+        self._clock = clock
+
+    def configure_persistence(self, store: ToolOutcomeStore, runtime_host_id: str) -> None:
+        """Bind the durable pending-call Store before Runtime readiness."""
+        if self._store is not None:
+            raise RuntimeError("Tool outcome persistence is already configured.")
+        if not runtime_host_id or runtime_host_id.strip() != runtime_host_id:
+            raise ValueError("Runtime Host ID must be non-empty and trimmed.")
+        self._store = store
+        self._runtime_host_id = runtime_host_id
+
+    async def begin_invocation(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        task_run_id: str | None,
+        tool_call_id: str,
+        tool_name: str,
+    ) -> None:
+        """Persist a pending record before dispatching a side-effecting tool."""
+        store, host_id = self._require_persistence()
+        await store.record_pending(
+            session_id=session_id,
+            turn_id=turn_id,
+            task_run_id=task_run_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            runtime_host_id=host_id,
+            now=self._clock(),
+        )
+
+    async def pending(self, session_id: str) -> tuple[PendingToolOutcome, ...]:
+        """Return sanitized pending calls for a Session."""
+        store, _ = self._require_persistence()
+        return await store.list_pending(session_id)
+
+    async def claim_resolution(self, session_id: str, tool_call_id: str) -> bool:
+        """Claim a pending call before applying a human-verified checkpoint result."""
+        store, host_id = self._require_persistence()
+        return await store.claim_resolution(
+            session_id,
+            tool_call_id,
+            runtime_host_id=host_id,
+            now=self._clock(),
+        )
+
+    async def release_resolution_claim(self, session_id: str, tool_call_id: str) -> None:
+        """Keep the Session blocked when checkpoint resolution fails."""
+        store, host_id = self._require_persistence()
+        await store.release_resolution_claim(
+            session_id,
+            tool_call_id,
+            runtime_host_id=host_id,
+        )
+
+    async def result_checkpointed(self, session_id: str, tool_call_id: str) -> None:
+        """Clear a pending call only after its ToolMessage has been persisted."""
+        store, host_id = self._require_persistence()
+        await store.clear_pending(session_id, tool_call_id, runtime_host_id=host_id)
+
+    def _require_persistence(self) -> tuple[ToolOutcomeStore, str]:
+        if self._store is None or self._runtime_host_id is None:
+            raise RuntimeError("Tool outcome persistence is not configured.")
+        return self._store, self._runtime_host_id
 
 
 @dataclass

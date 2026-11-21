@@ -288,6 +288,7 @@ def create_default_chat_agent_runtime_registry() -> ChatAgentRuntimeRegistry:
             LangGraphRuntimeSessionStateAdapter(skill_runtime.graph),
             tools=context.runtime_tool_definitions,
             allowed_tool_ids=context.runtime_allowed_tool_ids,
+            tool_side_effects=context.runtime_tool_side_effects or {},
             skill_runtime=skill_runtime,
         )
 
@@ -397,6 +398,12 @@ def create_configured_chat_agent_runtime(
             tools=tools,
             runtime_execution_loop=runtime_execution_loop,
             runtime_tool_definitions=runtime_tool_definitions,
+            runtime_tool_side_effects={
+                descriptor.name: descriptor.side_effect
+                for descriptor in _tool_descriptors(tool_provider)
+            }
+            if tool_provider is not None
+            else {},
             runtime_allowed_tool_ids=frozenset(
                 definition.name for definition in runtime_tool_definitions
             ),

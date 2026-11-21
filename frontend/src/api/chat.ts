@@ -27,6 +27,17 @@ export interface ChatResponse {
   token_usage: { input_tokens: number; output_tokens: number; total_tokens: number } | null
 }
 
+export interface PendingToolOutcome {
+  tool_call_id: string
+  tool_name: string
+  created_at: string
+  state: 'pending'
+}
+
+export type ToolOutcomeResolution =
+  | { resolution: 'completed'; result_text: string }
+  | { resolution: 'not_applied' }
+
 const defaultApiBaseUrl = 'http://127.0.0.1:8000/api/v1'
 
 function getApiBaseUrl(): string {
@@ -91,5 +102,22 @@ export async function getConversationMessages(
   sessionId: string,
 ): Promise<ConversationHistory> {
   return request<ConversationHistory>(`/conversations/${encodeURIComponent(sessionId)}/messages`)
+}
+
+export function listPendingToolOutcomes(sessionId: string): Promise<PendingToolOutcome[]> {
+  return request<PendingToolOutcome[]>(
+    `/conversations/${encodeURIComponent(sessionId)}/tool-outcomes`,
+  )
+}
+
+export function resolveToolOutcome(
+  sessionId: string,
+  toolCallId: string,
+  resolution: ToolOutcomeResolution,
+): Promise<{ resolved: boolean }> {
+  return request<{ resolved: boolean }>(
+    `/conversations/${encodeURIComponent(sessionId)}/tool-outcomes/${encodeURIComponent(toolCallId)}/resolve`,
+    { method: 'POST', body: JSON.stringify(resolution) },
+  )
 }
 

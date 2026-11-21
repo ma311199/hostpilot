@@ -13,6 +13,7 @@ from hostpilot.runtime.lifecycle import (
     AgentLifecycleManager,
     SessionLifecycleManager,
     TaskLifecycleManager,
+    ToolOutcomeLifecycleManager,
     TurnLifecycleManager,
 )
 
@@ -88,6 +89,7 @@ class RuntimeContext:
     runtime_host_id: str = field(default_factory=lambda: str(uuid4()))
     agents: AgentLifecycleManager = field(default_factory=AgentLifecycleManager)
     sessions: SessionLifecycleManager = field(default_factory=SessionLifecycleManager)
+    tool_outcomes: ToolOutcomeLifecycleManager = field(default_factory=ToolOutcomeLifecycleManager)
     turns: TurnLifecycleManager = field(default_factory=TurnLifecycleManager)
     tasks: TaskLifecycleManager = field(default_factory=TaskLifecycleManager)
 

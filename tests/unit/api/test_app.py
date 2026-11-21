@@ -1529,6 +1529,91 @@ class FakeChatRuntime:
         )
 
 
+class RecoverableFakeChatRuntime(FakeChatRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tool_outcomes = None
+        self.resolution_results: list[tuple[str, str]] = []
+
+    def configure_tool_outcomes(self, lifecycle) -> None:
+        self.tool_outcomes = lifecycle
+
+    async def resolve_tool_outcome(
+        self, session_id: str, tool_call_id: str, *, result_text: str
+    ) -> None:
+        assert self.tool_outcomes is not None
+        if not await self.tool_outcomes.claim_resolution(session_id, tool_call_id):
+            raise ValueError("Tool outcome is missing or is being resolved.")
+        self.resolution_results.append((tool_call_id, result_text))
+        await self.tool_outcomes.result_checkpointed(session_id, tool_call_id)
+
+
+def test_tool_outcome_recovery_api_lists_safe_metadata_and_resolves_call(tmp_path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+    runtime = RecoverableFakeChatRuntime()
+
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
+        conversation = client.post("/api/v1/conversations", json={}).json()
+        session_id = conversation["session_id"]
+        host_context = client.app.state.runtime_host.context
+        asyncio.run(
+            host_context.tool_outcomes.begin_invocation(
+                session_id=session_id,
+                turn_id="turn-1",
+                task_run_id="task-1",
+                tool_call_id="call-secret-free",
+                tool_name="write_text_file",
+            )
+        )
+
+        pending = client.get(f"/api/v1/conversations/{session_id}/tool-outcomes")
+        invalid = client.post(
+            f"/api/v1/conversations/{session_id}/tool-outcomes/call-secret-free/resolve",
+            json={"resolution": "completed", "result_text": "  "},
+        )
+        missing_call = client.post(
+            f"/api/v1/conversations/{session_id}/tool-outcomes/unknown-call/resolve",
+            json={"resolution": "not_applied"},
+        )
+        resolved = client.post(
+            f"/api/v1/conversations/{session_id}/tool-outcomes/call-secret-free/resolve",
+            json={"resolution": "completed", "result_text": "Verified output"},
+        )
+        asyncio.run(
+            host_context.tool_outcomes.begin_invocation(
+                session_id=session_id,
+                turn_id="turn-2",
+                task_run_id=None,
+                tool_call_id="call-not-applied",
+                tool_name="remote_action",
+            )
+        )
+        not_applied = client.post(
+            f"/api/v1/conversations/{session_id}/tool-outcomes/call-not-applied/resolve",
+            json={"resolution": "not_applied"},
+        )
+        remaining = client.get(f"/api/v1/conversations/{session_id}/tool-outcomes")
+        missing_session = client.get("/api/v1/conversations/missing/tool-outcomes")
+
+    assert pending.status_code == 200
+    assert pending.json()[0]["tool_call_id"] == "call-secret-free"
+    assert set(pending.json()[0]) == {"tool_call_id", "tool_name", "created_at", "state"}
+    assert "arguments" not in pending.text
+    assert invalid.status_code == 422
+    assert missing_call.status_code == 404
+    assert resolved.status_code == 200
+    assert not_applied.status_code == 200
+    assert runtime.resolution_results == [
+        ("call-secret-free", "Verified output"),
+        (
+            "call-not-applied",
+            "已核实：原工具调用未执行，未产生副作用；该调用不会自动重放。",
+        ),
+    ]
+    assert remaining.json() == []
+    assert missing_session.status_code == 404
+
+
 def test_app_runtime_host_manages_chat_runtime_lifecycle(tmp_path) -> None:
     from hostpilot.runtime import RuntimeHostState
 

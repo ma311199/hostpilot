@@ -139,10 +139,12 @@ from hostpilot.persistence import (
     SQLiteSessionLifecycleStore,
     SQLiteSkillExecutionStore,
     SQLiteTaskStore,
+    SQLiteToolOutcomeStore,
     SQLiteTraceStore,
     SQLiteTurnStore,
     SQLiteWorkspaceConfigurationStore,
     TaskStoreFactory,
+    ToolOutcomeStoreFactory,
     TraceStore,
     TraceStoreFactory,
     TurnStoreFactory,
@@ -683,6 +685,39 @@ class WorkspaceStatusResponse(BaseModel):
     read_only: bool
     selected: bool = True
     message: str | None = None
+
+
+class PendingToolOutcomeResponse(BaseModel):
+    """Sanitized pending side-effect metadata safe to show in the recovery UI."""
+
+    tool_call_id: str
+    tool_name: str
+    created_at: str
+    state: Literal["pending"] = "pending"
+
+
+class ToolOutcomeResolutionRequest(BaseModel):
+    """User-verified result or an explicit confirmation that no effect occurred."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: Literal["completed", "not_applied"]
+    result_text: str | None = Field(default=None, max_length=32_768)
+
+    @model_validator(mode="after")
+    def validate_resolution_payload(self) -> ToolOutcomeResolutionRequest:
+        if self.resolution == "completed":
+            if self.result_text is None or not self.result_text.strip():
+                raise ValueError("completed resolution requires a non-empty result_text.")
+        elif self.result_text is not None:
+            raise ValueError("not_applied resolution does not accept result_text.")
+        return self
+
+
+class ToolOutcomeResolutionResponse(BaseModel):
+    """Result of one successful manual outcome reconciliation."""
+
+    resolved: bool
 
 
 class AuditEventResponse(BaseModel):
@@ -2007,6 +2042,75 @@ async def get_messages(
     return ConversationHistoryResponse(conversation=conversation, messages=messages)
 
 
+@router.get(
+    "/conversations/{session_id}/tool-outcomes",
+    response_model=tuple[PendingToolOutcomeResponse, ...],
+    tags=["chat", "recovery"],
+)
+async def list_pending_tool_outcomes(
+    session_id: str,
+    request: Request,
+) -> tuple[PendingToolOutcomeResponse, ...]:
+    """List only safe metadata for unresolved side-effecting calls in one Session."""
+    runtime_context = request.app.state.runtime_host.context
+    try:
+        async with runtime_context.sessions.lease(session_id):
+            conversation = await request.app.state.conversations.get(session_id)
+            if conversation is None:
+                raise ConversationNotFoundError(session_id)
+            pending = await runtime_context.tool_outcomes.pending(session_id)
+    except (ConversationNotFoundError, SessionUnavailableError, ValueError) as error:
+        raise HTTPException(status_code=404, detail="Conversation not found.") from error
+    return tuple(
+        PendingToolOutcomeResponse(
+            tool_call_id=item.tool_call_id,
+            tool_name=item.tool_name,
+            created_at=item.created_at.isoformat(),
+        )
+        for item in pending
+    )
+
+
+@router.post(
+    "/conversations/{session_id}/tool-outcomes/{tool_call_id}/resolve",
+    response_model=ToolOutcomeResolutionResponse,
+    tags=["chat", "recovery"],
+)
+async def resolve_pending_tool_outcome(
+    session_id: str,
+    tool_call_id: str,
+    body: ToolOutcomeResolutionRequest,
+    request: Request,
+) -> ToolOutcomeResolutionResponse:
+    """Checkpoint a human-verified result before releasing the Session gate."""
+    runtime_context = request.app.state.runtime_host.context
+    result_text = (
+        body.result_text
+        if body.resolution == "completed"
+        else "已核实：原工具调用未执行，未产生副作用；该调用不会自动重放。"
+    )
+    try:
+        async with runtime_context.sessions.lease(session_id):
+            conversation = await request.app.state.conversations.get(session_id)
+            if conversation is None:
+                raise ConversationNotFoundError(session_id)
+            pending = await runtime_context.tool_outcomes.pending(session_id)
+            if not any(item.tool_call_id == tool_call_id for item in pending):
+                raise HTTPException(status_code=404, detail="Pending tool outcome not found.")
+            runtime = runtime_context.services.resolve(ChatAgentRuntimeHostPlugin.service_id)
+            resolve = getattr(runtime, "resolve_tool_outcome", None)
+            if not callable(resolve):
+                raise RuntimeError("The active Chat Runtime cannot resolve tool outcomes.")
+            await resolve(session_id, tool_call_id, result_text=result_text)
+    except (ConversationNotFoundError, SessionUnavailableError) as error:
+        raise HTTPException(status_code=404, detail="Conversation not found.") from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return ToolOutcomeResolutionResponse(resolved=True)
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -2020,6 +2124,7 @@ def create_app(
     turn_store_factory: TurnStoreFactory | None = None,
     task_store_factory: TaskStoreFactory | None = None,
     session_store_factory: SessionLifecycleStoreFactory | None = None,
+    tool_outcome_store_factory: ToolOutcomeStoreFactory | None = None,
     checkpointer_factory: CheckpointerFactory | None = None,
     model_configuration_store_factory: ModelConfigurationStoreFactory | None = None,
     routing_model_configuration_store_factory: RoutingModelConfigurationStoreFactory | None = None,
@@ -2313,6 +2418,7 @@ def create_app(
                 turn_lifecycle=runtime_context.turns,
                 task_lifecycle=runtime_context.tasks,
                 session_lifecycle=runtime_context.sessions,
+                tool_outcome_lifecycle=runtime_context.tool_outcomes,
             )
 
         def hosted_chat_agent_runtime() -> ChatAgentRuntime:
@@ -3201,6 +3307,7 @@ def create_app(
             turn_store_factory=turn_store_factory or SQLiteTurnStore,
             task_store_factory=task_store_factory or SQLiteTaskStore,
             session_store_factory=session_store_factory or SQLiteSessionLifecycleStore,
+            tool_outcome_store_factory=tool_outcome_store_factory or SQLiteToolOutcomeStore,
         )
         chat_agent_runtime_plugin = ChatAgentRuntimeHostPlugin()
         runtime_host.register_plugin(configuration_plugin)

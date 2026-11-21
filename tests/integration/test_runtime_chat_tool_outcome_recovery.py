@@ -133,7 +133,7 @@ def test_chat_api_retry_clarifies_without_repeating_tool_after_sqlite_checkpoint
     assert failed.status_code == 500
     assert retry.status_code == 200
     assert retry.json()["route"] == "clarify"
-    assert "结果不确定" in retry.json()["assistant_message"]
+    assert "尚未核实" in retry.json()["assistant_message"]
     assert len(tool.calls) == 1
     assert len(model.calls) == 1
     assert len(runtime_instances) == 3

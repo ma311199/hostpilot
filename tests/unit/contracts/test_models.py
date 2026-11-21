@@ -10,6 +10,7 @@ from hostpilot.contracts import (
     ContextSnapshot,
     Evidence,
     EvidenceSet,
+    ExecutionEnvironment,
     MemoryScope,
     MemoryWriteProposal,
     RetrievalToolRequest,
@@ -17,6 +18,11 @@ from hostpilot.contracts import (
     RouteDecision,
     SandboxPolicy,
     SandboxResourceLimits,
+    TimeoutProfile,
+    ToolDescriptor,
+    ToolSideEffect,
+    ToolType,
+    TrustLevel,
 )
 
 
@@ -81,6 +87,23 @@ def test_route_decision_requires_route_specific_fields() -> None:
 def test_retrieval_request_requires_explicit_budget() -> None:
     with pytest.raises(ValidationError):
         RetrievalToolRequest(query="Find the policy", mode="fast")  # type: ignore[call-arg]
+
+
+def test_tool_effect_defaults_to_possible_and_can_mark_a_read_only_tool() -> None:
+    descriptor_args = {
+        "name": "custom_tool",
+        "description": "Custom tool",
+        "tool_type": ToolType.ACTION,
+        "trust_level": TrustLevel.THIRD_PARTY,
+        "execution_env": ExecutionEnvironment.SERVICE,
+        "timeout_profile": TimeoutProfile(timeout_seconds=5),
+    }
+
+    assert ToolDescriptor(**descriptor_args).side_effect is ToolSideEffect.POSSIBLE
+    assert (
+        ToolDescriptor(**descriptor_args, side_effect=ToolSideEffect.NONE).side_effect
+        is ToolSideEffect.NONE
+    )
 
 
 def test_evidence_requires_timezone_aware_retrieval_time() -> None:

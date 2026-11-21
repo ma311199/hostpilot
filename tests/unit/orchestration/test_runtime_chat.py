@@ -12,6 +12,7 @@ from hostpilot.contracts import (
     MessageRole,
     ModelTokenUsage,
     Route,
+    ToolSideEffect,
 )
 from hostpilot.models import (
     ModelMessage,
@@ -78,6 +79,14 @@ class FakeExecutionLoop:
         if request.message_sink is not None and self.result.messages:
             await request.message_sink(self.result.messages)
         return self.result
+
+
+class FakeOutcomeLifecycle:
+    async def begin_invocation(self, **kwargs):
+        del kwargs
+
+    async def result_checkpointed(self, session_id, tool_call_id):
+        del session_id, tool_call_id
 
 
 class FakeSkillRuntime:
@@ -240,6 +249,7 @@ def test_runtime_chat_does_not_repeat_a_completed_tool_after_model_failure() -> 
         state,
         tools=(ModelToolDefinition("write_file", "Write a file", {"type": "object"}),),
     )
+    runtime.configure_tool_outcomes(FakeOutcomeLifecycle())
 
     with pytest.raises(RuntimeError, match="after tool result"):
         asyncio.run(runtime.respond("Write report.txt", request_context()))
@@ -370,6 +380,7 @@ def test_runtime_chat_blocks_recovery_after_side_effect_checkpoint_failure() -> 
         state,
         tools=(definition,),
     )
+    first_runtime.configure_tool_outcomes(FakeOutcomeLifecycle())
 
     with pytest.raises(RuntimeError, match="checkpoint write failure"):
         asyncio.run(first_runtime.respond("Write report.txt", request_context()))
@@ -384,6 +395,7 @@ def test_runtime_chat_blocks_recovery_after_side_effect_checkpoint_failure() -> 
         state,
         tools=(definition,),
     )
+    restarted_runtime.configure_tool_outcomes(FakeOutcomeLifecycle())
     response = asyncio.run(restarted_runtime.respond("Write report.txt", request_context()))
 
     assert response.route is Route.CLARIFY
@@ -391,3 +403,51 @@ def test_runtime_chat_blocks_recovery_after_side_effect_checkpoint_failure() -> 
     assert "核实" in response.content
     assert retry_model.calls == 0
     assert tools.side_effects == 1
+
+
+def test_runtime_chat_retries_interrupted_read_only_tool_call() -> None:
+    state = FakeState()
+    previous_call = ModelToolCall(
+        call_id="read-call-1", name="read_text_file", arguments={"path": "about.txt"}
+    )
+    retry_call = ModelToolCall(
+        call_id="read-call-2", name="read_text_file", arguments={"path": "about.txt"}
+    )
+    state.messages = (
+        ModelMessage(role=ModelRole.USER, content="Read about.txt"),
+        ModelMessage(role=ModelRole.ASSISTANT, content="", tool_calls=(previous_call,)),
+    )
+
+    class ReadToolPort:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, request_context, tool_call):
+            del request_context, tool_call
+            self.calls += 1
+            return "HostPilot"
+
+    tool_port = ReadToolPort()
+
+    class ReadThenFinalModel:
+        def __init__(self) -> None:
+            self.responses = [
+                ModelResponse(text="", tool_calls=(retry_call,)),
+                ModelResponse(text="HostPilot"),
+            ]
+
+        async def complete(self, request_context, request):
+            del request_context, request
+            return self.responses.pop(0)
+
+    runtime = RuntimeChatAgentRuntime(
+        DefaultRuntimeExecutionLoop(ReadThenFinalModel(), tool_port),
+        state,
+        tools=(ModelToolDefinition("read_text_file", "Read a file", {"type": "object"}),),
+        tool_side_effects={"read_text_file": ToolSideEffect.NONE},
+    )
+
+    response = asyncio.run(runtime.respond("Read about.txt", request_context()))
+
+    assert response.content == "HostPilot"
+    assert tool_port.calls == 1

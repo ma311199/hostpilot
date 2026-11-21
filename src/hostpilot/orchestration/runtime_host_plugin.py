@@ -30,6 +30,7 @@ class ChatAgentRuntimeHostPlugin:
 
     def __init__(self, runtime: ChatAgentRuntime | None = None) -> None:
         self._agents = AgentLifecycleManager(runtime)
+        self._tool_outcomes: Any | None = None
 
     @property
     def selector(self) -> Any:
@@ -49,13 +50,20 @@ class ChatAgentRuntimeHostPlugin:
         context.services.register(self.service_id, self, owner=self.spec.plugin_id)
 
     async def start(self, context: RuntimeContext) -> None:
-        del context
+        self._tool_outcomes = context.tool_outcomes
+        runtime = self._agents.current
+        configure = getattr(runtime, "configure_tool_outcomes", None)
+        if callable(configure):
+            configure(self._tool_outcomes)
 
     async def stop(self, context: RuntimeContext) -> None:
         del context
         await self._agents.aclose()
 
     async def replace(self, runtime: ChatAgentRuntime | None) -> None:
+        configure = getattr(runtime, "configure_tool_outcomes", None)
+        if callable(configure) and self._tool_outcomes is not None:
+            configure(self._tool_outcomes)
         await self._agents.replace(runtime)
 
     def set_sandbox_mode(self, mode: SandboxMode | None) -> None:
@@ -99,3 +107,17 @@ class ChatAgentRuntimeHostPlugin:
                 user_message,
                 assistant_message,
             )
+
+    async def resolve_tool_outcome(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        *,
+        result_text: str,
+    ) -> None:
+        """Apply a verified result through the currently leased chat runtime."""
+        async with self._agents.lease() as runtime:
+            resolve = getattr(runtime, "resolve_tool_outcome", None)
+            if not callable(resolve):
+                raise RuntimeError("The active Chat Runtime cannot resolve tool outcomes.")
+            await resolve(session_id, tool_call_id, result_text=result_text)

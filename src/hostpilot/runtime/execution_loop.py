@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from hostpilot.contracts import ModelTokenUsage
+from hostpilot.contracts import ModelTokenUsage, ToolSideEffect
 from hostpilot.models import (
     ModelMessage,
     ModelRequest,
@@ -120,6 +120,7 @@ class DefaultRuntimeExecutionLoop:
             for tool_call in model_response.tool_calls:
                 replay_key = runtime_tool_call_key(tool_call)
                 tool_result: str | None
+                dispatched = False
                 if replay_key in executed_results:
                     tool_result = executed_results[replay_key]
                 elif replay_key in replay_results:
@@ -128,8 +129,30 @@ class DefaultRuntimeExecutionLoop:
                         tool_result = _uncertain_replay_message(tool_call.name)
                 else:
                     request_context.budget.ensure_available()
+                    side_effect = request.tool_side_effects.get(
+                        tool_call.name,
+                        ToolSideEffect.POSSIBLE,
+                    )
+                    if side_effect is ToolSideEffect.POSSIBLE:
+                        if request.tool_outcomes is None:
+                            raise RuntimeError(
+                                "Side-effecting tool execution requires outcome persistence."
+                            )
+                        session_id = request_context.snapshot.session_id
+                        if session_id is None:
+                            raise RuntimeError(
+                                "Side-effecting tool execution requires a Session ID."
+                            )
+                        await request.tool_outcomes.begin_invocation(
+                            session_id=session_id,
+                            turn_id=request_context.snapshot.request_id,
+                            task_run_id=None,
+                            tool_call_id=tool_call.call_id,
+                            tool_name=tool_call.name,
+                        )
                     tool_result = await self.tools.execute(request_context, tool_call)
                     executed_results[replay_key] = tool_result
+                    dispatched = True
                 if not isinstance(tool_result, str):
                     raise TypeError("Runtime Tool Port must return text results.")
                 tool_message = ModelMessage(
@@ -140,6 +163,18 @@ class DefaultRuntimeExecutionLoop:
                 request_messages.append(tool_message)
                 generated_messages.append(tool_message)
                 await _publish_messages(request, (tool_message,))
+                if (
+                    dispatched
+                    and request.tool_side_effects.get(
+                        tool_call.name,
+                        ToolSideEffect.POSSIBLE,
+                    )
+                    is ToolSideEffect.POSSIBLE
+                ):
+                    session_id = request_context.snapshot.session_id
+                    if session_id is None or request.tool_outcomes is None:
+                        raise RuntimeError("Side-effect outcome persistence disappeared mid-turn.")
+                    await request.tool_outcomes.result_checkpointed(session_id, tool_call.call_id)
 
         raise AssertionError("Runtime execution loop exited without a terminal result.")
 

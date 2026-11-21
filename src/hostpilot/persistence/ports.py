@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol
@@ -107,6 +108,55 @@ class SessionLifecycleStore(Protocol):
 
 
 SessionLifecycleStoreFactory = Callable[[Path], SessionLifecycleStore]
+
+
+@dataclass(frozen=True)
+class PendingToolOutcome:
+    """Safe metadata for a tool call whose result is not yet durable."""
+
+    session_id: str
+    turn_id: str
+    task_run_id: str | None
+    tool_call_id: str
+    tool_name: str
+    dispatched_host_id: str
+    created_at: datetime
+    resolving_host_id: str | None = None
+
+
+class ToolOutcomeStore(Protocol):
+    """Persist unresolved side-effecting tool calls until their result is durable."""
+
+    async def initialize(self) -> None: ...
+
+    async def record_pending(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        task_run_id: str | None,
+        tool_call_id: str,
+        tool_name: str,
+        runtime_host_id: str,
+        now: datetime,
+    ) -> None: ...
+
+    async def list_pending(self, session_id: str) -> tuple[PendingToolOutcome, ...]: ...
+
+    async def claim_resolution(
+        self, session_id: str, tool_call_id: str, *, runtime_host_id: str, now: datetime
+    ) -> bool: ...
+
+    async def release_resolution_claim(
+        self, session_id: str, tool_call_id: str, *, runtime_host_id: str
+    ) -> None: ...
+
+    async def clear_pending(
+        self, session_id: str, tool_call_id: str, *, runtime_host_id: str
+    ) -> None: ...
+
+
+ToolOutcomeStoreFactory = Callable[[Path], ToolOutcomeStore]
 
 
 class TaskStore(Protocol):
