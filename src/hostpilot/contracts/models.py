@@ -266,6 +266,15 @@ class ToolSideEffect(StrEnum):
     POSSIBLE = "possible"
 
 
+class ToolRetryClass(StrEnum):
+    """Retry safety based on external effects and verified idempotency guarantees."""
+
+    PURE_READ = "pure_read"
+    IDEMPOTENT_WRITE = "idempotent_write"
+    NON_IDEMPOTENT_WRITE = "non_idempotent_write"
+    UNKNOWN = "unknown"
+
+
 class TrustLevel(StrEnum):
     """Declared trust class for a tool implementation."""
 
@@ -305,6 +314,10 @@ class ToolDescriptor(ContractModel):
     description: NonEmptyString
     tool_type: ToolType
     side_effect: ToolSideEffect = ToolSideEffect.POSSIBLE
+    retry_class: ToolRetryClass | None = None
+    idempotency_window_seconds: int | None = Field(default=None, ge=1)
+    rejects_idempotency_body_conflict: bool = False
+    idempotency_business_fields: tuple[NonEmptyString, ...] = ()
     trust_level: TrustLevel
     execution_env: ExecutionEnvironment
     timeout_profile: TimeoutProfile
@@ -313,6 +326,36 @@ class ToolDescriptor(ContractModel):
     input_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
     capabilities: frozenset[NonEmptyString] = frozenset()
     high_impact: bool = False
+
+    @property
+    def effective_retry_class(self) -> ToolRetryClass:
+        """Default side-effect-free tools to reads; keep all writes explicitly classified."""
+        if self.retry_class is not None:
+            return self.retry_class
+        return (
+            ToolRetryClass.PURE_READ
+            if self.side_effect is ToolSideEffect.NONE
+            else ToolRetryClass.UNKNOWN
+        )
+
+    @model_validator(mode="after")
+    def validate_idempotency_guarantee(self) -> Self:
+        has_idempotency_contract = self.idempotency_window_seconds is not None
+        if self.retry_class is ToolRetryClass.IDEMPOTENT_WRITE:
+            if not has_idempotency_contract or not self.rejects_idempotency_body_conflict:
+                raise ValueError(
+                    "Idempotent writes must declare a key retention window and reject "
+                    "body conflicts."
+                )
+        elif has_idempotency_contract != self.rejects_idempotency_body_conflict:
+            raise ValueError(
+                "Idempotency retention and request conflict behavior must be declared together."
+            )
+        if self.effective_retry_class is ToolRetryClass.PURE_READ and has_idempotency_contract:
+            raise ValueError("Pure-read tools cannot declare an idempotency-key write contract.")
+        if len(set(self.idempotency_business_fields)) != len(self.idempotency_business_fields):
+            raise ValueError("Idempotency business fields must be unique.")
+        return self
 
 
 class ToolConnectionState(StrEnum):
@@ -417,6 +460,7 @@ __all__ = [
     "SandboxResourceLimits",
     "TimeoutProfile",
     "ToolDescriptor",
+    "ToolRetryClass",
     "ToolType",
     "TrustLevel",
 ]

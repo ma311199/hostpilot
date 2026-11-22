@@ -6,7 +6,12 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Protocol, cast
 
 from hostpilot.budget import RequestBudget
-from hostpilot.contracts import SandboxMode, ToolConnectionStatus, ToolDescriptor
+from hostpilot.contracts import (
+    SandboxMode,
+    ToolConnectionStatus,
+    ToolDescriptor,
+    ToolRetryClass,
+)
 from hostpilot.tools.executor import AsyncConfirmationProvider
 from hostpilot.tools.registry import ToolRegistry
 
@@ -22,6 +27,20 @@ class ToolInvoker(Protocol):
         name: str,
         arguments: Mapping[str, Any],
         *,
+        budget: RequestBudget,
+        confirmation_provider: AsyncConfirmationProvider | None = None,
+    ) -> str: ...
+
+
+class IdempotentToolInvoker(Protocol):
+    """Optional provider extension that consumes keys outside the tool schema."""
+
+    async def call_tool_with_idempotency_key(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str,
         budget: RequestBudget,
         confirmation_provider: AsyncConfirmationProvider | None = None,
     ) -> str: ...
@@ -66,6 +85,38 @@ class ToolFacade:
             confirmation_provider=confirmation_provider,
         )
 
+    async def call_tool_with_idempotency_key(
+        self,
+        tool_id: str,
+        arguments: Mapping[str, Any],
+        *,
+        idempotency_key: str,
+        budget: RequestBudget,
+        confirmation_provider: AsyncConfirmationProvider | None = None,
+    ) -> str:
+        """Invoke only through an explicitly idempotent, governed provider adapter."""
+        descriptor = self._provider.registry.get(tool_id).descriptor
+        if (
+            descriptor.effective_retry_class
+            not in {ToolRetryClass.IDEMPOTENT_WRITE, ToolRetryClass.NON_IDEMPOTENT_WRITE}
+            or descriptor.idempotency_window_seconds is None
+            or not descriptor.rejects_idempotency_body_conflict
+        ):
+            raise RuntimeError("Tool does not declare an idempotency contract.")
+        if not idempotency_key or idempotency_key.strip() != idempotency_key:
+            raise ValueError("Idempotency key must be non-empty and trimmed.")
+        execute = getattr(self._provider, "call_tool_with_idempotency_key", None)
+        if not callable(execute):
+            raise RuntimeError("Tool provider does not implement idempotent invocation.")
+        invoke = cast(Callable[..., Awaitable[str]], execute)
+        return await invoke(
+            tool_id,
+            arguments,
+            idempotency_key=idempotency_key,
+            budget=budget,
+            confirmation_provider=confirmation_provider,
+        )
+
     async def prepare_existing_file_write(
         self,
         arguments: Mapping[str, Any],
@@ -103,4 +154,4 @@ class ToolFacade:
         )
 
 
-__all__ = ["ToolFacade", "ToolInvoker"]
+__all__ = ["IdempotentToolInvoker", "ToolFacade", "ToolInvoker"]

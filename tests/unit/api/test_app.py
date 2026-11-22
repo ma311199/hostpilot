@@ -2,6 +2,7 @@ import asyncio
 import json
 import sqlite3
 import zipfile
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,7 +54,7 @@ from hostpilot.sandbox.linux import (
     LinuxShellSandbox,
 )
 from hostpilot.skills.compensation import CancellationSnapshot
-from hostpilot.skills.runtime import SkillSideEffect
+from hostpilot.skills.runtime import SkillExecutionResult, SkillExecutionStatus, SkillSideEffect
 from hostpilot.skills.yaml_registry import SideEffectLevel
 from hostpilot.tools.executor import RemoteToolOutcomeUnknownError
 from hostpilot.tools.filesystem import WorkspaceReadOnlyError
@@ -1614,6 +1615,267 @@ def test_tool_outcome_recovery_api_lists_safe_metadata_and_resolves_call(tmp_pat
     assert missing_session.status_code == 404
 
 
+def test_plan_recovery_api_is_session_scoped_and_hides_private_invocation_data(tmp_path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+    runtime = RecoverableFakeChatRuntime()
+
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
+        first = client.post("/api/v1/conversations", json={}).json()
+        second = client.post("/api/v1/conversations", json={}).json()
+        tasks = client.app.state.runtime_host.context.tasks
+        now = datetime.now(UTC)
+
+        async def create_recoverable_plan(session_id: str, plan_run_id: str) -> None:
+            await tasks.create_plan_run(
+                plan_run_id=plan_run_id,
+                turn_id=f"turn-{plan_run_id}",
+                session_id=session_id,
+                goal="Prepare a private report",
+                snapshot={
+                    "version": 1,
+                    "plan": {"tasks": [{"task_id": "task-1", "description": "Read source"}]},
+                    "states": [
+                        {"task_id": "task-1", "status": "completed", "output": {"summary": "done"}}
+                    ],
+                },
+                started_at=now,
+            )
+            await tasks.prepare_invocation(
+                invocation_id=f"invocation-{plan_run_id}",
+                session_id=session_id,
+                turn_id=f"turn-{plan_run_id}",
+                plan_run_id=plan_run_id,
+                task_run_id=f"task-run-{plan_run_id}",
+                task_id="task-1",
+                call_index=1,
+                tool_id="send_message",
+                retry_class="non_idempotent_write",
+                idempotency_key="private-stable-key",
+                request_fingerprint="fingerprint-private",
+                arguments_json='{"recipient":"private@example.com"}',
+                idempotency_window_seconds=3600,
+            )
+            await tasks.update_plan_run(
+                plan_run_id,
+                state="interrupted",
+                snapshot={
+                    "version": 1,
+                    "plan": {"tasks": [{"task_id": "task-1", "description": "Read source"}]},
+                    "states": [
+                        {"task_id": "task-1", "status": "completed", "output": {"summary": "done"}}
+                    ],
+                },
+                updated_at=now + timedelta(seconds=1),
+            )
+
+        asyncio.run(create_recoverable_plan(first["session_id"], "plan-first"))
+        asyncio.run(create_recoverable_plan(second["session_id"], "plan-second"))
+
+        response = client.get(f"/api/v1/conversations/{first['session_id']}/plan-runs/recoverable")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["plan_run_id"] for item in payload] == ["plan-first"]
+    assert payload[0]["tasks"][0]["output"] == {"summary": "done"}
+    assert payload[0]["pending_invocations"] == [
+        {
+            "invocation_id": "invocation-plan-first",
+            "tool_id": "send_message",
+            "retry_class": "non_idempotent_write",
+            "state": "prepared",
+        }
+    ]
+    assert "private-stable-key" not in response.text
+    assert "fingerprint-private" not in response.text
+    assert "private@example.com" not in response.text
+
+
+def test_plan_invocation_resolution_requires_and_records_user_observations(tmp_path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+    runtime = RecoverableFakeChatRuntime()
+
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
+        conversation = client.post("/api/v1/conversations", json={}).json()
+        session_id = conversation["session_id"]
+        tasks = client.app.state.runtime_host.context.tasks
+        now = datetime.now(UTC)
+
+        async def create_plan_and_invocation() -> None:
+            await tasks.create_plan_run(
+                plan_run_id="plan-resolve",
+                turn_id="turn-resolve",
+                session_id=session_id,
+                goal="Send a report",
+                snapshot={"version": 1, "plan": {"tasks": []}, "states": []},
+                started_at=now,
+            )
+            await tasks.prepare_invocation(
+                invocation_id="invocation-resolve",
+                session_id=session_id,
+                turn_id="turn-resolve",
+                plan_run_id="plan-resolve",
+                task_run_id="task-run-resolve",
+                task_id="send",
+                call_index=1,
+                tool_id="send_message",
+                retry_class="non_idempotent_write",
+                idempotency_key=None,
+                request_fingerprint="fingerprint",
+                arguments_json='{"recipient":"private@example.com"}',
+                idempotency_window_seconds=None,
+            )
+            await tasks.update_plan_run(
+                "plan-resolve",
+                state="interrupted",
+                snapshot={"version": 1, "plan": {"tasks": []}, "states": []},
+                updated_at=now + timedelta(seconds=1),
+            )
+
+        asyncio.run(create_plan_and_invocation())
+        path = (
+            f"/api/v1/conversations/{session_id}/plan-runs/plan-resolve/"
+            "invocations/invocation-resolve/resolve"
+        )
+        empty_result = client.post(path, json={"resolution": "executed", "result_text": " "})
+        resolved = client.post(
+            path,
+            json={"resolution": "executed", "result_text": "Observed message id 42"},
+        )
+        records = asyncio.run(tasks.list_tool_invocations("plan-resolve"))
+
+    assert empty_result.status_code == 422
+    assert resolved.status_code == 200
+    assert records[0].state == "user_reported"
+    assert records[0].reported_result == "Observed message id 42"
+    assert "private@example.com" not in resolved.text
+
+
+def test_plan_resume_api_dispatches_only_after_explicit_post(tmp_path) -> None:
+    class ResumeFakeRuntime(RecoverableFakeChatRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resume_calls: list[tuple[str, object]] = []
+
+        async def resume_plan_run(self, plan_run_id: str, request_context):
+            self.resume_calls.append((plan_run_id, request_context))
+            return SkillExecutionResult(SkillExecutionStatus.COMPLETED, output=None)
+
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+    runtime = ResumeFakeRuntime()
+
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
+        conversation = client.post("/api/v1/conversations", json={}).json()
+        session_id = conversation["session_id"]
+        tasks = client.app.state.runtime_host.context.tasks
+        now = datetime.now(UTC)
+
+        async def create_plan() -> None:
+            await tasks.create_plan_run(
+                plan_run_id="plan-resume",
+                turn_id="turn-resume",
+                session_id=session_id,
+                goal="Resume a report",
+                snapshot={"version": 1, "plan": {"tasks": []}, "states": []},
+                started_at=now,
+            )
+            await tasks.update_plan_run(
+                "plan-resume",
+                state="interrupted",
+                snapshot={"version": 1, "plan": {"tasks": []}, "states": []},
+                updated_at=now + timedelta(seconds=1),
+            )
+
+        asyncio.run(create_plan())
+        recoverable = client.get(f"/api/v1/conversations/{session_id}/plan-runs/recoverable")
+        assert runtime.resume_calls == []
+        response = client.post(f"/api/v1/conversations/{session_id}/plan-runs/plan-resume/resume")
+
+    assert recoverable.status_code == 200
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert len(runtime.resume_calls) == 1
+    assert runtime.resume_calls[0][0] == "plan-resume"
+    assert runtime.resume_calls[0][1].plan_run_id == "plan-resume"
+
+
+def test_plan_resume_websocket_uses_current_tool_confirmation_provider(tmp_path) -> None:
+    class ConfirmingResumeRuntime(RecoverableFakeChatRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.confirmation_decisions: list[ConfirmationDecision] = []
+
+        async def resume_plan_run(self, plan_run_id: str, request_context):
+            assert request_context.plan_run_id == plan_run_id
+            provider = request_context.confirmation_provider
+            assert provider is not None
+            decision = await provider.confirm(
+                ConfirmationRequest(
+                    request_id="resume-confirmation",
+                    tool_name="send_message",
+                    summary="发送已恢复的报告",
+                )
+            )
+            self.confirmation_decisions.append(decision)
+            return SkillExecutionResult(SkillExecutionStatus.COMPLETED, output=None)
+
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+    runtime = ConfirmingResumeRuntime()
+
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
+        conversation = client.post("/api/v1/conversations", json={}).json()
+        session_id = conversation["session_id"]
+        tasks = client.app.state.runtime_host.context.tasks
+        now = datetime.now(UTC)
+        asyncio.run(
+            tasks.create_plan_run(
+                plan_run_id="plan-ws-resume",
+                turn_id="turn-ws-resume",
+                session_id=session_id,
+                goal="Send the report",
+                snapshot={"version": 1, "plan": {"tasks": []}, "states": []},
+                started_at=now,
+            )
+        )
+        asyncio.run(
+            tasks.update_plan_run(
+                "plan-ws-resume",
+                state="interrupted",
+                snapshot={"version": 1, "plan": {"tasks": []}, "states": []},
+                updated_at=now + timedelta(seconds=1),
+            )
+        )
+
+        with client.websocket_connect("/api/v1/ws/chat") as websocket:
+            websocket.send_json(
+                {
+                    "type": "plan.resume",
+                    "session_id": session_id,
+                    "plan_run_id": "plan-ws-resume",
+                }
+            )
+            confirmation = websocket.receive_json()
+            assert confirmation == {
+                "type": "tool.confirmation.request",
+                "data": {
+                    "request_id": "resume-confirmation",
+                    "tool_name": "send_message",
+                    "summary": "发送已恢复的报告",
+                },
+            }
+            websocket.send_json(
+                {
+                    "type": "tool.confirmation.decision",
+                    "request_id": "resume-confirmation",
+                    "decision": "approved",
+                }
+            )
+            response = websocket.receive_json()
+
+    assert response["type"] == "plan.resume.response"
+    assert response["data"]["plan_run_id"] == "plan-ws-resume"
+    assert runtime.confirmation_decisions == [ConfirmationDecision.APPROVED]
+
+
 def test_app_runtime_host_manages_chat_runtime_lifecycle(tmp_path) -> None:
     from hostpilot.runtime import RuntimeHostState
 
@@ -1890,6 +2152,8 @@ def test_harness_configuration_is_persisted_and_applied_to_live_chat_runtime(tmp
         "plan_max_tasks": 10,
         "plan_tool_agent_max_turns": 5,
         "plan_tool_candidate_limit": 5,
+        "plan_result_history_limit": 24,
+        "plan_result_history_max_chars": 48000,
         "routing_minimum_business_confidence": 0.85,
         "routing_minimum_business_margin": 0.3,
         "routing_minimum_plan_candidate_confidence": 0.5,
@@ -1913,14 +2177,22 @@ def test_harness_configuration_is_persisted_and_applied_to_live_chat_runtime(tmp
             "/api/v1/harness/configuration",
             json={**configuration, "request_tool_call_budget": 101},
         )
+        invalid_history_limit = client.put(
+            "/api/v1/harness/configuration",
+            json={**configuration, "plan_result_history_limit": 129},
+        )
 
         assert initial.status_code == 200
         assert initial.json()["request_token_budget"] == settings.request_token_budget
         assert updated.status_code == 200
         assert updated.json() == configuration
         assert invalid.status_code == 422
+        assert invalid_history_limit.status_code == 422
         assert oversized.status_code == 413
         assert reply.status_code == 200
+        tasks = client.app.state.runtime_host.context.tasks
+        assert tasks.result_history_limit == 24
+        assert tasks.result_history_max_chars == 48000
         assert runtime.contexts[-1].budget.limits.total_tokens == 7000
         assert client.app.state.chat_service.budget_limits.tool_calls == 8
         assert client.app.state.chat_service.context_builder.max_messages == 12
@@ -1935,6 +2207,9 @@ def test_harness_configuration_is_persisted_and_applied_to_live_chat_runtime(tmp
         restored = client.get("/api/v1/harness/configuration")
         assert restored.status_code == 200
         assert restored.json() == configuration
+        tasks = client.app.state.runtime_host.context.tasks
+        assert tasks.result_history_limit == 24
+        assert tasks.result_history_max_chars == 48000
 
 
 def test_chat_api_builds_scoped_context_and_returns_runtime_reply(tmp_path) -> None:

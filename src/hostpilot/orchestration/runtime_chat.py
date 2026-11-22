@@ -5,7 +5,13 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from hostpilot.contracts import ConversationMessage, MessageRole, Route, ToolSideEffect
+from hostpilot.contracts import (
+    ConversationMessage,
+    MessageRole,
+    Route,
+    ToolRetryClass,
+    ToolSideEffect,
+)
 from hostpilot.models import ModelMessage, ModelRole, ModelToolDefinition
 from hostpilot.orchestration.runtime import (
     ChatAgentResponse,
@@ -44,6 +50,9 @@ class RuntimeChatAgentRuntime:
         max_steps: int = 8,
         skill_runtime: Any | None = None,
         tool_side_effects: Mapping[str, ToolSideEffect] | None = None,
+        tool_retry_classes: Mapping[str, ToolRetryClass] | None = None,
+        idempotency_windows: Mapping[str, int] | None = None,
+        idempotency_business_fields: Mapping[str, tuple[str, ...]] | None = None,
     ) -> None:
         self.execution_loop = execution_loop
         self.session_state = session_state
@@ -58,6 +67,9 @@ class RuntimeChatAgentRuntime:
         self.max_steps = max_steps
         self.skill_runtime = skill_runtime
         self.tool_side_effects = dict(tool_side_effects or {})
+        self.tool_retry_classes = dict(tool_retry_classes or {})
+        self.idempotency_windows = dict(idempotency_windows or {})
+        self.idempotency_business_fields = dict(idempotency_business_fields or {})
         self.tool_outcomes: RuntimeToolOutcomePort | None = None
 
     def configure_tool_outcomes(self, lifecycle: RuntimeToolOutcomePort) -> None:
@@ -130,6 +142,11 @@ class RuntimeChatAgentRuntime:
                 tool_replays=tool_replays,
                 tool_side_effects=self.tool_side_effects,
                 tool_outcomes=self.tool_outcomes,
+                tool_invocations=request_context.task_lifecycle,
+                tool_retry_classes=self.tool_retry_classes,
+                idempotency_windows=self.idempotency_windows,
+                idempotency_business_fields=self.idempotency_business_fields,
+                require_tool_invocation_journal=request_context.task_lifecycle is not None,
                 message_sink=persist_message_delta,
             )
         )

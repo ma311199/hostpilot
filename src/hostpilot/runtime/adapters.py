@@ -40,5 +40,21 @@ class ToolFacadeRuntimeAdapter:
             confirmation_provider=request_context.confirmation_provider,
         )
 
+    async def execute_idempotent(
+        self,
+        request_context: RequestContext,
+        tool_call: ModelToolCall,
+        *,
+        idempotency_key: str,
+    ) -> str:
+        """Forward the Runtime-owned key without changing model-visible arguments."""
+        return await self.tool_facade.call_tool_with_idempotency_key(
+            tool_call.name,
+            tool_call.arguments,
+            idempotency_key=idempotency_key,
+            budget=request_context.budget,
+            confirmation_provider=request_context.confirmation_provider,
+        )
+
 
 __all__ = ["ModelProviderRuntimeAdapter", "ToolFacadeRuntimeAdapter"]

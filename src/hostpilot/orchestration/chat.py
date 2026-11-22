@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from time import perf_counter
 from typing import Any, Protocol, cast
@@ -43,6 +44,7 @@ from hostpilot.runtime import (
     TurnLifecycleManager,
 )
 from hostpilot.runtime.context import TaskCacheApprovalProvider
+from hostpilot.skills.runtime import SkillExecutionResult
 from hostpilot.tools.executor import AsyncConfirmationProvider
 from hostpilot.tools.facade import ToolFacade
 
@@ -138,6 +140,72 @@ class ChatService:
                 confirmation_provider=confirmation_provider,
                 task_cache_approval_provider=task_cache_approval_provider,
             )
+
+    async def resume_plan_run(
+        self,
+        session_id: str,
+        plan_run_id: str,
+        *,
+        confirmation_provider: AsyncConfirmationProvider | None = None,
+    ) -> SkillExecutionResult:
+        """Resume one interrupted Plan only after an explicit user API action."""
+        if self.task_lifecycle is None:
+            raise RuntimeError("Plan recovery persistence is not configured.")
+        async with _lease_session(self.session_lifecycle, session_id):
+            conversation = await self.conversations.get(session_id)
+            if conversation is None:
+                raise ConversationNotFoundError(session_id)
+            if await self._pending_tool_outcomes(session_id):
+                raise RuntimeError("Resolve pending chat tool outcomes before resuming a Plan.")
+            plan_run = await self.task_lifecycle.get_plan_run(plan_run_id)
+            if (
+                plan_run is None
+                or plan_run.session_id != session_id
+                or plan_run.state not in {"interrupted", "awaiting_reconciliation"}
+            ):
+                raise ValueError(
+                    "PlanRun is missing, belongs to another Session, or is not recoverable."
+                )
+            async with _lease_runtime(self.runtime) as runtime:
+                resume = getattr(runtime, "resume_plan_run", None)
+                if not callable(resume):
+                    raise RuntimeError("The active Runtime cannot resume PlanRuns.")
+                budget = RequestBudget.start(BudgetContext(limits=self.budget_limits))
+                async with asyncio.timeout(self.budget_limits.timeout_seconds):
+                    context = await self.context_builder.build(
+                        session_id,
+                        query=plan_run.goal,
+                        state_reader=runtime,
+                    )
+                    context = context.model_copy(update={"budget": budget.snapshot()})
+                    request_context = RequestContext(
+                        snapshot=context,
+                        budget=budget,
+                        confirmation_provider=confirmation_provider,
+                        task_lifecycle=self.task_lifecycle,
+                        plan_run_id=plan_run_id,
+                    )
+                    if not await self.task_lifecycle.claim_plan_run(plan_run_id):
+                        raise ValueError("PlanRun is already claimed by another Runtime Host.")
+                    await self.task_lifecycle.update_plan_run(
+                        plan_run_id,
+                        state="running",
+                        snapshot=plan_run.snapshot,
+                        updated_at=datetime.now(UTC),
+                    )
+                    if self.turn_lifecycle is None:
+                        result = await resume(plan_run_id, request_context)
+                        if not isinstance(result, SkillExecutionResult):
+                            raise TypeError("Runtime returned an invalid Plan recovery result.")
+                        return result
+                    async with self.turn_lifecycle.track(
+                        request_context.snapshot.request_id,
+                        session_id,
+                    ):
+                        result = await resume(plan_run_id, request_context)
+                        if not isinstance(result, SkillExecutionResult):
+                            raise TypeError("Runtime returned an invalid Plan recovery result.")
+                        return result
 
     async def _send_leased(
         self,

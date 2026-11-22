@@ -193,6 +193,8 @@ class Settings(BaseSettings):
     plan_max_tasks: int = Field(default=10, gt=0, le=100)
     plan_tool_agent_max_turns: int = Field(default=5, gt=0, le=32)
     plan_tool_candidate_limit: int = Field(default=5, gt=0, le=20)
+    plan_result_history_limit: int = Field(default=32, gt=0, le=128)
+    plan_result_history_max_chars: int = Field(default=65_536, gt=0, le=262_144)
     routing_minimum_business_confidence: float = Field(default=0.85, ge=0.5, le=1)
     routing_minimum_business_margin: float = Field(default=0.30, ge=0, le=1)
     routing_minimum_plan_candidate_confidence: float = Field(default=0.50, ge=0.5, le=1)

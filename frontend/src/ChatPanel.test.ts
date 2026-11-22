@@ -10,6 +10,9 @@ const chatMocks = vi.hoisted(() => ({
   upgradeConversationSandbox: vi.fn(),
   getConversationMessages: vi.fn(),
   listPendingToolOutcomes: vi.fn(),
+  listRecoverablePlanRuns: vi.fn(),
+  resumePlanRun: vi.fn(),
+  resolvePlanInvocation: vi.fn(),
   resolveToolOutcome: vi.fn(),
   getWorkspace: vi.fn(),
   selectWorkspace: vi.fn(),
@@ -42,6 +45,9 @@ vi.mock('./api/chat', () => ({
   upgradeConversationSandbox: chatMocks.upgradeConversationSandbox,
   getConversationMessages: chatMocks.getConversationMessages,
   listPendingToolOutcomes: chatMocks.listPendingToolOutcomes,
+  listRecoverablePlanRuns: chatMocks.listRecoverablePlanRuns,
+  resumePlanRun: chatMocks.resumePlanRun,
+  resolvePlanInvocation: chatMocks.resolvePlanInvocation,
   resolveToolOutcome: chatMocks.resolveToolOutcome,
 }))
 
@@ -70,6 +76,7 @@ vi.mock('./api/chatSocket', () => ({
 
     respondToConfirmation = chatMocks.respondToConfirmation
     respondToTaskCacheApproval = chatMocks.respondToTaskCacheApproval
+    resumePlanRun = chatMocks.resumePlanRun
     close = chatMocks.close
     send = vi.fn()
   },
@@ -89,6 +96,11 @@ describe('chat tool approval dialog', () => {
       message: null,
     })
     chatMocks.listPendingToolOutcomes.mockResolvedValue([])
+    chatMocks.listRecoverablePlanRuns.mockResolvedValue([])
+    chatMocks.resumePlanRun.mockResolvedValue({
+      plan_run_id: 'plan-1', state: 'completed', status: 'completed', reason_code: null,
+    })
+    chatMocks.resolvePlanInvocation.mockResolvedValue({ resolved: true })
     chatMocks.resolveToolOutcome.mockResolvedValue({ resolved: true })
   })
 
@@ -384,6 +396,92 @@ describe('chat tool approval dialog', () => {
     confirmSpy.mockRestore()
     wrapper.unmount()
   })
+})
+
+it('shows interrupted Plan progress and resumes only after explicit confirmation', async () => {
+  const conversation = {
+    session_id: 'conversation-plan-recovery',
+    title: 'Recovery test',
+    created_at: '2026-11-22T00:00:00Z',
+    updated_at: '2026-11-22T00:00:00Z',
+    sandbox_mode: 'read-only',
+  }
+  chatMocks.listConversations.mockResolvedValue([conversation])
+  chatMocks.getConversationMessages.mockResolvedValue({ conversation, messages: [] })
+  chatMocks.listRecoverablePlanRuns.mockResolvedValue([{
+    plan_run_id: 'plan-1',
+    goal: 'Prepare a report',
+    state: 'interrupted',
+    tasks: [{
+      task_id: 'task-1', description: 'Read source', status: 'completed',
+      output: { summary: 'Source reviewed' }, error_code: null,
+    }],
+    pending_invocations: [],
+    updated_at: '2026-11-22T00:00:00Z',
+  }])
+  const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+
+  const wrapper = mount(ChatPanel)
+  await flushPromises()
+
+  expect(wrapper.text()).toContain('Prepare a report')
+  expect(wrapper.text()).toContain('Read source')
+  expect(wrapper.text()).toContain('Source reviewed')
+  expect(chatMocks.resumePlanRun).not.toHaveBeenCalled()
+
+  await wrapper.get('.plan-recovery-footer button').trigger('click')
+  await flushPromises()
+
+  expect(confirmSpy).toHaveBeenCalledOnce()
+  expect(chatMocks.resumePlanRun).toHaveBeenCalledWith('conversation-plan-recovery', 'plan-1')
+  expect(wrapper.get('[role="status"]').text()).toContain('Plan 已恢复并完成')
+  confirmSpy.mockRestore()
+  wrapper.unmount()
+})
+
+it('requires a user observation before resuming an unresolved Plan invocation', async () => {
+  const conversation = {
+    session_id: 'conversation-unresolved-plan',
+    title: 'Unresolved recovery',
+    created_at: '2026-11-22T00:00:00Z',
+    updated_at: '2026-11-22T00:00:00Z',
+    sandbox_mode: 'read-only',
+  }
+  chatMocks.listConversations.mockResolvedValue([conversation])
+  chatMocks.getConversationMessages.mockResolvedValue({ conversation, messages: [] })
+  chatMocks.listRecoverablePlanRuns.mockResolvedValue([{
+    plan_run_id: 'plan-uncertain',
+    goal: 'Send a report',
+    state: 'awaiting_reconciliation',
+    tasks: [],
+    pending_invocations: [{
+      invocation_id: 'invocation-uncertain',
+      tool_id: 'send_message',
+      retry_class: 'non_idempotent_write',
+      state: 'awaiting_reconciliation',
+    }],
+    updated_at: '2026-11-22T00:00:00Z',
+  }])
+  const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+  const wrapper = mount(ChatPanel)
+  await flushPromises()
+
+  expect(wrapper.text()).toContain('需要人工核实')
+  expect(wrapper.get('.plan-recovery-footer button').attributes('disabled')).toBeDefined()
+  await wrapper.get('textarea[placeholder="填写实际观察到的结果；HostPilot 无法独立验证它"]').setValue('Observed message id 7')
+  await wrapper.get('.plan-recovery-actions .plan-recovery-primary').trigger('click')
+  await flushPromises()
+
+  expect(chatMocks.resolvePlanInvocation).toHaveBeenCalledWith(
+    'conversation-unresolved-plan',
+    'plan-uncertain',
+    'invocation-uncertain',
+    { resolution: 'executed', result_text: 'Observed message id 7' },
+  )
+  expect(chatMocks.resumePlanRun).not.toHaveBeenCalled()
+  expect(confirmSpy).not.toHaveBeenCalled()
+  confirmSpy.mockRestore()
+  wrapper.unmount()
 })
 
 it('shows successful cached task output and requires an explicit reuse or execute choice', async () => {

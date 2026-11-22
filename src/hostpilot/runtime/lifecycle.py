@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -23,9 +23,12 @@ if TYPE_CHECKING:
     from hostpilot.task_results import (
         CompletedPlanTaskResult,
         FailedPlanTaskSummary,
+        PlanRunSnapshot,
+        PlanRunState,
         PlanTaskExecutionSummary,
         StoredPlanTaskFailure,
         StoredPlanTaskResult,
+        ToolInvocationRecord,
     )
 
 
@@ -506,10 +509,19 @@ class _ActiveTaskRun:
 class TaskRunHandle:
     """Capture the terminal state and optional successful result for a TaskRun."""
 
-    def __init__(self) -> None:
+    def __init__(self, task_run_id: str, plan_run_id: str | None = None) -> None:
+        self.task_run_id = task_run_id
+        self.plan_run_id = plan_run_id
         self.terminal_state = TaskState.COMPLETED
         self.completed_result: CompletedPlanTaskResult | None = None
         self.failure_summary: FailedPlanTaskSummary | None = None
+        self.plan_snapshot: Mapping[str, object] | None = None
+
+    def checkpoint_plan_progress(self, snapshot: Mapping[str, object]) -> None:
+        """Attach the Plan state that must commit with this successful TaskRun."""
+        if self.plan_run_id is None:
+            raise RuntimeError("Plan progress requires an associated PlanRun.")
+        self.plan_snapshot = dict(snapshot)
 
     def fail(
         self,
@@ -566,17 +578,39 @@ class TaskLifecycleManager:
         self,
         *,
         history_limit: int = 100,
+        result_history_limit: int = 32,
+        result_history_max_chars: int = 65_536,
         store: TaskStore | None = None,
         runtime_host_id: str | None = None,
     ) -> None:
         if history_limit < 0:
             raise ValueError("Task history limit cannot be negative.")
+        self.configure_result_history(result_history_limit, result_history_max_chars)
         if (store is None) != (runtime_host_id is None):
             raise ValueError("TaskStore and Runtime Host ID must be configured together.")
         self._active: dict[str, _ActiveTaskRun] = {}
         self._history: deque[TaskRecord] = deque(maxlen=history_limit)
         self._store = store
         self._runtime_host_id = runtime_host_id
+
+    @property
+    def result_history_limit(self) -> int:
+        """Maximum number of completed Plan results visible to a later Planner."""
+        return self._result_history_limit
+
+    @property
+    def result_history_max_chars(self) -> int:
+        """Maximum serialized characters visible in prior Plan results."""
+        return self._result_history_max_chars
+
+    def configure_result_history(self, limit: int, max_chars: int) -> None:
+        """Apply validated Harness bounds for historical Planner context."""
+        if not 1 <= limit <= 128:
+            raise ValueError("Plan result history limit must be between 1 and 128.")
+        if not 1 <= max_chars <= 262_144:
+            raise ValueError("Plan result history character limit must be between 1 and 262144.")
+        self._result_history_limit = limit
+        self._result_history_max_chars = max_chars
 
     @property
     def active_task_runs(self) -> tuple[TaskRecord, ...]:
@@ -598,7 +632,7 @@ class TaskLifecycleManager:
         self._runtime_host_id = runtime_host_id
 
     async def list_completed_task_results(
-        self, session_id: str, *, exclude_turn_id: str, limit: int = 32
+        self, session_id: str, *, exclude_turn_id: str
     ) -> tuple[StoredPlanTaskResult, ...]:
         """Load bounded prior results for a new Plan in this Session."""
         if self._store is None:
@@ -606,7 +640,8 @@ class TaskLifecycleManager:
         return await self._store.list_completed_task_results(
             session_id=session_id,
             exclude_turn_id=exclude_turn_id,
-            limit=limit,
+            limit=self.result_history_limit,
+            max_chars=self.result_history_max_chars,
         )
 
     async def find_completed_task_result(
@@ -633,17 +668,201 @@ class TaskLifecycleManager:
             limit=limit,
         )
 
+    async def list_recoverable_plan_runs(self, session_id: str) -> tuple[PlanRunSnapshot, ...]:
+        """Load interrupted or unresolved PlanRuns from the configured store."""
+        if self._store is None:
+            return ()
+        return await self._store.list_recoverable_plan_runs(session_id)
+
+    async def create_plan_run(
+        self,
+        *,
+        plan_run_id: str,
+        turn_id: str,
+        session_id: str,
+        goal: str,
+        snapshot: Mapping[str, object],
+        started_at: datetime,
+    ) -> None:
+        """Persist a validated Plan snapshot under the active Runtime Host."""
+        if self._store is None or self._runtime_host_id is None:
+            return
+        await self._store.create_plan_run(
+            plan_run_id=plan_run_id,
+            turn_id=turn_id,
+            session_id=session_id,
+            runtime_host_id=self._runtime_host_id,
+            goal=goal,
+            snapshot=snapshot,
+            started_at=started_at,
+        )
+
+    async def update_plan_run(
+        self,
+        plan_run_id: str,
+        *,
+        state: PlanRunState,
+        snapshot: Mapping[str, object],
+        updated_at: datetime,
+    ) -> None:
+        """Checkpoint Plan progress while enforcing the active Host identity."""
+        if self._store is None or self._runtime_host_id is None:
+            return
+        await self._store.update_plan_run(
+            plan_run_id,
+            runtime_host_id=self._runtime_host_id,
+            state=state,
+            snapshot=snapshot,
+            updated_at=updated_at,
+        )
+
+    async def get_plan_run(self, plan_run_id: str) -> PlanRunSnapshot | None:
+        """Load one persisted Plan snapshot when a store is configured."""
+        if self._store is None:
+            return None
+        return await self._store.get_plan_run(plan_run_id)
+
+    async def list_tool_invocations(self, plan_run_id: str) -> tuple[ToolInvocationRecord, ...]:
+        """Load private call records needed to make Plan recovery decisions."""
+        if self._store is None:
+            return ()
+        return await self._store.list_tool_invocations(plan_run_id=plan_run_id)
+
+    async def resolve_tool_invocation(
+        self,
+        invocation_id: str,
+        *,
+        plan_run_id: str,
+        state: Literal["user_reported", "not_executed"],
+        reported_result: str | None,
+    ) -> None:
+        """Persist a user's explicit report before any Plan resume is permitted."""
+        if self._store is None or self._runtime_host_id is None:
+            raise RuntimeError("Tool invocation persistence is not configured.")
+        await self._store.resolve_tool_invocation(
+            invocation_id,
+            plan_run_id=plan_run_id,
+            runtime_host_id=self._runtime_host_id,
+            state=state,
+            reported_result=reported_result,
+            resolved_at=datetime.now(UTC),
+        )
+
+    async def claim_plan_run(self, plan_run_id: str) -> bool:
+        """Atomically claim a PlanRun for explicit recovery by this Runtime Host."""
+        if self._store is None or self._runtime_host_id is None:
+            return False
+        return await self._store.claim_plan_run(
+            plan_run_id,
+            runtime_host_id=self._runtime_host_id,
+            now=datetime.now(UTC),
+        )
+
+    async def release_plan_run_claim(self, plan_run_id: str) -> None:
+        """Release this Runtime Host's PlanRun recovery claim."""
+        if self._store is None or self._runtime_host_id is None:
+            return
+        await self._store.release_plan_run_claim(
+            plan_run_id,
+            runtime_host_id=self._runtime_host_id,
+        )
+
+    async def prepare_invocation(
+        self,
+        *,
+        invocation_id: str,
+        session_id: str,
+        turn_id: str,
+        plan_run_id: str | None,
+        task_run_id: str | None,
+        task_id: str,
+        call_index: int,
+        tool_id: str,
+        retry_class: str,
+        idempotency_key: str | None,
+        request_fingerprint: str,
+        arguments_json: str,
+        idempotency_window_seconds: int | None,
+    ) -> None:
+        """Persist the private tool-call journal before Runtime dispatch."""
+        if self._store is None or self._runtime_host_id is None:
+            raise RuntimeError("Tool invocation persistence is not configured.")
+        now = datetime.now(UTC)
+        if plan_run_id is not None:
+            if task_run_id is None:
+                raise RuntimeError("Plan tool invocation journaling requires a TaskRun ID.")
+            await self._store.record_tool_invocation(
+                invocation_id=invocation_id,
+                plan_run_id=plan_run_id,
+                task_run_id=task_run_id,
+                task_id=task_id,
+                call_index=call_index,
+                tool_id=tool_id,
+                retry_class=retry_class,
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+                arguments_json=arguments_json,
+                created_at=now,
+                runtime_host_id=self._runtime_host_id,
+                idempotency_window_seconds=idempotency_window_seconds,
+            )
+            return
+        await self._store.record_runtime_tool_invocation(
+            invocation_id=invocation_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            runtime_host_id=self._runtime_host_id,
+            task_run_id=task_run_id,
+            task_id=task_id,
+            call_index=call_index,
+            tool_id=tool_id,
+            retry_class=retry_class,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint,
+            arguments_json=arguments_json,
+            idempotency_window_seconds=idempotency_window_seconds,
+            created_at=now,
+        )
+
+    async def complete_invocation(self, invocation_id: str, *, plan_run_id: str | None) -> None:
+        """Mark an invocation complete only after its result checkpoint is durable."""
+        if self._store is None or self._runtime_host_id is None:
+            raise RuntimeError("Tool invocation persistence is not configured.")
+        await self._store.finish_tool_invocation(
+            invocation_id,
+            plan_run_id=plan_run_id,
+            runtime_host_id=self._runtime_host_id,
+            state="completed",
+            finished_at=datetime.now(UTC),
+        )
+
+    async def rearm_invocation(self, invocation_id: str, *, plan_run_id: str) -> None:
+        """Reopen a user-confirmed not-executed logical call before dispatch."""
+        if self._store is None or self._runtime_host_id is None:
+            raise RuntimeError("Tool invocation persistence is not configured.")
+        await self._store.finish_tool_invocation(
+            invocation_id,
+            plan_run_id=plan_run_id,
+            runtime_host_id=self._runtime_host_id,
+            state="prepared",
+            finished_at=datetime.now(UTC),
+        )
+
     @asynccontextmanager
     async def track(
         self,
         task_id: str,
         turn_id: str,
         session_id: str,
+        *,
+        plan_run_id: str | None = None,
     ) -> AsyncIterator[TaskRunHandle]:
         """Persist a TaskRun before work starts and its outcome when work ends."""
         for value, label in ((task_id, "Task"), (turn_id, "Turn"), (session_id, "Session")):
             if not value or value.strip() != value:
                 raise ValueError(f"{label} ID must be non-empty and trimmed.")
+        if plan_run_id is not None and (not plan_run_id or plan_run_id.strip() != plan_run_id):
+            raise ValueError("PlanRun ID must be non-empty and trimmed.")
         task = asyncio.current_task()
         if task is None:
             raise RuntimeError("Task lifecycle tracking requires an asyncio task.")
@@ -666,7 +885,7 @@ class TaskLifecycleManager:
                 started_at=record.started_at,
             )
         self._active[task_run_id] = _ActiveTaskRun(record, task)
-        handle = TaskRunHandle()
+        handle = TaskRunHandle(task_run_id, plan_run_id)
         terminal_state: TaskState
         try:
             yield handle
@@ -690,6 +909,19 @@ class TaskLifecycleManager:
                     )
                 )
                 if self._store is not None:
+                    finish_values: dict[str, Any] = {
+                        "completed_result": (
+                            handle.completed_result
+                            if terminal_state is TaskState.COMPLETED
+                            else None
+                        ),
+                        "failure_summary": (
+                            handle.failure_summary if terminal_state is TaskState.FAILED else None
+                        ),
+                    }
+                    if plan_run_id is not None and handle.plan_snapshot is not None:
+                        finish_values["plan_run_id"] = plan_run_id
+                        finish_values["plan_snapshot"] = handle.plan_snapshot
                     await self._store.finish_task_run(
                         task_run_id,
                         runtime_host_id=self._runtime_host_id or "",
@@ -698,14 +930,7 @@ class TaskLifecycleManager:
                             terminal_state.value,
                         ),
                         finished_at=finished_at,
-                        completed_result=(
-                            handle.completed_result
-                            if terminal_state is TaskState.COMPLETED
-                            else None
-                        ),
-                        failure_summary=(
-                            handle.failure_summary if terminal_state is TaskState.FAILED else None
-                        ),
+                        **finish_values,
                     )
 
     async def cancel_all(self) -> int:

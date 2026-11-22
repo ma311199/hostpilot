@@ -1,4 +1,6 @@
 import asyncio
+import json
+import sqlite3
 
 import pytest
 from pydantic import ValidationError
@@ -42,6 +44,51 @@ def test_harness_configuration_rejects_out_of_range_budgets() -> None:
         HarnessConfiguration(routing_minimum_business_confidence=0.49)
     with pytest.raises(ValidationError):
         HarnessConfiguration(routing_minimum_plan_candidate_confidence=0.49)
+
+
+def test_harness_configuration_defaults_and_validates_plan_result_history_limits() -> None:
+    configuration = HarnessConfiguration()
+
+    assert configuration.plan_result_history_limit == 32
+    assert configuration.plan_result_history_max_chars == 65_536
+    assert HarnessConfiguration(plan_result_history_limit=1).plan_result_history_limit == 1
+    assert HarnessConfiguration(plan_result_history_limit=128).plan_result_history_limit == 128
+    assert HarnessConfiguration(plan_result_history_max_chars=1).plan_result_history_max_chars == 1
+    assert (
+        HarnessConfiguration(plan_result_history_max_chars=262_144).plan_result_history_max_chars
+        == 262_144
+    )
+    with pytest.raises(ValidationError):
+        HarnessConfiguration(plan_result_history_limit=0)
+    with pytest.raises(ValidationError):
+        HarnessConfiguration(plan_result_history_limit=129)
+    with pytest.raises(ValidationError):
+        HarnessConfiguration(plan_result_history_max_chars=0)
+    with pytest.raises(ValidationError):
+        HarnessConfiguration(plan_result_history_max_chars=262_145)
+
+
+def test_harness_configuration_loads_defaults_for_pre_history_limit_records(tmp_path) -> None:
+    store = SQLiteHarnessConfigurationStore(tmp_path / "data" / "hostpilot.sqlite3")
+    legacy_payload = HarnessConfiguration().model_dump(
+        exclude={"plan_result_history_limit", "plan_result_history_max_chars"}
+    )
+
+    async def save_legacy_configuration() -> HarnessConfiguration | None:
+        await store.initialize()
+        with sqlite3.connect(store.database_path) as connection:
+            connection.execute(
+                "INSERT INTO harness_configuration (singleton_id, configuration_json) "
+                "VALUES (1, ?)",
+                (json.dumps(legacy_payload),),
+            )
+        return await store.get()
+
+    restored = asyncio.run(save_legacy_configuration())
+
+    assert restored is not None
+    assert restored.plan_result_history_limit == 32
+    assert restored.plan_result_history_max_chars == 65_536
 
 
 def test_harness_configuration_store_rejects_database_symlink(tmp_path) -> None:

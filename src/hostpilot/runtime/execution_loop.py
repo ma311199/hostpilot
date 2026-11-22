@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from hostpilot.contracts import ModelTokenUsage, ToolSideEffect
+from hostpilot.contracts import ModelTokenUsage, ToolRetryClass, ToolSideEffect
 from hostpilot.models import (
     ModelMessage,
     ModelRequest,
@@ -20,6 +20,7 @@ from hostpilot.runtime.execution import (
     RuntimeModelPort,
     RuntimeToolPort,
     runtime_tool_call_key,
+    stable_tool_invocation_identity,
 )
 
 
@@ -51,6 +52,7 @@ class DefaultRuntimeExecutionLoop:
         allowed_tools = tuple(
             tool for tool in request.tools if tool.name in request.allowed_tool_ids
         )
+        next_call_index = request.tool_call_index_start
 
         for step in range(1, request.max_steps + 1):
             request_context.budget.ensure_available()
@@ -133,6 +135,70 @@ class DefaultRuntimeExecutionLoop:
                         tool_call.name,
                         ToolSideEffect.POSSIBLE,
                     )
+                    retry_class = request.tool_retry_classes.get(
+                        tool_call.name,
+                        (
+                            ToolRetryClass.PURE_READ
+                            if side_effect is ToolSideEffect.NONE
+                            else ToolRetryClass.UNKNOWN
+                        ),
+                    )
+                    idempotency_window = request.idempotency_windows.get(tool_call.name)
+                    if (
+                        retry_class
+                        in {
+                            ToolRetryClass.IDEMPOTENT_WRITE,
+                            ToolRetryClass.NON_IDEMPOTENT_WRITE,
+                        }
+                        and idempotency_window is not None
+                        and request.tool_invocations is None
+                    ):
+                        raise RuntimeError(
+                            "Idempotent tool execution requires a durable invocation journal."
+                        )
+                    invocation_id: str | None = None
+                    if request.tool_invocations is not None:
+                        session_id = request_context.snapshot.session_id
+                        if session_id is None:
+                            raise RuntimeError("Tool invocation journaling requires a Session ID.")
+                        logical_plan_id = request.plan_run_id or request_context.snapshot.request_id
+                        key, fingerprint = stable_tool_invocation_identity(
+                            plan_run_id=logical_plan_id,
+                            task_id=request.task_id,
+                            call_index=next_call_index,
+                            tool_id=tool_call.name,
+                            arguments=tool_call.arguments,
+                            business_fields=request.idempotency_business_fields.get(
+                                tool_call.name, ()
+                            ),
+                        )
+                        invocation_id = f"invocation:{key}"
+                        idempotency_key = (
+                            key
+                            if idempotency_window is not None
+                            and retry_class
+                            in {
+                                ToolRetryClass.IDEMPOTENT_WRITE,
+                                ToolRetryClass.NON_IDEMPOTENT_WRITE,
+                            }
+                            else None
+                        )
+                        _, arguments_json = replay_key
+                        await request.tool_invocations.prepare_invocation(
+                            invocation_id=invocation_id,
+                            session_id=session_id,
+                            turn_id=request_context.snapshot.request_id,
+                            plan_run_id=request.plan_run_id,
+                            task_run_id=request.task_run_id,
+                            task_id=request.task_id,
+                            call_index=next_call_index,
+                            tool_id=tool_call.name,
+                            retry_class=retry_class,
+                            idempotency_key=idempotency_key,
+                            request_fingerprint=fingerprint,
+                            arguments_json=arguments_json,
+                            idempotency_window_seconds=idempotency_window,
+                        )
                     if side_effect is ToolSideEffect.POSSIBLE:
                         if request.tool_outcomes is None:
                             raise RuntimeError(
@@ -150,9 +216,34 @@ class DefaultRuntimeExecutionLoop:
                             tool_call_id=tool_call.call_id,
                             tool_name=tool_call.name,
                         )
-                    tool_result = await self.tools.execute(request_context, tool_call)
+                    idempotency_key = (
+                        key
+                        if request.tool_invocations is not None
+                        and idempotency_window is not None
+                        and retry_class
+                        in {
+                            ToolRetryClass.IDEMPOTENT_WRITE,
+                            ToolRetryClass.NON_IDEMPOTENT_WRITE,
+                        }
+                        else None
+                    )
+                    if idempotency_key is not None:
+                        execute_idempotent = getattr(self.tools, "execute_idempotent", None)
+                        if not callable(execute_idempotent):
+                            raise RuntimeError(
+                                "Tool declares idempotency support but its Runtime adapter "
+                                "cannot execute with an idempotency key."
+                            )
+                        tool_result = await execute_idempotent(
+                            request_context,
+                            tool_call,
+                            idempotency_key=idempotency_key,
+                        )
+                    else:
+                        tool_result = await self.tools.execute(request_context, tool_call)
                     executed_results[replay_key] = tool_result
                     dispatched = True
+                    next_call_index += 1
                 if not isinstance(tool_result, str):
                     raise TypeError("Runtime Tool Port must return text results.")
                 tool_message = ModelMessage(
@@ -163,6 +254,12 @@ class DefaultRuntimeExecutionLoop:
                 request_messages.append(tool_message)
                 generated_messages.append(tool_message)
                 await _publish_messages(request, (tool_message,))
+                if dispatched and invocation_id is not None:
+                    assert request.tool_invocations is not None
+                    await request.tool_invocations.complete_invocation(
+                        invocation_id,
+                        plan_run_id=request.plan_run_id,
+                    )
                 if (
                     dispatched
                     and request.tool_side_effects.get(

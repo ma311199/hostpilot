@@ -148,6 +148,7 @@ class SkillEngineAgentAdapter:
 
         if self.trace_sink is None:
             return await self._execute_selected(selection, message, request_context)
+
         started_at = perf_counter()
         try:
             span_context = child_trace_context(trace_id=UUID(request_context.snapshot.request_id))
@@ -193,6 +194,38 @@ class SkillEngineAgentAdapter:
                 ),
             )
         return response
+
+    async def resume_plan_run(
+        self,
+        plan_run_id: str,
+        request_context: RequestContext,
+    ) -> SkillExecutionResult:
+        """Continue a claimed Plan snapshot through the same Plan executor and Policy."""
+        lifecycle = request_context.task_lifecycle
+        if lifecycle is None:
+            raise RuntimeError("Plan recovery persistence is not configured.")
+        plan_run = await lifecycle.get_plan_run(plan_run_id)
+        if (
+            plan_run is None
+            or plan_run.session_id != request_context.snapshot.session_id
+            or plan_run.state != "running"
+        ):
+            raise ValueError("PlanRun is missing, belongs to another Session, or is not claimed.")
+        fallback = getattr(self.skill_engine, "plan_fallback", None)
+        plan_executor = getattr(fallback, "plan_executor", None)
+        execute = getattr(plan_executor, "execute", None)
+        if not callable(execute):
+            raise RuntimeError("The active Skill Runtime has no Plan executor.")
+        plan_request = SkillExecutionRequest(
+            skill_id="builtin/orchestrator_plan",
+            payload={"task_description": plan_run.goal},
+            request_context=request_context,
+            original_goal=plan_run.goal,
+        )
+        result = await execute(plan_request)
+        if not isinstance(result, SkillExecutionResult):
+            raise TypeError("Plan executor returned an invalid recovery result.")
+        return result
 
     async def _execute_selected(
         self,

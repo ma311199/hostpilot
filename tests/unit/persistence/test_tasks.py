@@ -4,10 +4,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from hostpilot.contracts import ToolRetryClass
 from hostpilot.persistence import (
     CompletedPlanTaskResult,
     SQLiteTaskStore,
     SQLiteTurnStore,
+    StoredPlanTaskResult,
 )
 from hostpilot.task_results import (
     FailedPlanTaskSummary,
@@ -74,6 +76,15 @@ def test_task_store_interrupts_only_tasks_owned_by_expired_hosts(tmp_path) -> No
         )
         store = SQLiteTaskStore(database_path)
         await store.initialize()
+        await store.create_plan_run(
+            plan_run_id="stale-plan",
+            turn_id="turn-stale",
+            session_id="session-1",
+            runtime_host_id="stale-host",
+            goal="Prepare a report",
+            snapshot={"version": 1, "plan": {"tasks": []}},
+            started_at=now - timedelta(minutes=1),
+        )
         await store.create_task_run(
             task_run_id="stale-run",
             task_id="read_source",
@@ -98,10 +109,12 @@ def test_task_store_interrupts_only_tasks_owned_by_expired_hosts(tmp_path) -> No
 
         assert await store.interrupt_inactive_host_tasks(now=now) == 1
         records = {record.task_run_id: record for record in await store.list_task_runs()}
+        plan_run = await store.get_plan_run("stale-plan")
         assert records["stale-run"].state == "interrupted"
         assert records["stale-run"].finished_at == now
         assert records["live-run"].state == "running"
         assert records["live-run"].finished_at is None
+        assert plan_run is not None and plan_run.state == "interrupted"
 
     asyncio.run(scenario())
 
@@ -201,6 +214,331 @@ def test_task_store_migrates_legacy_result_table_with_no_fingerprint(tmp_path) -
             for row in connection.execute("PRAGMA table_info(runtime_plan_task_results)").fetchall()
         }
     assert "task_fingerprint" in columns
+
+
+def test_task_store_persists_plan_run_snapshot_and_lists_recoverable_session_runs(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 10, 0, tzinfo=UTC)
+    later = now + timedelta(seconds=5)
+    snapshot = {
+        "version": 1,
+        "goal": "Inspect two API contracts",
+        "tasks": [{"task_id": "inspect-api", "depends_on": []}],
+        "results": {},
+    }
+
+    async def scenario() -> None:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(seconds=30))
+        store = SQLiteTaskStore(database_path)
+        await store.create_plan_run(
+            plan_run_id="plan-run-1",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            goal="Inspect two API contracts",
+            snapshot=snapshot,
+            started_at=now,
+        )
+        await store.update_plan_run(
+            "plan-run-1",
+            runtime_host_id="host-a",
+            state="interrupted",
+            snapshot={**snapshot, "completed_task_ids": ["inspect-api"]},
+            updated_at=later,
+        )
+
+    asyncio.run(scenario())
+
+    async def reopen() -> None:
+        store = SQLiteTaskStore(database_path)
+        loaded = await store.get_plan_run("plan-run-1")
+        assert loaded is not None
+        assert loaded.session_id == "session-1"
+        assert loaded.state == "interrupted"
+        assert loaded.snapshot["completed_task_ids"] == ["inspect-api"]
+        assert loaded.updated_at == later
+        assert [run.plan_run_id for run in await store.list_recoverable_plan_runs("session-1")] == [
+            "plan-run-1"
+        ]
+        assert await store.list_recoverable_plan_runs("session-2") == ()
+
+    asyncio.run(reopen())
+
+
+def test_task_store_claims_one_plan_resume_until_owner_releases_it(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 10, 0, tzinfo=UTC)
+    snapshot = {"version": 1, "goal": "Read README", "tasks": []}
+
+    async def scenario() -> tuple[bool, bool, bool]:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        for host_id in ("host-a", "host-b"):
+            await turns.register_host(
+                host_id, now=now, lease_expires_at=now + timedelta(seconds=30)
+            )
+        store = SQLiteTaskStore(database_path)
+        await store.create_plan_run(
+            plan_run_id="plan-run-1",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            goal="Read README",
+            snapshot=snapshot,
+            started_at=now,
+        )
+        await store.update_plan_run(
+            "plan-run-1",
+            runtime_host_id="host-a",
+            state="interrupted",
+            snapshot=snapshot,
+            updated_at=now + timedelta(seconds=1),
+        )
+        first = await store.claim_plan_run(
+            "plan-run-1", runtime_host_id="host-a", now=now + timedelta(seconds=2)
+        )
+        concurrent = await store.claim_plan_run(
+            "plan-run-1", runtime_host_id="host-b", now=now + timedelta(seconds=2)
+        )
+        await store.release_plan_run_claim("plan-run-1", runtime_host_id="host-a")
+        after_release = await store.claim_plan_run(
+            "plan-run-1", runtime_host_id="host-b", now=now + timedelta(seconds=3)
+        )
+        if after_release:
+            await store.update_plan_run(
+                "plan-run-1",
+                runtime_host_id="host-b",
+                state="running",
+                snapshot=snapshot,
+                updated_at=now + timedelta(seconds=4),
+            )
+        recovered = await store.get_plan_run("plan-run-1")
+        assert recovered is not None and recovered.runtime_host_id == "host-b"
+        return first, concurrent, after_release
+
+    assert asyncio.run(scenario()) == (True, False, True)
+
+
+def test_task_store_journals_tool_invocation_before_dispatch_and_records_completion(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 10, 0, tzinfo=UTC)
+
+    async def scenario() -> None:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(seconds=30))
+        store = SQLiteTaskStore(database_path)
+        await store.create_plan_run(
+            plan_run_id="plan-run-1",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            goal="Send invoice",
+            snapshot={"version": 1, "tasks": []},
+            started_at=now,
+        )
+        await store.record_tool_invocation(
+            invocation_id="invocation-1",
+            plan_run_id="plan-run-1",
+            task_run_id="task-run-1",
+            task_id="send-invoice",
+            call_index=1,
+            tool_id="billing/send_invoice",
+            retry_class="non_idempotent_write",
+            idempotency_key="plan-run-1:send-invoice:1:invoice-42",
+            request_fingerprint="sha256:request-1",
+            arguments_json='{"invoice_id":"invoice-42"}',
+            created_at=now,
+            runtime_host_id="host-a",
+            idempotency_window_seconds=3600,
+        )
+        pending = await store.list_tool_invocations("plan-run-1")
+        assert len(pending) == 1
+        assert pending[0].state == "prepared"
+        assert pending[0].idempotency_key == "plan-run-1:send-invoice:1:invoice-42"
+        assert pending[0].arguments_json == '{"invoice_id":"invoice-42"}'
+        assert pending[0].idempotency_expires_at == now + timedelta(seconds=3600)
+
+        await store.finish_tool_invocation(
+            "invocation-1",
+            plan_run_id="plan-run-1",
+            runtime_host_id="host-a",
+            state="completed",
+            finished_at=now + timedelta(seconds=1),
+        )
+        completed = await SQLiteTaskStore(database_path).list_tool_invocations("plan-run-1")
+        assert completed[0].state == "completed"
+        assert completed[0].finished_at == now + timedelta(seconds=1)
+
+    asyncio.run(scenario())
+
+
+def test_task_store_journals_runtime_chat_tool_calls_without_plan_run(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 10, 0, tzinfo=UTC)
+
+    async def scenario() -> None:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(seconds=30))
+        store = SQLiteTaskStore(database_path)
+        await store.record_runtime_tool_invocation(
+            invocation_id="invocation-chat-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            runtime_host_id="host-a",
+            task_run_id=None,
+            task_id="runtime_chat",
+            call_index=1,
+            tool_id="search_files",
+            retry_class=ToolRetryClass.PURE_READ,
+            idempotency_key=None,
+            request_fingerprint="sha256:search-request",
+            arguments_json='{"pattern":"*.py"}',
+            idempotency_window_seconds=None,
+            created_at=now,
+        )
+        await store.finish_tool_invocation(
+            "invocation-chat-1",
+            plan_run_id=None,
+            runtime_host_id="host-a",
+            state="completed",
+            finished_at=now + timedelta(seconds=1),
+        )
+        loaded = await SQLiteTaskStore(database_path).list_tool_invocations(session_id="session-1")
+        assert len(loaded) == 1
+        assert loaded[0].plan_run_id is None
+        assert loaded[0].arguments_json == '{"pattern":"*.py"}'
+        assert loaded[0].request_fingerprint == "sha256:search-request"
+        assert loaded[0].state == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_task_completion_completes_its_tool_journal_with_the_result_checkpoint(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 10, 0, tzinfo=UTC)
+
+    async def scenario() -> None:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(seconds=30))
+        store = SQLiteTaskStore(database_path)
+        await store.create_task_run(
+            task_run_id="task-run-1",
+            task_id="inspect-files",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            started_at=now,
+        )
+        await store.record_runtime_tool_invocation(
+            invocation_id="invocation-plan-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            runtime_host_id="host-a",
+            task_run_id="task-run-1",
+            task_id="inspect-files",
+            call_index=1,
+            tool_id="read_text_file",
+            retry_class=ToolRetryClass.PURE_READ,
+            idempotency_key=None,
+            request_fingerprint="sha256:read-request",
+            arguments_json='{"path":"README.md"}',
+            idempotency_window_seconds=None,
+            created_at=now,
+        )
+        assert (await store.list_tool_invocations(session_id="session-1"))[0].state == "prepared"
+        await store.finish_task_run(
+            "task-run-1",
+            runtime_host_id="host-a",
+            state="completed",
+            finished_at=now + timedelta(seconds=2),
+            completed_result=CompletedPlanTaskResult(
+                description="Inspect files",
+                input={},
+                depends_on=(),
+                output={"files": []},
+                task_fingerprint=f"v1:{'b' * 64}",
+            ),
+        )
+        loaded = await SQLiteTaskStore(database_path).list_tool_invocations(session_id="session-1")
+        assert loaded[0].state == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_plan_task_result_and_progress_snapshot_commit_with_tool_completion(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 10, 0, tzinfo=UTC)
+    initial_snapshot = {"version": 1, "states": []}
+    completed_snapshot = {
+        "version": 1,
+        "states": [{"task_id": "inspect", "status": "completed", "output": {"ok": True}}],
+    }
+
+    async def scenario() -> None:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(seconds=30))
+        store = SQLiteTaskStore(database_path)
+        await store.create_plan_run(
+            plan_run_id="plan-run-atomic",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            goal="Inspect files",
+            snapshot=initial_snapshot,
+            started_at=now,
+        )
+        await store.create_task_run(
+            task_run_id="task-run-atomic",
+            task_id="inspect",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            started_at=now,
+        )
+        await store.record_tool_invocation(
+            invocation_id="invocation-atomic",
+            plan_run_id="plan-run-atomic",
+            task_run_id="task-run-before-restart",
+            task_id="inspect",
+            call_index=1,
+            tool_id="read_text_file",
+            retry_class=ToolRetryClass.PURE_READ,
+            idempotency_key=None,
+            request_fingerprint="sha256:read",
+            arguments_json='{"path":"README.md"}',
+            created_at=now,
+            runtime_host_id="host-a",
+        )
+        await store.finish_task_run(
+            "task-run-atomic",
+            runtime_host_id="host-a",
+            state="completed",
+            finished_at=now + timedelta(seconds=1),
+            completed_result=CompletedPlanTaskResult(
+                description="Inspect files",
+                input={},
+                depends_on=(),
+                output={"ok": True},
+                task_fingerprint=f"v1:{'b' * 64}",
+            ),
+            plan_run_id="plan-run-atomic",
+            plan_snapshot=completed_snapshot,
+        )
+        persisted_plan = await store.get_plan_run("plan-run-atomic")
+        persisted_invocation = (await store.list_tool_invocations("plan-run-atomic"))[0]
+        assert persisted_plan is not None
+        assert persisted_plan.snapshot == completed_snapshot
+        assert persisted_invocation.state == "completed"
+
+    asyncio.run(scenario())
 
 
 def test_task_store_migrates_legacy_result_table_with_nullable_execution_summary(tmp_path) -> None:
@@ -456,7 +794,7 @@ def test_task_store_result_history_is_bounded_and_newest_first_within_window(tmp
         await turns.initialize()
         await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
         store = SQLiteTaskStore(database_path)
-        for index in range(4):
+        for index in range(34):
             started_at = now + timedelta(seconds=index)
             run_id = f"run-{index}"
             await store.create_task_run(
@@ -483,11 +821,11 @@ def test_task_store_result_history_is_bounded_and_newest_first_within_window(tmp
         return await store.list_completed_task_results(
             session_id="session-1",
             exclude_turn_id="turn-current",
-            limit=2,
+            limit=33,
         )
 
     results = asyncio.run(scenario())
-    assert [result.task_id for result in results] == ["task-2", "task-3"]
+    assert [result.task_id for result in results] == [f"task-{index}" for index in range(1, 34)]
 
 
 def test_task_store_bounds_total_result_history_payload_size(tmp_path) -> None:
@@ -529,6 +867,50 @@ def test_task_store_bounds_total_result_history_payload_size(tmp_path) -> None:
 
     results = asyncio.run(scenario())
     assert [result.task_id for result in results] == ["large-task-2"]
+
+
+def test_task_store_result_history_budget_counts_unicode_characters(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 11, 0, tzinfo=UTC)
+
+    async def scenario() -> tuple[StoredPlanTaskResult, ...]:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
+        store = SQLiteTaskStore(database_path)
+        for index in range(2):
+            started_at = now + timedelta(seconds=index)
+            run_id = f"unicode-run-{index}"
+            await store.create_task_run(
+                task_run_id=run_id,
+                task_id=f"unicode-task-{index}",
+                turn_id=f"unicode-turn-{index}",
+                session_id="session-1",
+                runtime_host_id="host-a",
+                started_at=started_at,
+            )
+            await store.finish_task_run(
+                run_id,
+                runtime_host_id="host-a",
+                state="completed",
+                finished_at=started_at + timedelta(seconds=1),
+                completed_result=CompletedPlanTaskResult(
+                    task_fingerprint=f"v1:{index:064x}",
+                    description=f"任务 {index}",
+                    input={},
+                    depends_on=(),
+                    output={"text": "中" * 20_000},
+                ),
+            )
+        return await store.list_completed_task_results(
+            session_id="session-1",
+            exclude_turn_id="current",
+            limit=2,
+            max_chars=42_000,
+        )
+
+    results = asyncio.run(scenario())
+    assert [result.task_id for result in results] == ["unicode-task-0", "unicode-task-1"]
 
 
 def test_task_store_does_not_persist_result_for_noncompleted_task(tmp_path) -> None:

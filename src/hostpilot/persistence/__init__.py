@@ -80,10 +80,14 @@ from hostpilot.persistence.workspace_configuration import SQLiteWorkspaceConfigu
 from hostpilot.task_results import (
     CompletedPlanTaskResult,
     FailedPlanTaskSummary,
+    PlanRunSnapshot,
+    PlanRunState,
     PlanTaskExecutionSummary,
     PlanTaskToolUsage,
     StoredPlanTaskFailure,
     StoredPlanTaskResult,
+    ToolInvocationRecord,
+    ToolInvocationState,
 )
 
 __all__ = [
@@ -111,6 +115,8 @@ __all__ = [
     "RoutingModelConfigurationStore",
     "RoutingModelConfigurationStoreFactory",
     "PendingToolOutcome",
+    "PlanRunSnapshot",
+    "PlanRunState",
     "SessionLifecycleStore",
     "SessionLifecycleStoreFactory",
     "SkillExecutionStore",
@@ -121,6 +127,8 @@ __all__ = [
     "TurnStoreFactory",
     "ToolOutcomeStore",
     "ToolOutcomeStoreFactory",
+    "ToolInvocationRecord",
+    "ToolInvocationState",
     "TaskStore",
     "TaskStoreFactory",
     "StoredPlanTaskResult",

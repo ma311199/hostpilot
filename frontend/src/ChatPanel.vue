@@ -6,12 +6,15 @@ import {
   deleteConversation,
   getConversationMessages,
   listPendingToolOutcomes,
+  listRecoverablePlanRuns,
   listConversations,
+  resolvePlanInvocation,
   resolveToolOutcome,
   upgradeConversationSandbox,
   type ConversationMessage,
   type ConversationSummary,
   type PendingToolOutcome,
+  type RecoverablePlanRun,
   type SandboxMode,
 } from './api/chat'
 import { getWorkspace, selectWorkspace, type WorkspaceStatus } from './api/workspace'
@@ -39,8 +42,13 @@ const chatSocket = new ChatSocketClient()
 const pendingApproval = ref<ToolConfirmationMessage | null>(null)
 const pendingTaskCacheApproval = ref<PlanTaskCacheMessage | null>(null)
 const pendingToolOutcomes = ref<PendingToolOutcome[]>([])
+const recoverablePlanRuns = ref<RecoverablePlanRun[]>([])
 const outcomeResultDrafts = ref<Record<string, string>>({})
 const resolvingToolCallId = ref<string | null>(null)
+const planInvocationResultDrafts = ref<Record<string, string>>({})
+const resolvingPlanInvocationId = ref<string | null>(null)
+const resumingPlanRunId = ref<string | null>(null)
+const recoveryStatusMessage = ref('')
 interface ConversationPreference {
   title?: string
   pinned?: boolean
@@ -111,6 +119,10 @@ async function refreshConversations(): Promise<void> {
 
 async function refreshPendingToolOutcomes(sessionId: string): Promise<void> {
   pendingToolOutcomes.value = await listPendingToolOutcomes(sessionId)
+}
+
+async function refreshRecoverablePlanRuns(sessionId: string): Promise<void> {
+  recoverablePlanRuns.value = await listRecoverablePlanRuns(sessionId)
 }
 
 function loadConversationPreferences(): Record<string, ConversationPreference> {
@@ -188,12 +200,15 @@ async function openConversation(sessionId: string): Promise<void> {
   activeSessionId.value = sessionId
   messages.value = []
   pendingToolOutcomes.value = []
+  recoverablePlanRuns.value = []
+  recoveryStatusMessage.value = ''
   loading.value = true
   errorMessage.value = ''
   try {
     const history = await getConversationMessages(sessionId)
     messages.value = history.messages
     await refreshPendingToolOutcomes(sessionId)
+    await refreshRecoverablePlanRuns(sessionId)
     await scrollToLatest()
   } catch (error) {
     errorMessage.value = messageFor(error)
@@ -211,6 +226,7 @@ async function startConversation(): Promise<void> {
     activeSessionId.value = conversation.session_id
     messages.value = []
     pendingToolOutcomes.value = []
+    recoverablePlanRuns.value = []
   } catch (error) {
     errorMessage.value = messageFor(error)
   }
@@ -239,6 +255,7 @@ async function removeConversation(conversation: ConversationSummary): Promise<vo
       activeSessionId.value = null
       messages.value = []
       pendingToolOutcomes.value = []
+      recoverablePlanRuns.value = []
       const latest = conversations.value[0]
       if (latest) await openConversation(latest.session_id)
     }
@@ -318,6 +335,7 @@ async function submitMessage(): Promise<void> {
     const history = await getConversationMessages(sessionId)
     messages.value = history.messages
     await refreshPendingToolOutcomes(sessionId)
+    await refreshRecoverablePlanRuns(sessionId)
     if (pendingToolOutcomes.value.length) {
       draft.value = message
       errorMessage.value = chatResponse.assistant_message
@@ -339,6 +357,73 @@ async function submitMessage(): Promise<void> {
     errorMessage.value = messageFor(error)
   } finally {
     sending.value = false
+  }
+}
+
+async function submitPlanInvocationResolution(
+  planRun: RecoverablePlanRun,
+  invocationId: string,
+  resolution: 'executed' | 'not_executed',
+): Promise<void> {
+  const sessionId = activeSessionId.value
+  if (!sessionId || resolvingPlanInvocationId.value) return
+  const resultText = planInvocationResultDrafts.value[invocationId]?.trim() || ''
+  if (resolution === 'executed' && !resultText) {
+    errorMessage.value = '请填写外部系统中实际观察到的执行结果。'
+    return
+  }
+  if (
+    resolution === 'not_executed'
+    && !window.confirm('确认已核实该调用没有执行或产生外部影响？确认后，恢复 Plan 会重新提交这个调用。')
+  ) return
+
+  resolvingPlanInvocationId.value = invocationId
+  errorMessage.value = ''
+  try {
+    await resolvePlanInvocation(
+      sessionId,
+      planRun.plan_run_id,
+      invocationId,
+      resolution === 'executed'
+        ? { resolution, result_text: resultText }
+        : { resolution },
+    )
+    const drafts = { ...planInvocationResultDrafts.value }
+    delete drafts[invocationId]
+    planInvocationResultDrafts.value = drafts
+    await refreshRecoverablePlanRuns(sessionId)
+  } catch (error) {
+    errorMessage.value = messageFor(error)
+  } finally {
+    resolvingPlanInvocationId.value = null
+  }
+}
+
+async function resumeInterruptedPlan(planRun: RecoverablePlanRun): Promise<void> {
+  const sessionId = activeSessionId.value
+  if (!sessionId || resumingPlanRunId.value) return
+  if (planRun.pending_invocations.some((item) => item.state === 'awaiting_reconciliation')) {
+    errorMessage.value = '请先核实需要人工处理的工具调用，再恢复这个 Plan。'
+    return
+  }
+  if (!window.confirm(`确认恢复 Plan“${planRun.goal}”吗？系统会使用当前预算、授权和工具策略继续执行。`)) {
+    return
+  }
+  resumingPlanRunId.value = planRun.plan_run_id
+  recoveryStatusMessage.value = ''
+  errorMessage.value = ''
+  try {
+    const result = await chatSocket.resumePlanRun(sessionId, planRun.plan_run_id)
+    recoveryStatusMessage.value = result.status === 'completed'
+      ? 'Plan 已恢复并完成。'
+      : `Plan 恢复已暂停：${result.reason_code || result.status}。`
+    await refreshRecoverablePlanRuns(sessionId)
+    await refreshConversations()
+  } catch (error) {
+    errorMessage.value = messageFor(error)
+    await refreshRecoverablePlanRuns(sessionId)
+  } finally {
+    resumingPlanRunId.value = null
   }
 }
 
@@ -726,6 +811,110 @@ onUnmounted(() => chatSocket.close())
           <span class="chat-model-caption">由当前配置的模型提供支持</span>
         </div>
       </header>
+
+      <section
+        v-if="recoverablePlanRuns.length"
+        class="plan-recovery"
+        aria-labelledby="plan-recovery-title"
+        role="region"
+      >
+        <div class="plan-recovery-heading">
+          <div>
+            <strong id="plan-recovery-title">有 Plan 在中断后等待恢复</strong>
+            <p>恢复会沿用原计划和已完成任务，并使用当前预算、授权与工具策略。系统不会在你确认前继续执行。</p>
+          </div>
+        </div>
+        <article
+          v-for="planRun in recoverablePlanRuns"
+          :key="planRun.plan_run_id"
+          class="plan-recovery-item"
+        >
+          <div class="plan-recovery-meta">
+            <strong>{{ planRun.goal }}</strong>
+            <span>{{ planRun.state === 'awaiting_reconciliation' ? '等待工具结果核实' : '已中断' }}</span>
+            <time :datetime="planRun.updated_at">{{ new Date(planRun.updated_at).toLocaleString() }}</time>
+          </div>
+          <ol
+            class="plan-recovery-tasks"
+            :aria-label="`Plan ${planRun.goal} 的任务进度`"
+          >
+            <li
+              v-for="task in planRun.tasks"
+              :key="task.task_id"
+            >
+              <div class="plan-recovery-task-heading">
+                <strong>{{ task.description }}</strong>
+                <span>{{ task.status === 'completed' ? '已完成' : task.status === 'failed' ? '失败' : '待执行' }}</span>
+              </div>
+              <pre v-if="task.status === 'completed' && task.output !== null">{{ formatTaskCacheOutput(task.output) }}</pre>
+              <small v-if="task.error_code">原因：{{ task.error_code }}</small>
+            </li>
+          </ol>
+          <div
+            v-if="planRun.pending_invocations.length"
+            class="plan-recovery-invocations"
+          >
+            <strong>未决工具调用</strong>
+            <article
+              v-for="invocation in planRun.pending_invocations"
+              :key="invocation.invocation_id"
+              class="plan-recovery-invocation"
+            >
+              <div class="plan-recovery-meta">
+                <span>工具：{{ invocation.tool_id }}</span>
+                <span>重试类别：{{ invocation.retry_class }}</span>
+                <span>{{ invocation.state === 'awaiting_reconciliation' ? '需要人工核实' : '待恢复策略判定' }}</span>
+              </div>
+              <label :for="`plan-invocation-${invocation.invocation_id}`">如果确认已执行，请填写外部系统中观察到的结果</label>
+              <textarea
+                :id="`plan-invocation-${invocation.invocation_id}`"
+                v-model="planInvocationResultDrafts[invocation.invocation_id]"
+                :disabled="resolvingPlanInvocationId !== null"
+                maxlength="32768"
+                rows="3"
+                placeholder="填写实际观察到的结果；HostPilot 无法独立验证它"
+              />
+              <div class="plan-recovery-actions">
+                <button
+                  type="button"
+                  :disabled="resolvingPlanInvocationId !== null"
+                  @click="submitPlanInvocationResolution(planRun, invocation.invocation_id, 'not_executed')"
+                >
+                  确认未执行
+                </button>
+                <button
+                  type="button"
+                  class="plan-recovery-primary"
+                  :disabled="resolvingPlanInvocationId !== null || !planInvocationResultDrafts[invocation.invocation_id]?.trim()"
+                  @click="submitPlanInvocationResolution(planRun, invocation.invocation_id, 'executed')"
+                >
+                  {{ resolvingPlanInvocationId === invocation.invocation_id ? '正在保存…' : '提交已执行结果' }}
+                </button>
+              </div>
+            </article>
+          </div>
+          <div class="plan-recovery-footer">
+            <button
+              type="button"
+              class="plan-recovery-primary"
+              :disabled="resumingPlanRunId !== null || planRun.pending_invocations.some((item) => item.state === 'awaiting_reconciliation')"
+              @click="resumeInterruptedPlan(planRun)"
+            >
+              {{ resumingPlanRunId === planRun.plan_run_id ? '正在恢复…' : '确认并恢复 Plan' }}
+            </button>
+            <small v-if="planRun.pending_invocations.some((item) => item.state === 'awaiting_reconciliation')">
+              请先完成上方需要人工核实的调用。
+            </small>
+          </div>
+        </article>
+      </section>
+      <p
+        v-if="recoveryStatusMessage"
+        class="plan-recovery-status"
+        role="status"
+      >
+        {{ recoveryStatusMessage }}
+      </p>
 
       <section
         v-if="pendingToolOutcomes.length"

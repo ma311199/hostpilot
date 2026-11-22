@@ -10,7 +10,7 @@ from hostpilot.contracts import BudgetContext, BudgetLimits, ContextSnapshot, Mo
 from hostpilot.models import ModelMessage, ModelRequest, ModelResponse, ModelRole
 from hostpilot.models.budget import complete_with_budget
 from hostpilot.observability import TraceContext, TraceEvent, trace_context_scope
-from hostpilot.persistence import SQLiteTaskStore, SQLiteTurnStore
+from hostpilot.persistence import CompletedPlanTaskResult, SQLiteTaskStore, SQLiteTurnStore
 from hostpilot.policy.confirmation import ConfirmationDecision, ConfirmationRequest
 from hostpilot.runtime import RequestContext, TaskLifecycleManager
 from hostpilot.runtime.context import TaskCacheDecision
@@ -27,6 +27,7 @@ from hostpilot.skills.orchestration import (
     PlanTaskResult,
     PlanValidation,
     PlanVerification,
+    _plan_fingerprint,
     _task_fingerprint,
 )
 from hostpilot.skills.runtime import (
@@ -35,7 +36,7 @@ from hostpilot.skills.runtime import (
     SkillSideEffect,
 )
 from hostpilot.skills.yaml_registry import SideEffectLevel
-from hostpilot.task_results import PlanTaskToolUsage
+from hostpilot.task_results import PlanRunSnapshot, PlanTaskToolUsage
 from hostpilot.tools.executor import RemoteToolOutcomeUnknownError
 
 
@@ -90,6 +91,293 @@ def test_task_fingerprint_preserves_dependency_output_associations() -> None:
     swapped = _task_fingerprint(downstream, {"left": "B", "right": "A"})
 
     assert original != swapped
+
+
+def test_orchestrator_persists_validated_plan_and_task_progress() -> None:
+    class SnapshotStore:
+        def __init__(self) -> None:
+            self.events = []
+            self.plan_run = None
+
+        async def create_plan_run(self, **values):
+            self.events.append(("created", values))
+            self.plan_run = PlanRunSnapshot(
+                plan_run_id=values["plan_run_id"],
+                turn_id=values["turn_id"],
+                session_id=values["session_id"],
+                runtime_host_id="host-1",
+                goal=values["goal"],
+                state="running",
+                snapshot=values["snapshot"],
+                created_at=values["started_at"],
+                updated_at=values["started_at"],
+            )
+
+        async def get_plan_run(self, plan_run_id):
+            if self.plan_run and self.plan_run.plan_run_id == plan_run_id:
+                return self.plan_run
+            return None
+
+        async def update_plan_run(self, plan_run_id, **values):
+            self.events.append((values["state"], plan_run_id, values["snapshot"]))
+            self.plan_run = replace(
+                self.plan_run,
+                state=values["state"],
+                snapshot=values["snapshot"],
+                updated_at=values["updated_at"],
+            )
+
+        async def create_task_run(self, **values):
+            pass
+
+        async def finish_task_run(self, *args, **values):
+            pass
+
+        async def list_recent_task_failures(self, **values):
+            return ()
+
+        async def list_completed_task_results(self, **values):
+            return ()
+
+        async def find_completed_task_result(self, **values):
+            return None
+
+    async def scenario():
+        store = SnapshotStore()
+        lifecycle = TaskLifecycleManager(store=store, runtime_host_id="host-1")
+        plan = ExecutionPlan((task("inspect"),))
+        executor = OrchestratorPlanExecutor(
+            FakePlanner(plan),
+            FakeValidator(),
+            FakeTaskExecutor(),
+            FakeVerifier(),
+            FakeReplanner(plan),
+        )
+        result = await executor.execute(request(task_lifecycle=lifecycle))
+        return result, store.events
+
+    result, events = asyncio.run(scenario())
+
+    assert result.status is SkillExecutionStatus.COMPLETED
+    assert events[0][0] == "created"
+    snapshot = events[0][1]["snapshot"]
+    assert snapshot["version"] == 1
+    assert snapshot["goal"] == "Prepare the requested report"
+    assert snapshot["plan"]["tasks"][0]["task_id"] == "inspect"
+    assert any(
+        event[0] == "completed"
+        and event[2]["states"][0]["task_id"] == "inspect"
+        and event[2]["states"][0]["status"] == "completed"
+        for event in events[1:]
+    )
+
+
+def test_orchestrator_restores_completed_tasks_without_replanning_or_rerunning() -> None:
+    plan_snapshot = {
+        "version": 1,
+        "goal": "Prepare the requested report",
+        "plan_fingerprint": _plan_fingerprint(
+            ExecutionPlan(
+                (
+                    task("inspect"),
+                    task("summarize", depends_on=("inspect",)),
+                )
+            )
+        ),
+        "next_wave_index": 1,
+        "plan": {
+            "tasks": [
+                {
+                    "task_id": "inspect",
+                    "description": "Run inspect",
+                    "execution_type": "tool_task",
+                    "depends_on": [],
+                    "skill_id": None,
+                    "input": {},
+                    "expected_output": None,
+                },
+                {
+                    "task_id": "summarize",
+                    "description": "Run summarize",
+                    "execution_type": "tool_task",
+                    "depends_on": ["inspect"],
+                    "skill_id": None,
+                    "input": {},
+                    "expected_output": None,
+                },
+            ]
+        },
+        "states": [
+            {
+                "task_id": "inspect",
+                "status": "completed",
+                "output": {"finding": "saved"},
+                "error_code": None,
+                "side_effects": [],
+                "idempotency_key": "key-inspect",
+                "invoked_tool_ids": ["read_text_file"],
+            }
+        ],
+        "blackboard_results": {"inspect": {"finding": "saved"}},
+    }
+
+    class RecoveryStore:
+        def __init__(self) -> None:
+            self.snapshot = PlanRunSnapshot(
+                plan_run_id="plan-1",
+                turn_id="old-turn",
+                session_id="conversation-1",
+                runtime_host_id="host-1",
+                goal="Prepare the requested report",
+                state="interrupted",
+                snapshot=plan_snapshot,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+            self.updates = []
+
+        async def get_plan_run(self, plan_run_id):
+            return self.snapshot if plan_run_id == "plan-1" else None
+
+        async def update_plan_run(self, plan_run_id, **values):
+            self.updates.append((plan_run_id, values))
+
+        async def create_plan_run(self, **values):
+            raise AssertionError("Recovery must keep the original PlanRun.")
+
+        async def list_recent_task_failures(self, **values):
+            return ()
+
+        async def list_completed_task_results(self, **values):
+            return ()
+
+        async def find_completed_task_result(self, **values):
+            return None
+
+        async def create_task_run(self, **values):
+            pass
+
+        async def finish_task_run(self, *args, **values):
+            pass
+
+    async def scenario():
+        store = RecoveryStore()
+        lifecycle = TaskLifecycleManager(store=store, runtime_host_id="host-1")
+        planner = FakePlanner()
+        executor = FakeTaskExecutor()
+        requested = request(task_lifecycle=lifecycle)
+        requested = replace(
+            requested,
+            request_context=replace(requested.request_context, plan_run_id="plan-1"),
+        )
+        orchestrator = OrchestratorPlanExecutor(
+            planner,
+            FakeValidator(),
+            executor,
+            FakeVerifier(),
+            FakeReplanner(),
+        )
+        result = await orchestrator.execute(requested)
+        return result, planner, executor, store
+
+    result, planner, executor, store = asyncio.run(scenario())
+
+    assert result.status is SkillExecutionStatus.COMPLETED
+    assert planner.calls == 0
+    assert [call.task.task_id for call in executor.calls] == ["summarize"]
+    assert executor.calls[0].dependencies == {"inspect": {"finding": "saved"}}
+    assert store.updates[-1][1]["state"] == "completed"
+
+
+def test_parallel_task_result_is_checkpointed_before_sibling_finishes() -> None:
+    class SnapshotStore:
+        def __init__(self) -> None:
+            self.plan_run = None
+            self.fast_saved = asyncio.Event()
+            self.snapshots = []
+
+        async def create_plan_run(self, **values):
+            self.plan_run = PlanRunSnapshot(
+                plan_run_id=values["plan_run_id"],
+                turn_id=values["turn_id"],
+                session_id=values["session_id"],
+                runtime_host_id="host-1",
+                goal=values["goal"],
+                state="running",
+                snapshot=values["snapshot"],
+                created_at=values["started_at"],
+                updated_at=values["started_at"],
+            )
+
+        async def get_plan_run(self, plan_run_id):
+            return self.plan_run
+
+        async def update_plan_run(self, plan_run_id, **values):
+            self.plan_run = replace(
+                self.plan_run,
+                state=values["state"],
+                snapshot=values["snapshot"],
+                updated_at=values["updated_at"],
+            )
+
+        async def list_recent_task_failures(self, **values):
+            return ()
+
+        async def list_completed_task_results(self, **values):
+            return ()
+
+        async def find_completed_task_result(self, **values):
+            return None
+
+        async def create_task_run(self, **values):
+            pass
+
+        async def finish_task_run(self, *args, **values):
+            snapshot = values.get("plan_snapshot")
+            if snapshot is not None:
+                self.snapshots.append(snapshot)
+                if any(
+                    state["task_id"] == "fast" and state["status"] == "completed"
+                    for state in snapshot["states"]
+                ):
+                    self.fast_saved.set()
+
+    class ParallelExecutor:
+        def __init__(self) -> None:
+            self.slow_started = asyncio.Event()
+            self.release_slow = asyncio.Event()
+
+        async def execute_task(self, call):
+            if call.task.task_id == "slow":
+                self.slow_started.set()
+                await self.release_slow.wait()
+            return PlanTaskResult(True, output={"task": call.task.task_id})
+
+    async def scenario():
+        store = SnapshotStore()
+        lifecycle = TaskLifecycleManager(store=store, runtime_host_id="host-1")
+        task_executor = ParallelExecutor()
+        plan = ExecutionPlan((task("fast"), task("slow")))
+        orchestrator = OrchestratorPlanExecutor(
+            FakePlanner(plan),
+            FakeValidator(),
+            task_executor,
+            FakeVerifier(),
+            FakeReplanner(),
+            max_parallel_tasks=2,
+        )
+        running = asyncio.create_task(orchestrator.execute(request(task_lifecycle=lifecycle)))
+        await task_executor.slow_started.wait()
+        await asyncio.wait_for(store.fast_saved.wait(), timeout=1)
+        intermediate = store.snapshots[-1]
+        task_executor.release_slow.set()
+        result = await running
+        return result, intermediate
+
+    result, intermediate = asyncio.run(scenario())
+
+    assert result.status is SkillExecutionStatus.COMPLETED
+    assert [state["task_id"] for state in intermediate["states"]] == ["fast"]
 
 
 class FakePlanner:
@@ -920,6 +1208,79 @@ def test_new_turn_without_cache_approval_provider_stops_without_reuse_or_executi
     assert len(task_runs) == 1
 
 
+def test_new_plan_gets_only_prior_session_results_and_does_not_complete_tasks_from_them(
+    tmp_path,
+) -> None:
+    async def scenario():
+        database_path = tmp_path / "runtime.sqlite3"
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        now = datetime.now(UTC)
+        await turns.register_host(
+            "host-1",
+            now=now,
+            lease_expires_at=now + timedelta(minutes=1),
+        )
+        store = SQLiteTaskStore(database_path)
+        for index, task_id, turn_id, session_id in (
+            (1, "prior-task", "turn-prior", "session-1"),
+            (2, "same-turn-task", "turn-current", "session-1"),
+            (3, "other-session-task", "turn-other", "session-2"),
+        ):
+            run_id = f"run-{index}"
+            started_at = now + timedelta(seconds=index)
+            await store.create_task_run(
+                task_run_id=run_id,
+                task_id=task_id,
+                turn_id=turn_id,
+                session_id=session_id,
+                runtime_host_id="host-1",
+                started_at=started_at,
+            )
+            await store.finish_task_run(
+                run_id,
+                runtime_host_id="host-1",
+                state="completed",
+                finished_at=started_at + timedelta(seconds=1),
+                completed_result=CompletedPlanTaskResult(
+                    task_fingerprint=f"v1:{index:064x}",
+                    description=f"Result for {task_id}",
+                    input={},
+                    depends_on=(),
+                    output={"task": task_id},
+                ),
+            )
+        lifecycle = TaskLifecycleManager(
+            store=store,
+            runtime_host_id="host-1",
+            result_history_limit=8,
+            result_history_max_chars=4096,
+        )
+        planner = FakePlanner(ExecutionPlan((task("new-task"),)))
+        task_executor = FakeTaskExecutor()
+        result = await OrchestratorPlanExecutor(
+            planner,
+            FakeValidator(),
+            task_executor,
+            FakeVerifier(),
+            FakeReplanner(),
+            max_replans=0,
+        ).execute(
+            request(task_lifecycle=lifecycle, request_id="turn-current", session_id="session-1")
+        )
+        return result, planner, task_executor
+
+    result, planner, task_executor = asyncio.run(scenario())
+
+    assert result.status is SkillExecutionStatus.COMPLETED
+    planner_board = planner.blackboards[0]
+    assert [result.task_id for result in planner_board.prior_results] == ["prior-task"]
+    assert planner_board.results == {}
+    assert len(task_executor.calls) == 1
+    assert task_executor.calls[0].blackboard.prior_results == ()
+    assert task_executor.calls[0].blackboard.results == {}
+
+
 @pytest.mark.parametrize(
     ("decision", "expected_task_calls", "expected_task_runs"),
     [
@@ -1040,11 +1401,25 @@ def test_uncertain_remote_outcome_is_not_a_planner_failure_reference(tmp_path) -
 
 def test_plan_does_not_call_task_executor_when_task_start_write_fails() -> None:
     class FailingTaskStore:
+        async def create_plan_run(self, **kwargs):
+            del kwargs
+
+        async def get_plan_run(self, plan_run_id):
+            del plan_run_id
+            return None
+
+        async def update_plan_run(self, plan_run_id, **kwargs):
+            del plan_run_id, kwargs
+
         async def find_completed_task_result(self, **kwargs):
             del kwargs
             return None
 
         async def list_recent_task_failures(self, **kwargs):
+            del kwargs
+            return ()
+
+        async def list_completed_task_results(self, **kwargs):
             del kwargs
             return ()
 

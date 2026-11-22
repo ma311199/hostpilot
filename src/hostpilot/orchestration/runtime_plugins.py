@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from hostpilot.contracts import ToolSideEffect
+from hostpilot.contracts import ToolRetryClass, ToolSideEffect
 from hostpilot.models import ModelToolDefinition
 from hostpilot.runtime import RuntimeExecutionLoop
 
@@ -25,6 +25,9 @@ class ChatAgentRuntimePluginContext:
     runtime_tool_definitions: tuple[ModelToolDefinition, ...] = ()
     runtime_allowed_tool_ids: frozenset[str] = frozenset()
     runtime_tool_side_effects: Mapping[str, ToolSideEffect] | None = None
+    runtime_tool_retry_classes: Mapping[str, ToolRetryClass] | None = None
+    runtime_idempotency_windows: Mapping[str, int] | None = None
+    runtime_idempotency_business_fields: Mapping[str, tuple[str, ...]] | None = None
 
 
 ChatAgentRuntimeFactory = Callable[[ChatAgentRuntimePluginContext], Any]

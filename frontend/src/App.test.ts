@@ -236,6 +236,8 @@ describe('project progress dashboard', () => {
         request_tool_call_budget: 5,
         request_retrieval_call_budget: 2,
         request_timeout_seconds: 60,
+        plan_result_history_limit: 32,
+        plan_result_history_max_chars: 65536,
       }), { status: 200, headers: { 'Content-Type': 'application/json' } })),
     )
     const wrapper = mount(App)
@@ -260,6 +262,8 @@ describe('project progress dashboard', () => {
       request_tool_call_budget: 5,
       request_retrieval_call_budget: 2,
       request_timeout_seconds: 60,
+      plan_result_history_limit: 32,
+      plan_result_history_max_chars: 65536,
     }
     const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
       let payload: unknown = {}

@@ -9,6 +9,7 @@ import re
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 from time import perf_counter
 from types import MappingProxyType
@@ -38,10 +39,13 @@ from hostpilot.skills.runtime import (
     SkillExecutionStatus,
     SkillSideEffect,
 )
+from hostpilot.skills.yaml_registry import SideEffectLevel
 from hostpilot.task_results import (
+    PlanRunState,
     PlanTaskExecutionSummary,
     PlanTaskToolUsage,
     StoredPlanTaskFailure,
+    StoredPlanTaskResult,
 )
 from hostpilot.tools.executor import AsyncConfirmationProvider, RemoteToolOutcomeUnknownError
 
@@ -60,6 +64,7 @@ async def _task_run_scope(request: SkillExecutionRequest, task: PlanTask) -> Asy
         task.task_id,
         request.request_context.snapshot.request_id,
         session_id,
+        plan_run_id=request.request_context.plan_run_id,
     ) as handle:
         yield handle
 
@@ -127,6 +132,7 @@ class BlackboardSnapshot:
 
     states: tuple[PlanTaskState, ...]
     prior_failed_tasks: tuple[StoredPlanTaskFailure, ...] = ()
+    prior_results: tuple[StoredPlanTaskResult, ...] = ()
 
     @property
     def results(self) -> Mapping[str, Any]:
@@ -281,6 +287,50 @@ class OrchestratorPlanExecutor:
         self.max_tasks = max_tasks
 
     async def execute(self, request: SkillExecutionRequest) -> SkillExecutionResult:
+        """Run a Plan under a stable ID and persist its terminal lifecycle state."""
+        context = request.request_context
+        resume_requested = context.plan_run_id is not None
+        plan_run_id = context.plan_run_id or str(uuid4())
+        request = replace(
+            request,
+            request_context=replace(context, plan_run_id=plan_run_id),
+        )
+        try:
+            result = await self._execute(request, resume_requested=resume_requested)
+        except asyncio.CancelledError:
+            await self._finalize_plan_run(request, "interrupted")
+            raise
+        state: PlanRunState = (
+            "completed"
+            if result.status is SkillExecutionStatus.COMPLETED
+            else "awaiting_reconciliation"
+            if result.output.get("error_code") == "remote_tool_outcome_unknown"
+            else "failed"
+        )
+        await self._finalize_plan_run(request, state)
+        return result
+
+    async def _finalize_plan_run(self, request: SkillExecutionRequest, state: PlanRunState) -> None:
+        lifecycle = request.request_context.task_lifecycle
+        plan_run_id = request.request_context.plan_run_id
+        if lifecycle is None or plan_run_id is None:
+            return
+        snapshot = await lifecycle.get_plan_run(plan_run_id)
+        if snapshot is None:
+            return
+        await lifecycle.update_plan_run(
+            plan_run_id,
+            state=state,
+            snapshot=snapshot.snapshot,
+            updated_at=datetime.now(UTC),
+        )
+
+    async def _execute(
+        self,
+        request: SkillExecutionRequest,
+        *,
+        resume_requested: bool,
+    ) -> SkillExecutionResult:
         task = request.payload.get("task_description")
         if not isinstance(task, str) or not task.strip():
             return SkillExecutionResult(
@@ -301,11 +351,16 @@ class OrchestratorPlanExecutor:
         except BudgetExceededError:
             return _failed_result("budget_exceeded", blackboard=BlackboardSnapshot(()))
         prior_failures: tuple[StoredPlanTaskFailure, ...] = ()
+        prior_results: tuple[StoredPlanTaskResult, ...] = ()
         task_lifecycle = request.request_context.task_lifecycle
         session_id = request.request_context.snapshot.session_id
         if task_lifecycle is not None and session_id is not None:
             try:
                 prior_failures = await task_lifecycle.list_recent_task_failures(
+                    session_id,
+                    exclude_turn_id=request.request_context.snapshot.request_id,
+                )
+                prior_results = await task_lifecycle.list_completed_task_results(
                     session_id,
                     exclude_turn_id=request.request_context.snapshot.request_id,
                 )
@@ -319,14 +374,37 @@ class OrchestratorPlanExecutor:
             return BlackboardSnapshot(tuple(states.values()))
 
         def planning_board() -> BlackboardSnapshot:
-            return BlackboardSnapshot(tuple(states.values()), prior_failures)
+            return BlackboardSnapshot(tuple(states.values()), prior_failures, prior_results)
 
-        try:
-            plan = await self.planner.create_plan(request, planning_board())
-        except Exception as error:
-            return _failed_result(f"planner_{type(error).__name__}", blackboard=current_board())
-        if plan.clarification_prompt is not None:
-            return _clarification_result(plan.clarification_prompt)
+        stored_plan_run = None
+        if task_lifecycle is not None and request.request_context.plan_run_id is not None:
+            stored_plan_run = await task_lifecycle.get_plan_run(request.request_context.plan_run_id)
+        if resume_requested and stored_plan_run is None:
+            return _failed_result("plan_recovery_snapshot_missing")
+        if stored_plan_run is not None:
+            if stored_plan_run.state not in {
+                "interrupted",
+                "awaiting_reconciliation",
+                "running",
+            }:
+                return _failed_result("plan_recovery_state_not_recoverable")
+            if stored_plan_run.session_id != session_id or stored_plan_run.goal != task:
+                return _failed_result("plan_recovery_session_or_goal_mismatch")
+            try:
+                plan, restored_states = _restore_plan_snapshot(
+                    stored_plan_run.snapshot,
+                    expected_goal=task,
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                return _failed_result(f"plan_recovery_snapshot_invalid_{type(error).__name__}")
+            states.update(restored_states)
+        else:
+            try:
+                plan = await self.planner.create_plan(request, planning_board())
+            except Exception as error:
+                return _failed_result(f"planner_{type(error).__name__}", blackboard=current_board())
+            if plan.clarification_prompt is not None:
+                return _clarification_result(plan.clarification_prompt)
 
         for replan_count in range(self.max_replans + 1):
             try:
@@ -375,9 +453,43 @@ class OrchestratorPlanExecutor:
                     return _clarification_result(plan.clarification_prompt)
                 continue
 
+            if task_lifecycle is not None and session_id is not None and stored_plan_run is None:
+                initial_snapshot = _plan_snapshot_data(
+                    goal=task,
+                    plan=plan,
+                    states=states,
+                    next_wave_index=0,
+                )
+                try:
+                    await task_lifecycle.create_plan_run(
+                        plan_run_id=request.request_context.plan_run_id or str(uuid4()),
+                        turn_id=request.request_context.snapshot.request_id,
+                        session_id=session_id,
+                        goal=task,
+                        snapshot=initial_snapshot,
+                        started_at=datetime.now(UTC),
+                    )
+                except Exception as error:
+                    return _failed_result(
+                        f"plan_snapshot_create_{type(error).__name__}",
+                        blackboard=current_board(),
+                    )
+
             failure_reason: str | None = None
-            for wave in _execution_waves(plan):
+            for wave_index, wave in enumerate(_execution_waves(plan)):
                 wave_board = current_board()
+                if task_lifecycle is not None and session_id is not None:
+                    await task_lifecycle.update_plan_run(
+                        request.request_context.plan_run_id or "",
+                        state="running",
+                        snapshot=_plan_snapshot_data(
+                            goal=task,
+                            plan=plan,
+                            states=states,
+                            next_wave_index=wave_index,
+                        ),
+                        updated_at=datetime.now(UTC),
+                    )
                 leaders: list[PlanTask] = []
                 fingerprints: dict[str, str] = {}
                 signatures: dict[str, tuple[PlanExecutionType, str | None, str, str]] = {}
@@ -504,6 +616,7 @@ class OrchestratorPlanExecutor:
                     return _failed_result("budget_exceeded", blackboard=wave_board)
 
                 semaphore = asyncio.Semaphore(self.max_parallel_tasks)
+                snapshot_lock = asyncio.Lock()
 
                 async def execute_one(
                     task_item: PlanTask,
@@ -514,6 +627,9 @@ class OrchestratorPlanExecutor:
                     wave_fingerprints: Mapping[str, str] = fingerprints,
                     board_snapshot: BlackboardSnapshot = wave_board,
                     concurrency_gate: asyncio.Semaphore = semaphore,
+                    progress_lock: asyncio.Lock = snapshot_lock,
+                    snapshot_plan: ExecutionPlan = plan,
+                    snapshot_wave_index: int = wave_index,
                 ) -> tuple[
                     PlanTask,
                     tuple[PlanExecutionType, str | None, str, str],
@@ -542,11 +658,19 @@ class OrchestratorPlanExecutor:
                                     request.request_context.confirmation_provider
                                 )
                                 task_request = request
-                                if confirmation_provider is not None:
+                                if task_run is not None:
                                     task_request = replace(
                                         request,
                                         request_context=replace(
                                             request.request_context,
+                                            task_run_id=task_run.task_run_id,
+                                        ),
+                                    )
+                                if confirmation_provider is not None:
+                                    task_request = replace(
+                                        task_request,
+                                        request_context=replace(
+                                            task_request.request_context,
                                             confirmation_provider=_TaskConfirmationRecorder(
                                                 confirmation_provider,
                                                 confirmation_decisions,
@@ -610,16 +734,35 @@ class OrchestratorPlanExecutor:
                                         side_effect_count=len(result.side_effects),
                                     )
                             elif task_run is not None:
-                                task_run.complete(
-                                    description=task_item.description,
-                                    input=task_item.input or {},
-                                    depends_on=task_item.depends_on,
+                                completed_state = PlanTaskState(
+                                    task_id=task_item.task_id,
+                                    status="completed",
                                     output=result.output,
-                                    task_fingerprint=fingerprint,
-                                    execution_summary=_execution_summary(
-                                        result, tuple(confirmation_decisions)
-                                    ),
+                                    side_effects=result.side_effects,
+                                    idempotency_key=_idempotency_key(request, task_item),
+                                    invoked_tool_ids=result.invoked_tool_ids,
                                 )
+                                async with progress_lock:
+                                    states[task_item.task_id] = completed_state
+                                    task_run.complete(
+                                        description=task_item.description,
+                                        input=task_item.input or {},
+                                        depends_on=task_item.depends_on,
+                                        output=result.output,
+                                        task_fingerprint=fingerprint,
+                                        execution_summary=_execution_summary(
+                                            result, tuple(confirmation_decisions)
+                                        ),
+                                    )
+                                    if request.request_context.plan_run_id is not None:
+                                        task_run.checkpoint_plan_progress(
+                                            _plan_snapshot_data(
+                                                goal=task,
+                                                plan=snapshot_plan,
+                                                states=states,
+                                                next_wave_index=snapshot_wave_index,
+                                            )
+                                        )
                     self._record_task_event(
                         task_trace,
                         task_item,
@@ -691,6 +834,19 @@ class OrchestratorPlanExecutor:
                         follower,
                         status="reused",
                         source_task_id=leader_id,
+                    )
+
+                if task_lifecycle is not None and session_id is not None:
+                    await task_lifecycle.update_plan_run(
+                        request.request_context.plan_run_id or "",
+                        state="running",
+                        snapshot=_plan_snapshot_data(
+                            goal=task,
+                            plan=plan,
+                            states=states,
+                            next_wave_index=wave_index + 1,
+                        ),
+                        updated_at=datetime.now(UTC),
                     )
 
                 wave_failures = [
@@ -885,6 +1041,154 @@ def _execution_waves(plan: ExecutionPlan) -> tuple[tuple[PlanTask, ...], ...]:
             emitted.add(task.task_id)
             pending.remove(task.task_id)
     return tuple(waves)
+
+
+def _plan_snapshot_data(
+    *,
+    goal: str,
+    plan: ExecutionPlan,
+    states: Mapping[str, PlanTaskState],
+    next_wave_index: int,
+) -> dict[str, Any]:
+    """Serialize the validated DAG and its completed Blackboard for local recovery."""
+    return {
+        "version": 1,
+        "goal": goal,
+        "plan_fingerprint": _plan_fingerprint(plan),
+        "next_wave_index": next_wave_index,
+        "plan": {
+            "tasks": [
+                {
+                    "task_id": item.task_id,
+                    "description": item.description,
+                    "execution_type": item.execution_type.value,
+                    "depends_on": list(item.depends_on),
+                    "skill_id": item.skill_id,
+                    "input": dict(item.input or {}),
+                    "expected_output": item.expected_output,
+                }
+                for item in plan.tasks
+            ]
+        },
+        "states": [
+            {
+                "task_id": state.task_id,
+                "status": state.status,
+                "output": state.output,
+                "error_code": state.error_code,
+                "side_effects": [
+                    {
+                        "action": effect.action,
+                        "level": effect.level.value,
+                        "idempotency_key": effect.idempotency_key,
+                        "compensation_handle": effect.compensation_handle,
+                    }
+                    for effect in state.side_effects
+                ],
+                "idempotency_key": state.idempotency_key,
+                "invoked_tool_ids": list(state.invoked_tool_ids),
+            }
+            for state in states.values()
+        ],
+        "blackboard_results": {
+            task_id: state.output
+            for task_id, state in states.items()
+            if state.status == "completed"
+        },
+    }
+
+
+def _restore_plan_snapshot(
+    snapshot: Mapping[str, Any],
+    *,
+    expected_goal: str,
+) -> tuple[ExecutionPlan, dict[str, PlanTaskState]]:
+    """Rebuild a versioned validated Plan and only its durably completed states."""
+    if snapshot.get("version") != 1 or snapshot.get("goal") != expected_goal:
+        raise ValueError("Plan snapshot version or goal does not match.")
+    plan_data = snapshot["plan"]
+    if not isinstance(plan_data, Mapping) or not isinstance(plan_data.get("tasks"), list):
+        raise TypeError("Plan snapshot tasks must be a list.")
+    tasks = tuple(
+        PlanTask(
+            task_id=str(item["task_id"]),
+            description=str(item["description"]),
+            execution_type=PlanExecutionType(item["execution_type"]),
+            depends_on=tuple(str(value) for value in item.get("depends_on", ())),
+            skill_id=(str(item["skill_id"]) if item.get("skill_id") is not None else None),
+            input=(item.get("input", {}) if isinstance(item.get("input", {}), Mapping) else {}),
+            expected_output=(
+                str(item["expected_output"]) if item.get("expected_output") is not None else None
+            ),
+        )
+        for item in plan_data["tasks"]
+        if isinstance(item, Mapping)
+    )
+    if len(tasks) != len(plan_data["tasks"]):
+        raise TypeError("Plan snapshot contains a malformed task.")
+    plan = ExecutionPlan(tasks)
+    if snapshot.get("plan_fingerprint") != _plan_fingerprint(plan):
+        raise ValueError("Plan snapshot DAG fingerprint does not match.")
+    raw_states = snapshot.get("states", [])
+    if not isinstance(raw_states, list):
+        raise TypeError("Plan snapshot states must be a list.")
+    states: dict[str, PlanTaskState] = {}
+    for item in raw_states:
+        if not isinstance(item, Mapping):
+            raise TypeError("Plan snapshot contains a malformed task state.")
+        if item.get("status") != "completed":
+            continue
+        side_effects = tuple(
+            SkillSideEffect(
+                action=str(effect["action"]),
+                level=SideEffectLevel(effect["level"]),
+                idempotency_key=str(effect["idempotency_key"]),
+                compensation_handle=(
+                    str(effect["compensation_handle"])
+                    if effect.get("compensation_handle") is not None
+                    else None
+                ),
+            )
+            for effect in item.get("side_effects", [])
+            if isinstance(effect, Mapping)
+        )
+        task_id = str(item["task_id"])
+        if task_id in states:
+            raise ValueError("Plan snapshot contains duplicate task states.")
+        states[task_id] = PlanTaskState(
+            task_id=task_id,
+            status="completed",
+            output=item.get("output"),
+            error_code=None,
+            side_effects=side_effects,
+            idempotency_key=(
+                str(item["idempotency_key"]) if item.get("idempotency_key") is not None else None
+            ),
+            invoked_tool_ids=tuple(str(value) for value in item.get("invoked_tool_ids", [])),
+        )
+    return plan, states
+
+
+def _plan_fingerprint(plan: ExecutionPlan) -> str:
+    canonical = json.dumps(
+        [
+            {
+                "task_id": item.task_id,
+                "description": item.description,
+                "execution_type": item.execution_type.value,
+                "depends_on": list(item.depends_on),
+                "skill_id": item.skill_id,
+                "input": dict(item.input or {}),
+                "expected_output": item.expected_output,
+            }
+            for item in plan.tasks
+        ],
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"v1:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 def _reuse_completed_state(task_id: str, completed: PlanTaskState) -> PlanTaskState:

@@ -59,4 +59,47 @@ describe('chat WebSocket confirmation outcomes', () => {
     await expect(pending).rejects.toThrow(expectedMessage)
     client.close()
   })
+
+  it('resumes a Plan over the approval-capable socket and returns its result', async () => {
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    const client = new ChatSocketClient()
+    const pending = client.resumePlanRun('conversation-1', 'plan-1')
+    const socket = FakeWebSocket.instances[0]
+    socket.readyState = FakeWebSocket.OPEN
+    socket.onopen?.(new Event('open'))
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
+
+    expect(JSON.parse(socket.sent[0] ?? '{}')).toEqual({
+      type: 'plan.resume',
+      session_id: 'conversation-1',
+      plan_run_id: 'plan-1',
+    })
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'tool.confirmation.request',
+        data: { request_id: 'approval-1', tool_name: 'send_message', summary: 'Send report' },
+      }),
+    } as MessageEvent<string>)
+    expect(socket.sent).toHaveLength(1)
+    client.respondToConfirmation('approval-1', 'approved')
+    expect(JSON.parse(socket.sent[1] ?? '{}')).toEqual({
+      type: 'tool.confirmation.decision',
+      request_id: 'approval-1',
+      decision: 'approved',
+    })
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'plan.resume.response',
+        data: { plan_run_id: 'plan-1', state: 'completed', status: 'completed', reason_code: null },
+      }),
+    } as MessageEvent<string>)
+
+    await expect(pending).resolves.toEqual({
+      plan_run_id: 'plan-1',
+      state: 'completed',
+      status: 'completed',
+      reason_code: null,
+    })
+    client.close()
+  })
 })

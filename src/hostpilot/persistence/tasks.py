@@ -9,9 +9,9 @@ import re
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import aiosqlite
 
@@ -19,16 +19,48 @@ from hostpilot.persistence.sqlite_path import prepare_sqlite_database_path
 from hostpilot.task_results import (
     CompletedPlanTaskResult,
     FailedPlanTaskSummary,
+    PlanRunSnapshot,
+    PlanRunState,
     PlanTaskExecutionSummary,
     PlanTaskToolUsage,
     StoredPlanTaskFailure,
     StoredPlanTaskResult,
+    ToolInvocationRecord,
+    ToolInvocationState,
 )
 
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "interrupted"})
+_PLAN_RUN_STATES = frozenset(
+    {"running", "interrupted", "awaiting_reconciliation", "completed", "failed", "cancelled"}
+)
+_PLAN_RUN_TRANSITIONS = {
+    "running": {
+        "running",
+        "interrupted",
+        "awaiting_reconciliation",
+        "completed",
+        "failed",
+        "cancelled",
+    },
+    "interrupted": {"interrupted", "running", "awaiting_reconciliation"},
+    "awaiting_reconciliation": {"awaiting_reconciliation", "interrupted", "running"},
+    "completed": {"completed"},
+    "failed": {"failed"},
+    "cancelled": {"cancelled"},
+}
+_INVOCATION_STATES = frozenset(
+    {"prepared", "completed", "awaiting_reconciliation", "user_reported", "not_executed"}
+)
+_INVOCATION_TRANSITIONS = {
+    "prepared": {"completed", "awaiting_reconciliation", "user_reported", "not_executed"},
+    "awaiting_reconciliation": {"completed", "user_reported", "not_executed"},
+    "completed": {"completed"},
+    "user_reported": {"user_reported"},
+    "not_executed": {"not_executed", "prepared"},
+}
 _MAX_RESULT_BYTES = 65_536
-_MAX_RESULT_HISTORY = 32
-_MAX_RESULT_HISTORY_BYTES = 65_536
+_MAX_RESULT_HISTORY = 128
+_MAX_RESULT_HISTORY_CHARS = 262_144
 _MAX_FAILURE_HISTORY = 16
 _MAX_FAILURE_HISTORY_BYTES = 16_384
 _SAFE_CACHE_VALUE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -49,7 +81,7 @@ class StoredTaskRun:
 
 
 class SQLiteTaskStore:
-    """Persist TaskRun lifecycle metadata and Session-scoped successful outputs."""
+    """Persist Plan recovery state, TaskRun metadata, and Session-scoped results."""
 
     def __init__(self, database_path: Path | str) -> None:
         self.database_path = Path(database_path).expanduser()
@@ -79,6 +111,144 @@ class SQLiteTaskStore:
                         FOREIGN KEY (runtime_host_id) REFERENCES runtime_hosts(host_id)
                     )
                     """
+                )
+                await connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS runtime_plan_runs (
+                        plan_run_id TEXT PRIMARY KEY,
+                        turn_id TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        runtime_host_id TEXT NOT NULL,
+                        goal TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (state IN (
+                            'running', 'interrupted', 'awaiting_reconciliation',
+                            'completed', 'failed', 'cancelled'
+                        )),
+                        snapshot_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        resume_claim_host_id TEXT,
+                        FOREIGN KEY (runtime_host_id) REFERENCES runtime_hosts(host_id)
+                    )
+                    """
+                )
+                await connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS runtime_tool_invocations (
+                        invocation_id TEXT PRIMARY KEY,
+                        plan_run_id TEXT,
+                        session_id TEXT NOT NULL,
+                        turn_id TEXT NOT NULL,
+                        runtime_host_id TEXT NOT NULL,
+                        task_run_id TEXT,
+                        task_id TEXT NOT NULL,
+                        call_index INTEGER NOT NULL CHECK (call_index > 0),
+                        tool_id TEXT NOT NULL,
+                        retry_class TEXT NOT NULL,
+                        idempotency_key TEXT,
+                        request_fingerprint TEXT NOT NULL,
+                        arguments_json TEXT NOT NULL,
+                        idempotency_expires_at TEXT,
+                        state TEXT NOT NULL CHECK (state IN (
+                            'prepared', 'completed', 'awaiting_reconciliation',
+                            'user_reported', 'not_executed'
+                        )),
+                        created_at TEXT NOT NULL,
+                        finished_at TEXT,
+                        reported_result TEXT,
+                        UNIQUE (plan_run_id, task_id, call_index),
+                        FOREIGN KEY (plan_run_id) REFERENCES runtime_plan_runs(plan_run_id)
+                    )
+                    """
+                )
+                invocation_columns_cursor = await connection.execute(
+                    "PRAGMA table_info(runtime_tool_invocations)"
+                )
+                invocation_columns = {
+                    str(row[1]): row for row in await invocation_columns_cursor.fetchall()
+                }
+                if "turn_id" not in invocation_columns:
+                    await connection.execute(
+                        "ALTER TABLE runtime_tool_invocations ADD COLUMN turn_id TEXT"
+                    )
+                if "idempotency_expires_at" not in invocation_columns:
+                    await connection.execute(
+                        "ALTER TABLE runtime_tool_invocations "
+                        "ADD COLUMN idempotency_expires_at TEXT"
+                    )
+                if "reported_result" not in invocation_columns:
+                    await connection.execute(
+                        "ALTER TABLE runtime_tool_invocations ADD COLUMN reported_result TEXT"
+                    )
+                if int(invocation_columns["plan_run_id"][3]) != 0:
+                    await connection.execute(
+                        "DROP INDEX IF EXISTS runtime_tool_invocations_plan_state"
+                    )
+                    await connection.execute(
+                        "ALTER TABLE runtime_tool_invocations RENAME TO "
+                        "runtime_tool_invocations_legacy"
+                    )
+                    await connection.execute(
+                        """
+                        CREATE TABLE runtime_tool_invocations (
+                            invocation_id TEXT PRIMARY KEY,
+                            plan_run_id TEXT,
+                            session_id TEXT NOT NULL,
+                            turn_id TEXT NOT NULL,
+                            runtime_host_id TEXT NOT NULL,
+                            task_run_id TEXT,
+                            task_id TEXT NOT NULL,
+                            call_index INTEGER NOT NULL CHECK (call_index > 0),
+                            tool_id TEXT NOT NULL,
+                            retry_class TEXT NOT NULL,
+                            idempotency_key TEXT,
+                            request_fingerprint TEXT NOT NULL,
+                            arguments_json TEXT NOT NULL,
+                            idempotency_expires_at TEXT,
+                            state TEXT NOT NULL CHECK (state IN (
+                                'prepared', 'completed', 'awaiting_reconciliation',
+                                'user_reported', 'not_executed'
+                            )),
+                            created_at TEXT NOT NULL,
+                            finished_at TEXT,
+                            reported_result TEXT,
+                            UNIQUE (plan_run_id, task_id, call_index),
+                            FOREIGN KEY (plan_run_id) REFERENCES runtime_plan_runs(plan_run_id)
+                        )
+                        """
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO runtime_tool_invocations (
+                            invocation_id, plan_run_id, session_id, turn_id, runtime_host_id,
+                            task_run_id, task_id, call_index, tool_id, retry_class,
+                            idempotency_key, request_fingerprint, arguments_json,
+                            idempotency_expires_at, state, created_at, finished_at,
+                            reported_result
+                        )
+                        SELECT old.invocation_id, old.plan_run_id, old.session_id,
+                            plan.turn_id, old.runtime_host_id, old.task_run_id, old.task_id,
+                            old.call_index, old.tool_id, old.retry_class, old.idempotency_key,
+                            old.request_fingerprint, old.arguments_json,
+                            old.idempotency_expires_at, old.state, old.created_at,
+                            old.finished_at, NULL
+                        FROM runtime_tool_invocations_legacy AS old
+                        JOIN runtime_plan_runs AS plan ON plan.plan_run_id = old.plan_run_id
+                        """
+                    )
+                    await connection.execute("DROP TABLE runtime_tool_invocations_legacy")
+                await connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS runtime_tool_invocations_chat_order "
+                    "ON runtime_tool_invocations(session_id, turn_id, task_id, call_index) "
+                    "WHERE plan_run_id IS NULL"
+                )
+                await connection.execute(
+                    "CREATE INDEX IF NOT EXISTS runtime_plan_runs_session_state "
+                    "ON runtime_plan_runs(session_id, state, updated_at)"
+                )
+                await connection.execute(
+                    "CREATE INDEX IF NOT EXISTS runtime_tool_invocations_plan_state "
+                    "ON runtime_tool_invocations(plan_run_id, state, created_at)"
                 )
                 await connection.execute(
                     """
@@ -150,6 +320,440 @@ class SQLiteTaskStore:
             os.chmod(self.database_path, 0o600)
             self._initialized = True
 
+    async def create_plan_run(
+        self,
+        *,
+        plan_run_id: str,
+        turn_id: str,
+        session_id: str,
+        runtime_host_id: str,
+        goal: str,
+        snapshot: Mapping[str, Any],
+        started_at: datetime,
+    ) -> None:
+        """Persist the first validated snapshot while the Host lease is live."""
+        for value, label in (
+            (plan_run_id, "PlanRun"),
+            (turn_id, "Turn"),
+            (session_id, "Session"),
+            (runtime_host_id, "Runtime Host"),
+        ):
+            _validate_id(value, label)
+        if not goal.strip():
+            raise ValueError("PlanRun goal cannot be blank.")
+        snapshot_json = _serialize_plan_snapshot(snapshot)
+        created_value = _timestamp(started_at)
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            cursor = await connection.execute(
+                """
+                INSERT INTO runtime_plan_runs (
+                    plan_run_id, turn_id, session_id, runtime_host_id, goal, state,
+                    snapshot_json, created_at, updated_at
+                )
+                SELECT ?, ?, ?, host_id, ?, 'running', ?, ?, ? FROM runtime_hosts
+                WHERE host_id = ? AND status = 'active' AND lease_expires_at > ?
+                """,
+                (
+                    plan_run_id,
+                    turn_id,
+                    session_id,
+                    goal,
+                    snapshot_json,
+                    created_value,
+                    created_value,
+                    runtime_host_id,
+                    created_value,
+                ),
+            )
+            await connection.commit()
+        if cursor.rowcount != 1:
+            raise RuntimeError("Cannot start a PlanRun without an active Runtime Host lease.")
+
+    async def update_plan_run(
+        self,
+        plan_run_id: str,
+        *,
+        runtime_host_id: str,
+        state: PlanRunState,
+        snapshot: Mapping[str, Any],
+        updated_at: datetime,
+    ) -> None:
+        """Update one PlanRun snapshot while enforcing its lifecycle transitions."""
+        _validate_id(plan_run_id, "PlanRun")
+        _validate_id(runtime_host_id, "Runtime Host")
+        if state not in _PLAN_RUN_STATES:
+            raise ValueError("PlanRun state is unsupported.")
+        snapshot_json = _serialize_plan_snapshot(snapshot)
+        updated_value = _timestamp(updated_at)
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                "SELECT state FROM runtime_plan_runs WHERE plan_run_id = ? "
+                "AND (runtime_host_id = ? OR resume_claim_host_id = ?)",
+                (plan_run_id, runtime_host_id, runtime_host_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await connection.rollback()
+                raise ValueError("PlanRun was not found for this Runtime Host.")
+            current_state = str(row[0])
+            if state not in _PLAN_RUN_TRANSITIONS[current_state]:
+                await connection.rollback()
+                raise ValueError(f"PlanRun cannot transition from {current_state} to {state}.")
+            await connection.execute(
+                "UPDATE runtime_plan_runs SET state = ?, snapshot_json = ?, updated_at = ? "
+                "WHERE plan_run_id = ? AND (runtime_host_id = ? OR resume_claim_host_id = ?)",
+                (
+                    state,
+                    snapshot_json,
+                    updated_value,
+                    plan_run_id,
+                    runtime_host_id,
+                    runtime_host_id,
+                ),
+            )
+            await connection.commit()
+
+    async def get_plan_run(self, plan_run_id: str) -> PlanRunSnapshot | None:
+        """Load a persisted snapshot by its stable PlanRun ID."""
+        _validate_id(plan_run_id, "PlanRun")
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            cursor = await connection.execute(
+                "SELECT * FROM runtime_plan_runs WHERE plan_run_id = ?", (plan_run_id,)
+            )
+            row = await cursor.fetchone()
+        return _stored_plan_run(row) if row is not None else None
+
+    async def list_recoverable_plan_runs(self, session_id: str) -> tuple[PlanRunSnapshot, ...]:
+        """List interrupted or unresolved PlanRuns for the requested Session only."""
+        _validate_id(session_id, "Session")
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            cursor = await connection.execute(
+                "SELECT * FROM runtime_plan_runs WHERE session_id = ? "
+                "AND state IN ('interrupted', 'awaiting_reconciliation') "
+                "ORDER BY updated_at, plan_run_id",
+                (session_id,),
+            )
+            rows = await cursor.fetchall()
+        return tuple(_stored_plan_run(row) for row in rows)
+
+    async def claim_plan_run(
+        self, plan_run_id: str, *, runtime_host_id: str, now: datetime
+    ) -> bool:
+        """Atomically claim a recoverable PlanRun under one active Host lease."""
+        _validate_id(plan_run_id, "PlanRun")
+        _validate_id(runtime_host_id, "Runtime Host")
+        now_value = _timestamp(now)
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                """
+                UPDATE runtime_plan_runs
+                SET resume_claim_host_id = ?, runtime_host_id = ?
+                WHERE plan_run_id = ?
+                  AND state IN ('interrupted', 'awaiting_reconciliation')
+                  AND (resume_claim_host_id IS NULL OR resume_claim_host_id = ? OR
+                       resume_claim_host_id IN (
+                           SELECT host_id FROM runtime_hosts
+                           WHERE status != 'active' OR lease_expires_at <= ?
+                       ))
+                  AND EXISTS (
+                      SELECT 1 FROM runtime_hosts WHERE host_id = ?
+                        AND status = 'active' AND lease_expires_at > ?
+                  )
+                """,
+                (
+                    runtime_host_id,
+                    runtime_host_id,
+                    plan_run_id,
+                    runtime_host_id,
+                    now_value,
+                    runtime_host_id,
+                    now_value,
+                ),
+            )
+            if cursor.rowcount == 1:
+                await connection.execute(
+                    "UPDATE runtime_tool_invocations SET runtime_host_id = ? WHERE plan_run_id = ?",
+                    (runtime_host_id, plan_run_id),
+                )
+            await connection.commit()
+        return cursor.rowcount == 1
+
+    async def release_plan_run_claim(self, plan_run_id: str, *, runtime_host_id: str) -> None:
+        """Release only the resume claim owned by the given Host."""
+        _validate_id(plan_run_id, "PlanRun")
+        _validate_id(runtime_host_id, "Runtime Host")
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            await connection.execute(
+                "UPDATE runtime_plan_runs SET resume_claim_host_id = NULL "
+                "WHERE plan_run_id = ? AND resume_claim_host_id = ?",
+                (plan_run_id, runtime_host_id),
+            )
+            await connection.commit()
+
+    async def record_tool_invocation(
+        self,
+        *,
+        invocation_id: str,
+        plan_run_id: str,
+        task_run_id: str,
+        task_id: str,
+        call_index: int,
+        tool_id: str,
+        retry_class: str,
+        idempotency_key: str | None,
+        request_fingerprint: str,
+        arguments_json: str,
+        created_at: datetime,
+        runtime_host_id: str,
+        idempotency_window_seconds: int | None = None,
+    ) -> None:
+        """Journal exact invocation data before a tool crosses dispatch boundary."""
+        for value, label in (
+            (invocation_id, "Invocation"),
+            (plan_run_id, "PlanRun"),
+            (task_run_id, "TaskRun"),
+            (task_id, "Task"),
+            (tool_id, "Tool"),
+            (request_fingerprint, "Request fingerprint"),
+            (runtime_host_id, "Runtime Host"),
+        ):
+            _validate_id(value, label)
+        _validate_invocation_values(
+            call_index,
+            retry_class,
+            idempotency_key,
+            arguments_json,
+            idempotency_window_seconds,
+        )
+        created_value = _timestamp(created_at)
+        expires_value = _idempotency_expiry(created_at, idempotency_window_seconds)
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            cursor = await connection.execute(
+                """
+                INSERT INTO runtime_tool_invocations (
+                    invocation_id, plan_run_id, session_id, turn_id, runtime_host_id,
+                    task_run_id, task_id, call_index, tool_id, retry_class, idempotency_key,
+                    request_fingerprint, arguments_json, idempotency_expires_at, state, created_at
+                )
+                SELECT ?, p.plan_run_id, p.session_id, p.turn_id, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, 'prepared', ?
+                FROM runtime_plan_runs AS p
+                WHERE p.plan_run_id = ? AND p.runtime_host_id = ?
+                    AND p.state IN ('running', 'interrupted', 'awaiting_reconciliation')
+                """,
+                (
+                    invocation_id,
+                    runtime_host_id,
+                    task_run_id,
+                    task_id,
+                    call_index,
+                    tool_id,
+                    retry_class,
+                    idempotency_key,
+                    request_fingerprint,
+                    arguments_json,
+                    expires_value,
+                    created_value,
+                    plan_run_id,
+                    runtime_host_id,
+                ),
+            )
+            await connection.commit()
+        if cursor.rowcount != 1:
+            raise RuntimeError("Cannot journal a tool invocation outside its owning PlanRun.")
+
+    async def record_runtime_tool_invocation(
+        self,
+        *,
+        invocation_id: str,
+        session_id: str,
+        turn_id: str,
+        runtime_host_id: str,
+        task_run_id: str | None,
+        task_id: str,
+        call_index: int,
+        tool_id: str,
+        retry_class: str,
+        idempotency_key: str | None,
+        request_fingerprint: str,
+        arguments_json: str,
+        idempotency_window_seconds: int | None,
+        created_at: datetime,
+    ) -> None:
+        """Journal a Chat or Plan invocation without requiring a PlanRun row."""
+        for value, label in (
+            (invocation_id, "Invocation"),
+            (session_id, "Session"),
+            (turn_id, "Turn"),
+            (runtime_host_id, "Runtime Host"),
+            (task_run_id, "TaskRun"),
+            (task_id, "Task"),
+            (tool_id, "Tool"),
+            (request_fingerprint, "Request fingerprint"),
+        ):
+            if value is not None:
+                _validate_id(value, label)
+        _validate_invocation_values(
+            call_index,
+            retry_class,
+            idempotency_key,
+            arguments_json,
+            idempotency_window_seconds,
+        )
+        created_value = _timestamp(created_at)
+        expires_value = _idempotency_expiry(created_at, idempotency_window_seconds)
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            cursor = await connection.execute(
+                """
+                INSERT INTO runtime_tool_invocations (
+                    invocation_id, session_id, turn_id, runtime_host_id, task_run_id,
+                    task_id, call_index, tool_id, retry_class, idempotency_key,
+                    request_fingerprint, arguments_json, idempotency_expires_at,
+                    state, created_at
+                )
+                SELECT ?, ?, ?, host_id, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?
+                FROM runtime_hosts
+                WHERE host_id = ? AND status = 'active' AND lease_expires_at > ?
+                """,
+                (
+                    invocation_id,
+                    session_id,
+                    turn_id,
+                    task_run_id,
+                    task_id,
+                    call_index,
+                    tool_id,
+                    retry_class,
+                    idempotency_key,
+                    request_fingerprint,
+                    arguments_json,
+                    expires_value,
+                    created_value,
+                    runtime_host_id,
+                    created_value,
+                ),
+            )
+            await connection.commit()
+        if cursor.rowcount != 1:
+            raise RuntimeError("Cannot journal a tool invocation without a live Host lease.")
+
+    async def finish_tool_invocation(
+        self,
+        invocation_id: str,
+        *,
+        plan_run_id: str | None,
+        runtime_host_id: str,
+        state: ToolInvocationState,
+        finished_at: datetime,
+    ) -> None:
+        """Record one invocation outcome without allowing unsafe state rewrites."""
+        if state not in _INVOCATION_STATES:
+            raise ValueError("Tool invocation state is unsupported.")
+        finished_value = _timestamp(finished_at)
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                "SELECT state FROM runtime_tool_invocations WHERE invocation_id = ? "
+                "AND plan_run_id IS ? AND runtime_host_id = ?",
+                (invocation_id, plan_run_id, runtime_host_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await connection.rollback()
+                raise ValueError("Tool invocation was not found for this Runtime Host.")
+            current_state = str(row[0])
+            if state not in _INVOCATION_TRANSITIONS[current_state]:
+                await connection.rollback()
+                raise ValueError(
+                    f"Tool invocation cannot transition from {current_state} to {state}."
+                )
+            await connection.execute(
+                "UPDATE runtime_tool_invocations SET state = ?, finished_at = ? "
+                "WHERE invocation_id = ? AND plan_run_id IS ? AND runtime_host_id = ?",
+                (state, finished_value, invocation_id, plan_run_id, runtime_host_id),
+            )
+            await connection.commit()
+
+    async def list_tool_invocations(
+        self, plan_run_id: str | None = None, *, session_id: str | None = None
+    ) -> tuple[ToolInvocationRecord, ...]:
+        """Read private invocation records by PlanRun or Session."""
+        if (plan_run_id is None) == (session_id is None):
+            raise ValueError("Provide exactly one PlanRun ID or Session ID.")
+        _validate_id(plan_run_id, "PlanRun") if plan_run_id is not None else None
+        _validate_id(session_id, "Session") if session_id is not None else None
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            if plan_run_id is not None:
+                cursor = await connection.execute(
+                    "SELECT * FROM runtime_tool_invocations WHERE plan_run_id = ? "
+                    "ORDER BY task_id, call_index, invocation_id",
+                    (plan_run_id,),
+                )
+            else:
+                cursor = await connection.execute(
+                    "SELECT * FROM runtime_tool_invocations WHERE session_id = ? "
+                    "ORDER BY turn_id, task_id, call_index, invocation_id",
+                    (session_id,),
+                )
+            rows = await cursor.fetchall()
+        return tuple(_stored_tool_invocation(row) for row in rows)
+
+    async def resolve_tool_invocation(
+        self,
+        invocation_id: str,
+        *,
+        plan_run_id: str,
+        runtime_host_id: str,
+        state: Literal["user_reported", "not_executed"],
+        reported_result: str | None,
+        resolved_at: datetime,
+    ) -> None:
+        """Record human reconciliation without claiming the external state was verified."""
+        _validate_id(invocation_id, "Invocation")
+        _validate_id(plan_run_id, "PlanRun")
+        _validate_id(runtime_host_id, "Runtime Host")
+        if state == "user_reported":
+            if reported_result is None or not reported_result.strip():
+                raise ValueError("User-reported completion requires a non-empty result.")
+        elif reported_result is not None:
+            raise ValueError("An unexecuted invocation cannot contain a result.")
+        resolved_value = _timestamp(resolved_at)
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                "UPDATE runtime_tool_invocations SET state = ?, reported_result = ?, "
+                "finished_at = ? WHERE invocation_id = ? AND plan_run_id = ? "
+                "AND runtime_host_id = ? AND state IN ('prepared', 'awaiting_reconciliation')",
+                (
+                    state,
+                    reported_result,
+                    resolved_value,
+                    invocation_id,
+                    plan_run_id,
+                    runtime_host_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                await connection.rollback()
+                raise ValueError("Pending tool invocation was not found for this Runtime Host.")
+            await connection.commit()
+
     async def create_task_run(
         self,
         *,
@@ -204,6 +808,8 @@ class SQLiteTaskStore:
         finished_at: datetime,
         completed_result: CompletedPlanTaskResult | None = None,
         failure_summary: FailedPlanTaskSummary | None = None,
+        plan_run_id: str | None = None,
+        plan_snapshot: Mapping[str, Any] | None = None,
     ) -> None:
         """Set one terminal TaskRun state, scoped to its owning Host."""
         if state not in _TERMINAL_STATES - {"interrupted"}:
@@ -218,7 +824,14 @@ class SQLiteTaskStore:
             raise ValueError(
                 "A TaskRun cannot persist both a successful result and failure summary."
             )
+        if (plan_run_id is None) != (plan_snapshot is None):
+            raise ValueError("PlanRun progress requires both a PlanRun ID and snapshot.")
+        if plan_snapshot is not None and (state != "completed" or completed_result is None):
+            raise ValueError("PlanRun progress can be checkpointed only with a completed result.")
         finished_value = _timestamp(finished_at)
+        plan_snapshot_json = (
+            _serialize_plan_snapshot(plan_snapshot) if plan_snapshot is not None else None
+        )
         serialized_result = (
             _serialize_task_result(completed_result) if completed_result is not None else None
         )
@@ -290,13 +903,41 @@ class SQLiteTaskStore:
                         finished_value,
                     ),
                 )
+            if serialized_result is not None:
+                if plan_run_id is not None:
+                    task_cursor = await connection.execute(
+                        "SELECT task_id FROM runtime_task_runs WHERE task_run_id = ?",
+                        (task_run_id,),
+                    )
+                    task_run = await task_cursor.fetchone()
+                    if task_run is None:
+                        raise ValueError("Completed TaskRun was not found for this Runtime Host.")
+                    plan_cursor = await connection.execute(
+                        "UPDATE runtime_plan_runs SET snapshot_json = ?, updated_at = ? "
+                        "WHERE plan_run_id = ? AND runtime_host_id = ? AND state = 'running'",
+                        (plan_snapshot_json, finished_value, plan_run_id, runtime_host_id),
+                    )
+                    if plan_cursor.rowcount != 1:
+                        raise ValueError("Running PlanRun was not found for this Runtime Host.")
+                    await connection.execute(
+                        "UPDATE runtime_tool_invocations SET state = 'completed', finished_at = ? "
+                        "WHERE plan_run_id = ? AND task_id = ? AND state = 'prepared'",
+                        (finished_value, plan_run_id, str(task_run["task_id"])),
+                    )
+                else:
+                    await connection.execute(
+                        "UPDATE runtime_tool_invocations SET state = 'completed', finished_at = ? "
+                        "WHERE task_run_id = ? AND state = 'prepared'",
+                        (finished_value, task_run_id),
+                    )
             await connection.commit()
 
     async def interrupt_inactive_host_tasks(self, *, now: datetime) -> int:
-        """Interrupt running tasks owned by expired or cleanly stopped Hosts."""
+        """Interrupt running Tasks and PlanRuns owned by inactive Runtime Hosts."""
         now_value = _timestamp(now)
         await self.initialize()
         async with aiosqlite.connect(self.database_path) as connection:
+            await connection.execute("BEGIN IMMEDIATE")
             cursor = await connection.execute(
                 """
                 UPDATE runtime_task_runs SET state = 'interrupted', finished_at = ?
@@ -305,6 +946,13 @@ class SQLiteTaskStore:
                 )
                 """,
                 (now_value,),
+            )
+            await connection.execute(
+                "UPDATE runtime_plan_runs SET state = 'interrupted', updated_at = ? "
+                "WHERE state = 'running' AND runtime_host_id IN ("
+                "SELECT host_id FROM runtime_hosts "
+                "WHERE status IN ('expired', 'stopped') OR lease_expires_at <= ?) ",
+                (now_value, now_value),
             )
             await connection.commit()
         return cursor.rowcount
@@ -336,13 +984,20 @@ class SQLiteTaskStore:
         return tuple(_stored_task_run(row) for row in rows)
 
     async def list_completed_task_results(
-        self, *, session_id: str, exclude_turn_id: str, limit: int
+        self,
+        *,
+        session_id: str,
+        exclude_turn_id: str,
+        limit: int,
+        max_chars: int = 65_536,
     ) -> tuple[StoredPlanTaskResult, ...]:
         """Return recent successful results for one Session, oldest first in the window."""
         _validate_id(session_id, "Session")
         _validate_id(exclude_turn_id, "Turn")
         if limit < 1:
             raise ValueError("Task result history limit must be positive.")
+        if not 1 <= max_chars <= _MAX_RESULT_HISTORY_CHARS:
+            raise ValueError("Task result history character limit is out of range.")
         await self.initialize()
         async with aiosqlite.connect(self.database_path) as connection:
             connection.row_factory = sqlite3.Row
@@ -361,10 +1016,10 @@ class SQLiteTaskStore:
             )
             rows = list(await cursor.fetchall())
         selected: list[StoredPlanTaskResult] = []
-        total_bytes = 0
+        total_chars = 0
         for row in rows:
-            result_bytes = sum(
-                len(str(row[column]).encode("utf-8"))
+            result_chars = sum(
+                len(str(row[column] or ""))
                 for column in (
                     "description",
                     "input_json",
@@ -373,10 +1028,10 @@ class SQLiteTaskStore:
                     "execution_summary_json",
                 )
             )
-            if total_bytes + result_bytes > _MAX_RESULT_HISTORY_BYTES:
+            if total_chars + result_chars > max_chars:
                 break
             selected.append(_stored_task_result(row))
-            total_bytes += result_bytes
+            total_chars += result_chars
         return tuple(reversed(selected))
 
     async def find_completed_task_result(
@@ -468,6 +1123,119 @@ def _stored_task_run(row: sqlite3.Row) -> StoredTaskRun:
             datetime.fromisoformat(str(row["finished_at"]))
             if row["finished_at"] is not None
             else None
+        ),
+    )
+
+
+def _serialize_plan_snapshot(snapshot: Mapping[str, Any]) -> str:
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("PlanRun snapshot must be a mapping.")
+    try:
+        serialized = json.dumps(dict(snapshot), ensure_ascii=False, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError("PlanRun snapshot must contain JSON-compatible values.") from error
+    if not serialized.strip() or len(serialized.encode("utf-8")) > _MAX_RESULT_BYTES:
+        raise ValueError("PlanRun snapshot is empty or exceeds the supported size.")
+    if not isinstance(snapshot.get("version"), int) or snapshot["version"] < 1:
+        raise ValueError("PlanRun snapshot must have a positive integer version.")
+    return serialized
+
+
+def _validate_invocation_values(
+    call_index: int,
+    retry_class: str,
+    idempotency_key: str | None,
+    arguments_json: str,
+    idempotency_window_seconds: int | None,
+) -> None:
+    if isinstance(call_index, bool) or not isinstance(call_index, int) or call_index < 1:
+        raise ValueError("Tool invocation call index must be positive.")
+    if retry_class not in {"pure_read", "idempotent_write", "non_idempotent_write", "unknown"}:
+        raise ValueError("Tool invocation retry class is unsupported.")
+    if retry_class == "idempotent_write" and not idempotency_key:
+        raise ValueError("Idempotent writes require a stable idempotency key.")
+    if idempotency_key is not None:
+        _validate_id(idempotency_key, "Idempotency key")
+        if idempotency_window_seconds is None:
+            raise ValueError("Idempotency keys require a declared retention window.")
+    if idempotency_window_seconds is not None and (
+        isinstance(idempotency_window_seconds, bool)
+        or not isinstance(idempotency_window_seconds, int)
+        or idempotency_window_seconds < 1
+    ):
+        raise ValueError("Idempotency window must be a positive integer number of seconds.")
+    try:
+        arguments = json.loads(arguments_json)
+        canonical_arguments = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("Tool invocation arguments must be valid JSON.") from error
+    if canonical_arguments != arguments_json:
+        raise ValueError("Tool invocation arguments must use canonical JSON encoding.")
+
+
+def _idempotency_expiry(created_at: datetime, window_seconds: int | None) -> str | None:
+    if window_seconds is None:
+        return None
+    return _timestamp(created_at + timedelta(seconds=window_seconds))
+
+
+def _stored_plan_run(row: sqlite3.Row) -> PlanRunSnapshot:
+    snapshot = json.loads(str(row["snapshot_json"]))
+    if not isinstance(snapshot, dict):
+        raise ValueError("Stored PlanRun snapshot is not a JSON object.")
+    return PlanRunSnapshot(
+        plan_run_id=str(row["plan_run_id"]),
+        turn_id=str(row["turn_id"]),
+        session_id=str(row["session_id"]),
+        runtime_host_id=str(row["runtime_host_id"]),
+        goal=str(row["goal"]),
+        state=str(row["state"]),  # type: ignore[arg-type]
+        snapshot=snapshot,
+        created_at=datetime.fromisoformat(str(row["created_at"])),
+        updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        resume_claim_host_id=(
+            str(row["resume_claim_host_id"]) if row["resume_claim_host_id"] is not None else None
+        ),
+    )
+
+
+def _stored_tool_invocation(row: sqlite3.Row) -> ToolInvocationRecord:
+    return ToolInvocationRecord(
+        invocation_id=str(row["invocation_id"]),
+        plan_run_id=(str(row["plan_run_id"]) if row["plan_run_id"] is not None else None),
+        session_id=str(row["session_id"]),
+        turn_id=str(row["turn_id"]),
+        runtime_host_id=str(row["runtime_host_id"]),
+        task_run_id=(str(row["task_run_id"]) if row["task_run_id"] is not None else None),
+        task_id=str(row["task_id"]),
+        call_index=int(row["call_index"]),
+        tool_id=str(row["tool_id"]),
+        retry_class=str(row["retry_class"]),
+        idempotency_key=(
+            str(row["idempotency_key"]) if row["idempotency_key"] is not None else None
+        ),
+        request_fingerprint=str(row["request_fingerprint"]),
+        arguments_json=str(row["arguments_json"]),
+        state=str(row["state"]),  # type: ignore[arg-type]
+        created_at=datetime.fromisoformat(str(row["created_at"])),
+        idempotency_expires_at=(
+            datetime.fromisoformat(str(row["idempotency_expires_at"]))
+            if row["idempotency_expires_at"] is not None
+            else None
+        ),
+        finished_at=(
+            datetime.fromisoformat(str(row["finished_at"]))
+            if row["finished_at"] is not None
+            else None
+        ),
+        reported_result=(
+            str(row["reported_result"]) if row["reported_result"] is not None else None
         ),
     )
 

@@ -206,6 +206,16 @@ class ChatSocketRequest(BaseModel):
         return value
 
 
+class PlanResumeSocketRequest(BaseModel):
+    """Explicit recovery request over the approval-capable chat socket."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str = Field(pattern="^plan.resume$")
+    session_id: str = Field(min_length=1, max_length=64)
+    plan_run_id: str = Field(min_length=1, max_length=128)
+
+
 class ToolConfirmationDecisionRequest(BaseModel):
     """One explicit response to an outstanding high-impact tool proposal."""
 
@@ -784,6 +794,69 @@ class ToolOutcomeResolutionRequest(BaseModel):
 
 class ToolOutcomeResolutionResponse(BaseModel):
     """Result of one successful manual outcome reconciliation."""
+
+    resolved: bool
+
+
+class PlanRecoveryInvocationResponse(BaseModel):
+    """Safe metadata for an unresolved Plan call; arguments and keys stay private."""
+
+    invocation_id: str
+    tool_id: str
+    retry_class: str
+    state: Literal["prepared", "awaiting_reconciliation"]
+
+
+class PlanRecoveryTaskResponse(BaseModel):
+    """Visible task progress without its private invocation arguments."""
+
+    task_id: str
+    description: str
+    status: str
+    output: Any = None
+    error_code: str | None = None
+
+
+class RecoverablePlanRunResponse(BaseModel):
+    """One user-confirmable interrupted Plan scoped to a Session."""
+
+    plan_run_id: str
+    goal: str
+    state: Literal["interrupted", "awaiting_reconciliation"]
+    tasks: tuple[PlanRecoveryTaskResponse, ...]
+    pending_invocations: tuple[PlanRecoveryInvocationResponse, ...]
+    updated_at: str
+
+
+class PlanRunResumeResponse(BaseModel):
+    """Outcome of a user-confirmed Plan recovery attempt."""
+
+    plan_run_id: str
+    state: str
+    status: str
+    reason_code: str | None = None
+
+
+class PlanInvocationResolutionRequest(BaseModel):
+    """Human observation needed to settle an uncertain Plan tool call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolution: Literal["executed", "not_executed"]
+    result_text: str | None = Field(default=None, max_length=32_768)
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> PlanInvocationResolutionRequest:
+        if self.resolution == "executed":
+            if self.result_text is None or not self.result_text.strip():
+                raise ValueError("executed resolution requires a non-empty result_text.")
+        elif self.result_text is not None:
+            raise ValueError("not_executed resolution does not accept result_text.")
+        return self
+
+
+class PlanInvocationResolutionResponse(BaseModel):
+    """Acknowledgement that the user's invocation report was persisted."""
 
     resolved: bool
 
@@ -1629,7 +1702,13 @@ async def chat_websocket(websocket: WebSocket) -> None:
                 )
                 continue
             try:
-                body = ChatSocketRequest.model_validate_json(raw_message)
+                raw_body = json.loads(raw_message)
+                if isinstance(raw_body, dict) and raw_body.get("type") == "plan.resume":
+                    body: ChatSocketRequest | PlanResumeSocketRequest = (
+                        PlanResumeSocketRequest.model_validate(raw_body)
+                    )
+                else:
+                    body = ChatSocketRequest.model_validate(raw_body)
             except (ValidationError, ValueError, json.JSONDecodeError):
                 await websocket.send_json(
                     {"type": "chat.error", "data": {"code": "invalid_message"}}
@@ -1652,14 +1731,21 @@ async def chat_websocket(websocket: WebSocket) -> None:
                     _set_runtime_sandbox_mode(websocket.scope["app"], conversation.sandbox_mode)
                     try:
                         with sandbox_mode_scope(conversation.sandbox_mode):
-                            result = await chat_service.send(
-                                body.session_id,
-                                body.message,
-                                confirmation_provider=WebSocketConfirmationProvider(websocket),
-                                task_cache_approval_provider=(
-                                    WebSocketTaskCacheApprovalProvider(websocket)
-                                ),
-                            )
+                            if isinstance(body, PlanResumeSocketRequest):
+                                plan_result = await chat_service.resume_plan_run(
+                                    body.session_id,
+                                    body.plan_run_id,
+                                    confirmation_provider=WebSocketConfirmationProvider(websocket),
+                                )
+                            else:
+                                chat_result = await chat_service.send(
+                                    body.session_id,
+                                    body.message,
+                                    confirmation_provider=WebSocketConfirmationProvider(websocket),
+                                    task_cache_approval_provider=(
+                                        WebSocketTaskCacheApprovalProvider(websocket)
+                                    ),
+                                )
                     finally:
                         _set_runtime_sandbox_mode(websocket.scope["app"], None)
             except RequestTooLargeError:
@@ -1685,17 +1771,40 @@ async def chat_websocket(websocket: WebSocket) -> None:
                 code = "request_timeout"
             except (OutputValidationError, UnsupportedRouteError):
                 code = "request_failed"
+            except RuntimeError:
+                code = "request_failed"
             else:
+                if isinstance(body, PlanResumeSocketRequest):
+                    stored = await websocket.scope[
+                        "app"
+                    ].state.runtime_host.context.tasks.get_plan_run(body.plan_run_id)
+                    output = plan_result.output if isinstance(plan_result.output, dict) else {}
+                    await websocket.send_json(
+                        {
+                            "type": "plan.resume.response",
+                            "data": {
+                                "plan_run_id": body.plan_run_id,
+                                "state": stored.state if stored is not None else "unknown",
+                                "status": plan_result.status.value,
+                                "reason_code": (
+                                    output.get("error_code")
+                                    if isinstance(output.get("error_code"), str)
+                                    else None
+                                ),
+                            },
+                        }
+                    )
+                    continue
                 await websocket.send_json(
                     {
                         "type": "chat.response",
                         "data": ChatResponse(
-                            session_id=result.session_id,
-                            request_id=result.request_id,
-                            assistant_message=result.assistant_message,
-                            route=result.route,
-                            clarification_prompt=result.clarification_prompt,
-                            token_usage=result.token_usage,
+                            session_id=chat_result.session_id,
+                            request_id=chat_result.request_id,
+                            assistant_message=chat_result.assistant_message,
+                            route=chat_result.route,
+                            clarification_prompt=chat_result.clarification_prompt,
+                            token_usage=chat_result.token_usage,
                         ).model_dump(mode="json"),
                     }
                 )
@@ -2114,6 +2223,173 @@ async def get_messages(
 
 
 @router.get(
+    "/conversations/{session_id}/plan-runs/recoverable",
+    response_model=tuple[RecoverablePlanRunResponse, ...],
+    tags=["chat", "recovery"],
+)
+async def list_recoverable_plan_runs(
+    session_id: str,
+    request: Request,
+) -> tuple[RecoverablePlanRunResponse, ...]:
+    """List recoverable Plan progress without exposing tool parameters or keys."""
+    runtime_context = request.app.state.runtime_host.context
+    try:
+        async with runtime_context.sessions.lease(session_id):
+            conversation = await request.app.state.conversations.get(session_id)
+            if conversation is None:
+                raise ConversationNotFoundError(session_id)
+            plan_runs = await runtime_context.tasks.list_recoverable_plan_runs(session_id)
+            responses = []
+            for plan_run in plan_runs:
+                plan_data = plan_run.snapshot.get("plan", {})
+                raw_tasks = plan_data.get("tasks", []) if isinstance(plan_data, dict) else []
+                state_data = plan_run.snapshot.get("states", [])
+                task_states = (
+                    {
+                        item.get("task_id"): item
+                        for item in state_data
+                        if isinstance(item, dict) and isinstance(item.get("task_id"), str)
+                    }
+                    if isinstance(state_data, list)
+                    else {}
+                )
+                tasks = (
+                    tuple(
+                        PlanRecoveryTaskResponse(
+                            task_id=str(item.get("task_id", "")),
+                            description=str(item.get("description", "")),
+                            status=str(
+                                task_states.get(item.get("task_id"), {}).get("status", "pending")
+                            ),
+                            output=task_states.get(item.get("task_id"), {}).get("output"),
+                            error_code=task_states.get(item.get("task_id"), {}).get("error_code"),
+                        )
+                        for item in raw_tasks
+                        if isinstance(item, dict)
+                    )
+                    if isinstance(raw_tasks, list)
+                    else ()
+                )
+                invocation_records = await runtime_context.tasks.list_tool_invocations(
+                    plan_run.plan_run_id
+                )
+                pending = tuple(
+                    PlanRecoveryInvocationResponse(
+                        invocation_id=item.invocation_id,
+                        tool_id=item.tool_id,
+                        retry_class=item.retry_class,
+                        state=item.state,
+                    )
+                    for item in invocation_records
+                    if item.state in {"prepared", "awaiting_reconciliation"}
+                )
+                responses.append(
+                    RecoverablePlanRunResponse(
+                        plan_run_id=plan_run.plan_run_id,
+                        goal=plan_run.goal,
+                        state=plan_run.state,
+                        tasks=tasks,
+                        pending_invocations=pending,
+                        updated_at=plan_run.updated_at.isoformat(),
+                    )
+                )
+    except (ConversationNotFoundError, SessionUnavailableError, ValueError) as error:
+        raise HTTPException(status_code=404, detail="Conversation not found.") from error
+    return tuple(responses)
+
+
+@router.post(
+    "/conversations/{session_id}/plan-runs/{plan_run_id}/resume",
+    response_model=PlanRunResumeResponse,
+    tags=["chat", "recovery"],
+)
+async def resume_plan_run(
+    session_id: str,
+    plan_run_id: str,
+    request: Request,
+) -> PlanRunResumeResponse:
+    """Resume one Plan only after this explicit user action claims the PlanRun."""
+    chat_service: ChatService | None = request.app.state.chat_service
+    if chat_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Agent runtime is not configured; select a model provider first.",
+        )
+    try:
+        async with request.app.state.model_components_lock:
+            result = await chat_service.resume_plan_run(session_id, plan_run_id)
+            stored = await request.app.state.runtime_host.context.tasks.get_plan_run(plan_run_id)
+    except ConversationNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Conversation not found.") from error
+    except (SessionUnavailableError, ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except TimeoutError as error:
+        raise HTTPException(status_code=504, detail="Plan recovery timed out.") from error
+    output = result.output if isinstance(result.output, dict) else {}
+    return PlanRunResumeResponse(
+        plan_run_id=plan_run_id,
+        state=stored.state if stored is not None else "unknown",
+        status=result.status.value,
+        reason_code=(
+            str(output["error_code"]) if isinstance(output.get("error_code"), str) else None
+        ),
+    )
+
+
+@router.post(
+    "/conversations/{session_id}/plan-runs/{plan_run_id}/invocations/{invocation_id}/resolve",
+    response_model=PlanInvocationResolutionResponse,
+    tags=["chat", "recovery"],
+)
+async def resolve_plan_invocation(
+    session_id: str,
+    plan_run_id: str,
+    invocation_id: str,
+    body: PlanInvocationResolutionRequest,
+    request: Request,
+) -> PlanInvocationResolutionResponse:
+    """Persist the user's observed result or explicit no-effect confirmation."""
+    runtime_context = request.app.state.runtime_host.context
+    claimed = False
+    try:
+        async with runtime_context.sessions.lease(session_id):
+            conversation = await request.app.state.conversations.get(session_id)
+            if conversation is None:
+                raise ConversationNotFoundError(session_id)
+            plan_run = await runtime_context.tasks.get_plan_run(plan_run_id)
+            if (
+                plan_run is None
+                or plan_run.session_id != session_id
+                or plan_run.state not in {"interrupted", "awaiting_reconciliation"}
+            ):
+                raise HTTPException(status_code=404, detail="Recoverable PlanRun not found.")
+            records = await runtime_context.tasks.list_tool_invocations(plan_run_id)
+            if not any(
+                item.invocation_id == invocation_id
+                and item.state in {"prepared", "awaiting_reconciliation"}
+                for item in records
+            ):
+                raise HTTPException(status_code=404, detail="Pending Plan invocation not found.")
+            if not await runtime_context.tasks.claim_plan_run(plan_run_id):
+                raise HTTPException(status_code=409, detail="PlanRun is claimed by another Host.")
+            claimed = True
+            await runtime_context.tasks.resolve_tool_invocation(
+                invocation_id,
+                plan_run_id=plan_run_id,
+                state=("user_reported" if body.resolution == "executed" else "not_executed"),
+                reported_result=body.result_text,
+            )
+    except (ConversationNotFoundError, SessionUnavailableError) as error:
+        raise HTTPException(status_code=404, detail="Conversation not found.") from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    finally:
+        if claimed:
+            await runtime_context.tasks.release_plan_run_claim(plan_run_id)
+    return PlanInvocationResolutionResponse(resolved=True)
+
+
+@router.get(
     "/conversations/{session_id}/tool-outcomes",
     response_model=tuple[PendingToolOutcomeResponse, ...],
     tags=["chat", "recovery"],
@@ -2316,6 +2592,10 @@ def create_app(
             )
         )
         app_settings = app_settings.model_copy(update=harness_configuration.model_dump())
+        runtime_context.tasks.configure_result_history(
+            harness_configuration.plan_result_history_limit,
+            harness_configuration.plan_result_history_max_chars,
+        )
         saved_workspace_path = await workspace_configuration_store.get()
         workspace_message: str | None = None
         try:
@@ -2753,6 +3033,10 @@ def create_app(
                 app_settings = candidate_settings
                 application.state.harness_configuration = configuration
                 application.state.settings = effective_mcp_settings()
+                runtime_context.tasks.configure_result_history(
+                    configuration.plan_result_history_limit,
+                    configuration.plan_result_history_max_chars,
+                )
                 memory_controller.max_recall_chars = configuration.max_memory_context_chars
                 if chat_service is not None:
                     chat_service.budget_limits = BudgetLimits(
@@ -3337,6 +3621,10 @@ def create_app(
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         prepare_sqlite_database_path(database_path)
         runtime_context = RuntimeContext()
+        runtime_context.tasks.configure_result_history(
+            app_settings.plan_result_history_limit,
+            app_settings.plan_result_history_max_chars,
+        )
         runtime_host = RuntimeHost(runtime_context)
         configuration_plugin = ConfigurationStoresHostPlugin(
             database_path,

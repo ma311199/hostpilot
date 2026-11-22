@@ -10,6 +10,8 @@ export interface HarnessConfiguration {
   plan_max_tasks: number
   plan_tool_agent_max_turns: number
   plan_tool_candidate_limit: number
+  plan_result_history_limit: number
+  plan_result_history_max_chars: number
   routing_minimum_business_confidence: number
   routing_minimum_business_margin: number
   routing_minimum_plan_candidate_confidence: number

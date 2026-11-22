@@ -16,11 +16,13 @@ from hostpilot.contracts import (
     ModelTokenUsage,
     TimeoutProfile,
     ToolDescriptor,
+    ToolRetryClass,
     ToolType,
     TrustLevel,
 )
 from hostpilot.models import ModelResponse, ModelToolCall
 from hostpilot.runtime import RequestContext
+from hostpilot.runtime.execution import stable_tool_invocation_identity
 from hostpilot.skills.llm_actions import register_llm_completion_action
 from hostpilot.skills.model_plan import (
     GovernedPlanTaskExecutor,
@@ -56,7 +58,12 @@ from hostpilot.skills.runtime import (
     StepActionRegistry,
 )
 from hostpilot.skills.yaml_registry import YamlSkillRegistry
-from hostpilot.task_results import PlanTaskToolUsage, StoredPlanTaskFailure
+from hostpilot.task_results import (
+    PlanTaskToolUsage,
+    StoredPlanTaskFailure,
+    StoredPlanTaskResult,
+    ToolInvocationRecord,
+)
 
 
 def request(
@@ -449,6 +456,40 @@ def test_tool_retrieval_matches_chinese_access_summaries() -> None:
 
 def test_tool_task_react_agent_can_call_multiple_tools_in_one_task() -> None:
     async def scenario() -> None:
+        invocation_events: list[str] = []
+        _, saved_fingerprint = stable_tool_invocation_identity(
+            plan_run_id="plan-1",
+            task_id="review_and_propose",
+            call_index=1,
+            tool_id="read_text_file",
+            arguments={"path": "README.md"},
+        )
+        saved_invocation = ToolInvocationRecord(
+            invocation_id="invocation:read-readme",
+            plan_run_id="plan-1",
+            session_id="conversation-1",
+            turn_id="old-turn",
+            runtime_host_id="host-old",
+            task_run_id="task-run-old",
+            task_id="review_and_propose",
+            call_index=1,
+            tool_id="read_text_file",
+            retry_class="pure_read",
+            idempotency_key=None,
+            request_fingerprint=saved_fingerprint,
+            arguments_json='{"path":"README.md"}',
+            state="prepared",
+            created_at=datetime(2026, 11, 22, tzinfo=UTC),
+        )
+
+        class InvocationJournal:
+            async def list_tool_invocations(self, plan_run_id: str):
+                assert plan_run_id == "plan-1"
+                return (saved_invocation,)
+
+            async def prepare_invocation(self, **kwargs) -> None:
+                invocation_events.append(f"prepared:{kwargs['tool_id']}")
+
         read_schema = {
             "type": "object",
             "properties": {"path": {"type": "string"}},
@@ -474,6 +515,7 @@ def test_tool_task_react_agent_can_call_multiple_tools_in_one_task() -> None:
                 trust_level=TrustLevel.HOST,
                 execution_env=ExecutionEnvironment.HOST,
                 timeout_profile=TimeoutProfile(timeout_seconds=5),
+                retry_class=ToolRetryClass.PURE_READ,
             ),
             "write_text_file": ToolDescriptor(
                 name="write_text_file",
@@ -547,6 +589,7 @@ def test_tool_task_react_agent_can_call_multiple_tools_in_one_task() -> None:
                 self.calls = []
 
             async def call_tool(self, name, arguments, *, budget, confirmation_provider=None):
+                invocation_events.append(f"provider:{name}")
                 budget.consume_tool_call(
                     retrieval=descriptors[name].tool_type is ToolType.RETRIEVAL
                 )
@@ -563,8 +606,17 @@ def test_tool_task_react_agent_can_call_multiple_tools_in_one_task() -> None:
             tool_provider=provider,
             tool_descriptors=descriptors,
         )
+        planned_request = request()
+        planned_request = replace(
+            planned_request,
+            request_context=replace(
+                planned_request.request_context,
+                task_lifecycle=InvocationJournal(),
+                plan_run_id="plan-1",
+            ),
+        )
         call = PlanTaskCall(
-            request=request(),
+            request=planned_request,
             task=PlanTask(
                 task_id="review_and_propose",
                 description=("读取 README.md 和 ROADMAP.md，比较状态，并提交状态报告写入提案。"),
@@ -600,6 +652,13 @@ def test_tool_task_react_agent_can_call_multiple_tools_in_one_task() -> None:
             PlanTaskToolUsage("write_text_file", 1, "unknown"),
         )
         assert executor.tool_agent_diagnostics[0]["turn_count"] == 3
+        assert invocation_events == [
+            "provider:read_text_file",
+            "prepared:read_text_file",
+            "provider:read_text_file",
+            "prepared:write_text_file",
+            "provider:write_text_file",
+        ]
 
     asyncio.run(scenario())
 
@@ -639,6 +698,140 @@ def test_tool_candidate_retrieval_accepts_immutable_plan_input() -> None:
     )
 
     assert tuple(executor._tool_candidates_for(call)) == ("read_text_file",)
+
+
+def test_recovered_plan_invocation_handles_user_report_and_no_effect_confirmation() -> None:
+    async def scenario(state: str):
+        arguments = {"recipient": "ops@example.com", "message": "Report ready"}
+        _, fingerprint = stable_tool_invocation_identity(
+            plan_run_id="plan-recovery",
+            task_id="send_report",
+            call_index=1,
+            tool_id="send_message",
+            arguments=arguments,
+        )
+        invocation = ToolInvocationRecord(
+            invocation_id="invocation-1",
+            plan_run_id="plan-recovery",
+            session_id="conversation-1",
+            turn_id="old-turn",
+            runtime_host_id="host-old",
+            task_run_id="task-run-old",
+            task_id="send_report",
+            call_index=1,
+            tool_id="send_message",
+            retry_class="non_idempotent_write",
+            idempotency_key=None,
+            request_fingerprint=fingerprint,
+            arguments_json=json.dumps(arguments, sort_keys=True, separators=(",", ":")),
+            state=state,
+            created_at=datetime(2026, 11, 22, tzinfo=UTC),
+            reported_result="Observed message id 42" if state == "user_reported" else None,
+        )
+
+        class InvocationJournal:
+            def __init__(self) -> None:
+                self.rearmed: list[str] = []
+
+            async def list_tool_invocations(self, plan_run_id: str):
+                assert plan_run_id == "plan-recovery"
+                return (invocation,)
+
+            async def rearm_invocation(self, invocation_id: str, *, plan_run_id: str):
+                assert plan_run_id == "plan-recovery"
+                self.rearmed.append(invocation_id)
+
+            async def prepare_invocation(self, **kwargs):
+                raise AssertionError(f"Existing call must not create a new key: {kwargs}")
+
+        class ScriptedModel:
+            def __init__(self) -> None:
+                self.requests = []
+
+            async def complete(self, model_request):
+                self.requests.append(model_request)
+                if len(self.requests) == 1:
+                    return ModelResponse(
+                        text="",
+                        tool_calls=(ModelToolCall("send-1", "send_message", arguments),),
+                        token_usage=ModelTokenUsage(
+                            input_tokens=1, output_tokens=1, total_tokens=2
+                        ),
+                    )
+                return ModelResponse(
+                    text="The report is ready.",
+                    token_usage=ModelTokenUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                )
+
+        class ToolProvider:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            async def call_tool(self, name, tool_arguments, *, budget, confirmation_provider=None):
+                del tool_arguments, confirmation_provider
+                budget.consume_tool_call()
+                self.calls.append(name)
+                return {"message_id": "42"}
+
+        descriptor = ToolDescriptor(
+            name="send_message",
+            description="Send a message",
+            access_summary="发送一条消息",
+            input_schema={"type": "object"},
+            tool_type=ToolType.ACTION,
+            trust_level=TrustLevel.HOST,
+            execution_env=ExecutionEnvironment.HOST,
+            timeout_profile=TimeoutProfile(timeout_seconds=5),
+            retry_class=ToolRetryClass.NON_IDEMPOTENT_WRITE,
+        )
+        journal = InvocationJournal()
+        tool_provider = ToolProvider()
+        model = ScriptedModel()
+        planned_request = request()
+        planned_request = replace(
+            planned_request,
+            request_context=replace(
+                planned_request.request_context,
+                task_lifecycle=journal,
+                plan_run_id="plan-recovery",
+            ),
+        )
+        result = await GovernedPlanTaskExecutor(
+            model,
+            skills=None,
+            tool_provider=tool_provider,
+            tool_descriptors={"send_message": descriptor},
+        ).execute_task(
+            PlanTaskCall(
+                request=planned_request,
+                task=PlanTask(
+                    task_id="send_report",
+                    description="Send the report",
+                    execution_type=PlanExecutionType.TOOL_TASK,
+                ),
+                dependencies={},
+                blackboard=BlackboardSnapshot(()),
+                idempotency_key="plan-task-key",
+            )
+        )
+        tool_messages = [
+            message.content
+            for message in model.requests[-1].messages
+            if message.role.value == "tool"
+        ]
+        return result, tool_provider, journal, tool_messages
+
+    reported = asyncio.run(scenario("user_reported"))
+    not_executed = asyncio.run(scenario("not_executed"))
+
+    assert reported[0].succeeded is True
+    assert reported[1].calls == []
+    assert "Observed message id 42" in " ".join(reported[3])
+    assert "not independently verified" in " ".join(reported[3])
+    assert reported[2].rearmed == []
+    assert not_executed[0].succeeded is True
+    assert not_executed[1].calls == ["send_message"]
+    assert not_executed[2].rearmed == ["invocation-1"]
 
 
 def test_structured_response_parser_accepts_json_surrounded_by_commentary() -> None:
@@ -756,6 +949,53 @@ def test_planner_receives_safe_prior_failure_summaries() -> None:
             "side_effect_count": 0,
         }
     ]
+
+
+def test_planner_receives_prior_results_as_reference_not_current_completions() -> None:
+    model = FakeTextModel(
+        {
+            "tasks": [
+                {
+                    "task_id": "answer",
+                    "description": "Use prior findings if still relevant",
+                    "execution_type": "reasoning_task",
+                    "expected_output": "A grounded answer",
+                    "input": {},
+                }
+            ]
+        }
+    )
+    prior = StoredPlanTaskResult(
+        task_run_id="run-1",
+        task_id="inspect",
+        turn_id="turn-1",
+        session_id="conversation-1",
+        task_fingerprint=f"v1:{'a' * 64}",
+        description="Inspect the source",
+        input={"path": "README.md"},
+        depends_on=(),
+        output={"finding": "Earlier decision"},
+        finished_at=datetime(2026, 11, 22, tzinfo=UTC),
+    )
+
+    async def scenario() -> None:
+        await LLMPlanner(model, ()).create_plan(
+            request(), BlackboardSnapshot((), prior_results=(prior,))
+        )
+
+    asyncio.run(scenario())
+
+    assert model.data["prior_results"] == [
+        {
+            "task_id": "inspect",
+            "description": "Inspect the source",
+            "input": {"path": "README.md"},
+            "depends_on": [],
+            "output": {"finding": "Earlier decision"},
+            "execution_summary": None,
+        }
+    ]
+    assert model.data["completed_results"] == {}
 
 
 def test_planner_rejects_capability_selection_inside_task_input() -> None:

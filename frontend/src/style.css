@@ -1756,6 +1756,13 @@ p {
   font-weight: 600;
 }
 
+.harness-settings-group label small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
 .harness-settings-group input {
   width: 100%;
   min-height: 42px;
@@ -2749,4 +2756,187 @@ summary:focus-visible,
 .tool-outcome-actions button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
+}
+
+.plan-recovery {
+  display: grid;
+  gap: 1rem;
+  margin: 1rem 1.5rem 0;
+  padding: 1rem;
+  border: 1px solid #95b9a5;
+  border-radius: 1rem;
+  background: #f1f8f3;
+  color: #193b30;
+}
+
+.plan-recovery-heading p {
+  margin: 0.35rem 0 0;
+  color: #536a5e;
+  font-size: 0.86rem;
+  line-height: 1.5;
+}
+
+.plan-recovery-item {
+  display: grid;
+  gap: 0.85rem;
+  padding: 1rem;
+  border: 1px solid #cbdccf;
+  border-radius: 0.8rem;
+  background: #fff;
+}
+
+.plan-recovery-meta,
+.plan-recovery-task-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.8rem;
+}
+
+.plan-recovery-meta > span,
+.plan-recovery-meta time,
+.plan-recovery-task-heading > span {
+  color: #5f7468;
+  font-size: 0.78rem;
+}
+
+.plan-recovery-tasks {
+  display: grid;
+  gap: 0.65rem;
+  margin: 0;
+  padding-left: 1.35rem;
+}
+
+.plan-recovery-tasks li {
+  padding-left: 0.2rem;
+}
+
+.plan-recovery-tasks pre {
+  max-height: 12rem;
+  overflow: auto;
+  margin: 0.45rem 0 0;
+  padding: 0.7rem;
+  border-radius: 0.55rem;
+  background: #f4f7f4;
+  color: #33483d;
+  font: 0.78rem/1.5 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.plan-recovery-tasks small {
+  display: block;
+  margin-top: 0.35rem;
+  color: #8a4a35;
+}
+
+.plan-recovery-invocations {
+  display: grid;
+  gap: 0.75rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid #dfe9e1;
+}
+
+.plan-recovery-invocation {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.8rem;
+  border: 1px solid #e1d2ae;
+  border-radius: 0.7rem;
+  background: #fffaf0;
+}
+
+.plan-recovery-invocation label {
+  font-size: 0.82rem;
+  font-weight: 650;
+}
+
+.plan-recovery-invocation textarea {
+  width: 100%;
+  min-height: 5.5rem;
+  resize: vertical;
+  border: 1px solid #c9b98e;
+  border-radius: 0.6rem;
+  padding: 0.7rem;
+  color: var(--ink);
+  background: #fffefa;
+  font: inherit;
+}
+
+.plan-recovery-invocation textarea:focus-visible {
+  outline: 3px solid #7aa68a;
+  outline-offset: 2px;
+}
+
+.plan-recovery-actions,
+.plan-recovery-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.plan-recovery-actions button,
+.plan-recovery-footer button {
+  min-height: 44px;
+  border: 1px solid #9aab9e;
+  border-radius: 999px;
+  padding: 0.55rem 1rem;
+  color: #294737;
+  background: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.plan-recovery-actions .plan-recovery-primary,
+.plan-recovery-footer .plan-recovery-primary {
+  border-color: #176a50;
+  color: #fff;
+  background: #176a50;
+}
+
+.plan-recovery-actions button:disabled,
+.plan-recovery-footer button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.plan-recovery-actions :focus-visible,
+.plan-recovery-footer :focus-visible {
+  outline: 3px solid #7aa68a;
+  outline-offset: 2px;
+}
+
+.plan-recovery-footer small {
+  color: #705b32;
+}
+
+.plan-recovery-status {
+  margin: 0.5rem 1.5rem 0;
+  color: #176a50;
+  font-size: 0.88rem;
+}
+
+@media (max-width: 760px) {
+  .plan-recovery {
+    margin-right: 0.75rem;
+    margin-left: 0.75rem;
+    padding: 0.8rem;
+  }
+
+  .plan-recovery-item {
+    padding: 0.75rem;
+  }
+
+  .plan-recovery-actions,
+  .plan-recovery-footer {
+    justify-content: stretch;
+  }
+
+  .plan-recovery-actions button,
+  .plan-recovery-footer button {
+    flex: 1 1 100%;
+  }
 }

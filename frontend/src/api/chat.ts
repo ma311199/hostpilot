@@ -27,6 +27,13 @@ export interface ChatResponse {
   token_usage: { input_tokens: number; output_tokens: number; total_tokens: number } | null
 }
 
+export interface PlanRunResumeResponse {
+  plan_run_id: string
+  state: string
+  status: string
+  reason_code: string | null
+}
+
 export interface PendingToolOutcome {
   tool_call_id: string
   tool_name: string
@@ -37,6 +44,34 @@ export interface PendingToolOutcome {
 export type ToolOutcomeResolution =
   | { resolution: 'completed'; result_text: string }
   | { resolution: 'not_applied' }
+
+export interface PlanRecoveryInvocation {
+  invocation_id: string
+  tool_id: string
+  retry_class: string
+  state: 'prepared' | 'awaiting_reconciliation'
+}
+
+export interface PlanRecoveryTask {
+  task_id: string
+  description: string
+  status: string
+  output: unknown
+  error_code: string | null
+}
+
+export interface RecoverablePlanRun {
+  plan_run_id: string
+  goal: string
+  state: 'interrupted' | 'awaiting_reconciliation'
+  tasks: PlanRecoveryTask[]
+  pending_invocations: PlanRecoveryInvocation[]
+  updated_at: string
+}
+
+export type PlanInvocationResolution =
+  | { resolution: 'executed'; result_text: string }
+  | { resolution: 'not_executed' }
 
 const defaultApiBaseUrl = 'http://127.0.0.1:8000/api/v1'
 
@@ -117,6 +152,34 @@ export function resolveToolOutcome(
 ): Promise<{ resolved: boolean }> {
   return request<{ resolved: boolean }>(
     `/conversations/${encodeURIComponent(sessionId)}/tool-outcomes/${encodeURIComponent(toolCallId)}/resolve`,
+    { method: 'POST', body: JSON.stringify(resolution) },
+  )
+}
+
+export function listRecoverablePlanRuns(sessionId: string): Promise<RecoverablePlanRun[]> {
+  return request<RecoverablePlanRun[]>(
+    `/conversations/${encodeURIComponent(sessionId)}/plan-runs/recoverable`,
+  )
+}
+
+export function resumePlanRun(
+  sessionId: string,
+  planRunId: string,
+): Promise<PlanRunResumeResponse> {
+  return request<PlanRunResumeResponse>(
+    `/conversations/${encodeURIComponent(sessionId)}/plan-runs/${encodeURIComponent(planRunId)}/resume`,
+    { method: 'POST' },
+  )
+}
+
+export function resolvePlanInvocation(
+  sessionId: string,
+  planRunId: string,
+  invocationId: string,
+  resolution: PlanInvocationResolution,
+): Promise<{ resolved: boolean }> {
+  return request(
+    `/conversations/${encodeURIComponent(sessionId)}/plan-runs/${encodeURIComponent(planRunId)}/invocations/${encodeURIComponent(invocationId)}/resolve`,
     { method: 'POST', body: JSON.stringify(resolution) },
   )
 }

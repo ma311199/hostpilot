@@ -289,6 +289,9 @@ def create_default_chat_agent_runtime_registry() -> ChatAgentRuntimeRegistry:
             tools=context.runtime_tool_definitions,
             allowed_tool_ids=context.runtime_allowed_tool_ids,
             tool_side_effects=context.runtime_tool_side_effects or {},
+            tool_retry_classes=context.runtime_tool_retry_classes or {},
+            idempotency_windows=context.runtime_idempotency_windows or {},
+            idempotency_business_fields=context.runtime_idempotency_business_fields or {},
             skill_runtime=skill_runtime,
         )
 
@@ -401,6 +404,26 @@ def create_configured_chat_agent_runtime(
             runtime_tool_side_effects={
                 descriptor.name: descriptor.side_effect
                 for descriptor in _tool_descriptors(tool_provider)
+            }
+            if tool_provider is not None
+            else {},
+            runtime_tool_retry_classes={
+                descriptor.name: descriptor.effective_retry_class
+                for descriptor in _tool_descriptors(tool_provider)
+            }
+            if tool_provider is not None
+            else {},
+            runtime_idempotency_windows={
+                descriptor.name: descriptor.idempotency_window_seconds
+                for descriptor in _tool_descriptors(tool_provider)
+                if descriptor.idempotency_window_seconds is not None
+            }
+            if tool_provider is not None
+            else {},
+            runtime_idempotency_business_fields={
+                descriptor.name: descriptor.idempotency_business_fields
+                for descriptor in _tool_descriptors(tool_provider)
+                if descriptor.idempotency_business_fields
             }
             if tool_provider is not None
             else {},

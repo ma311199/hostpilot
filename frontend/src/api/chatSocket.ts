@@ -1,4 +1,4 @@
-import type { ChatResponse } from './chat'
+import type { ChatResponse, PlanRunResumeResponse } from './chat'
 
 interface ChatResponseMessage {
   type: 'chat.response'
@@ -8,6 +8,11 @@ interface ChatResponseMessage {
 interface ChatErrorMessage {
   type: 'chat.error'
   data: { code: string }
+}
+
+interface PlanResumeResponseMessage {
+  type: 'plan.resume.response'
+  data: PlanRunResumeResponse
 }
 
 export interface ToolConfirmationMessage {
@@ -46,6 +51,7 @@ interface PlanTaskCacheRequestMessage {
 type ChatServerMessage =
   | ChatResponseMessage
   | ChatErrorMessage
+  | PlanResumeResponseMessage
   | ToolConfirmationRequestMessage
   | PlanTaskCacheRequestMessage
 
@@ -97,6 +103,24 @@ function parseChatMessage(raw: string): ChatServerMessage | null {
       }
     }
     if (
+      candidate.type === 'plan.resume.response' &&
+      typeof candidate.data === 'object' &&
+      candidate.data
+    ) {
+      const data = candidate.data as Record<string, unknown>
+      if (
+        typeof data.plan_run_id === 'string' &&
+        typeof data.state === 'string' &&
+        typeof data.status === 'string' &&
+        (typeof data.reason_code === 'string' || data.reason_code === null)
+      ) {
+        return {
+          type: 'plan.resume.response',
+          data: data as unknown as PlanRunResumeResponse,
+        }
+      }
+    }
+    if (
       candidate.type === 'tool.confirmation.request' &&
       typeof candidate.data === 'object' &&
       candidate.data
@@ -145,10 +169,18 @@ function parseChatMessage(raw: string): ChatServerMessage | null {
 export class ChatSocketClient {
   private socket: WebSocket | null = null
   private connecting: Promise<void> | null = null
-  private pending: {
-    resolve: (response: ChatResponse) => void
-    reject: (error: Error) => void
-  } | null = null
+  private pending:
+    | {
+        kind: 'chat'
+        resolve: (response: ChatResponse) => void
+        reject: (error: Error) => void
+      }
+    | {
+        kind: 'plan.resume'
+        resolve: (response: PlanRunResumeResponse) => void
+        reject: (error: Error) => void
+      }
+    | null = null
   onConfirmation: ((request: ToolConfirmationMessage) => void) | null = null
   onTaskCacheApproval: ((request: PlanTaskCacheMessage) => void) | null = null
 
@@ -160,7 +192,7 @@ export class ChatSocketClient {
     }
 
     return new Promise<ChatResponse>((resolve, reject) => {
-      this.pending = { resolve, reject }
+      this.pending = { kind: 'chat', resolve, reject }
       try {
         this.socket?.send(JSON.stringify({
           type: 'chat.send',
@@ -170,6 +202,31 @@ export class ChatSocketClient {
       } catch {
         this.pending = null
         reject(new Error('无法发送消息，请重试。'))
+      }
+    })
+  }
+
+  async resumePlanRun(
+    sessionId: string,
+    planRunId: string,
+  ): Promise<PlanRunResumeResponse> {
+    await this.connect()
+    if (this.pending) throw new Error('上一条消息仍在处理中。')
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error('聊天连接已断开，请重试。')
+    }
+
+    return new Promise<PlanRunResumeResponse>((resolve, reject) => {
+      this.pending = { kind: 'plan.resume', resolve, reject }
+      try {
+        this.socket?.send(JSON.stringify({
+          type: 'plan.resume',
+          session_id: sessionId,
+          plan_run_id: planRunId,
+        }))
+      } catch {
+        this.pending = null
+        reject(new Error('无法恢复 Plan，请重试。'))
       }
     })
   }
@@ -246,10 +303,14 @@ export class ChatSocketClient {
     if (!this.pending) return
     const pending = this.pending
     this.pending = null
-    if (message.type === 'chat.response') {
+    if (message.type === 'chat.response' && pending.kind === 'chat') {
       pending.resolve(message.data)
-    } else {
+    } else if (message.type === 'plan.resume.response' && pending.kind === 'plan.resume') {
+      pending.resolve(message.data)
+    } else if (message.type === 'chat.error') {
       pending.reject(new Error(errorMessages[message.data.code] || '聊天请求失败。'))
+    } else {
+      pending.reject(new Error('聊天服务返回了不匹配的响应。'))
     }
   }
 

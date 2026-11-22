@@ -95,6 +95,14 @@ class ChatAgentRuntimeHostPlugin:
         async with self._agents.lease() as runtime:
             return await cast(ChatAgentRuntime, runtime).respond(message, request_context)
 
+    async def resume_plan_run(self, plan_run_id: str, request_context: RequestContext) -> Any:
+        """Forward explicit Plan recovery to the active Runtime generation."""
+        async with self._agents.lease() as runtime:
+            resume = getattr(runtime, "resume_plan_run", None)
+            if not callable(resume):
+                raise RuntimeError("The active Runtime cannot resume PlanRuns.")
+            return await resume(plan_run_id, request_context)
+
     async def record_turn(
         self,
         session_id: str,

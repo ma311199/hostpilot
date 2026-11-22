@@ -25,6 +25,9 @@ class RequestContext:
     confirmation_provider: AsyncConfirmationProvider | None = None
     task_cache_approval_provider: TaskCacheApprovalProvider | None = None
     task_lifecycle: TaskLifecycleManager | None = None
+    plan_run_id: str | None = None
+    task_run_id: str | None = None
+    tool_call_index_start: int = 1
 
 
 class TaskCacheDecision(StrEnum):

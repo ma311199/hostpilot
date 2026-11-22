@@ -218,6 +218,21 @@ class SQLiteSessionLifecycleStore:
             await connection.execute(
                 "DELETE FROM runtime_session_leases WHERE session_id = ?", (session_id,)
             )
+            for table_name in (
+                "runtime_tool_invocations",
+                "runtime_plan_runs",
+                "runtime_plan_task_results",
+                "runtime_plan_task_failures",
+                "runtime_task_runs",
+            ):
+                table_cursor = await connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (table_name,),
+                )
+                if await table_cursor.fetchone() is not None:
+                    await connection.execute(
+                        f"DELETE FROM {table_name} WHERE session_id = ?", (session_id,)
+                    )
             await connection.execute(
                 "UPDATE runtime_sessions SET state = 'deleted', closing_host_id = NULL "
                 "WHERE session_id = ? AND state = 'closing'",

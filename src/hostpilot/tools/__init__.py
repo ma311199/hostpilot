@@ -6,7 +6,7 @@ from hostpilot.tools.executor import (
     ToolExecutionError,
     ToolExecutor,
 )
-from hostpilot.tools.facade import ToolFacade
+from hostpilot.tools.facade import IdempotentToolInvoker, ToolFacade
 from hostpilot.tools.filesystem import WorkspaceFileError, WorkspaceFiles, WorkspaceReadOnlyError
 from hostpilot.tools.governance import (
     DefaultToolExecutorFactory,
@@ -28,6 +28,7 @@ __all__ = [
     "ToolDeniedError",
     "ToolExecutionError",
     "ToolFacade",
+    "IdempotentToolInvoker",
     "DefaultToolExecutorFactory",
     "ToolExecutionScope",
     "ToolExecutorFactory",

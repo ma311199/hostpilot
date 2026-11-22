@@ -19,6 +19,8 @@ const configuration = reactive<HarnessConfiguration>({
   plan_max_tasks: 10,
   plan_tool_agent_max_turns: 5,
   plan_tool_candidate_limit: 5,
+  plan_result_history_limit: 32,
+  plan_result_history_max_chars: 65536,
   routing_minimum_business_confidence: 0.85,
   routing_minimum_business_margin: 0.3,
   routing_minimum_plan_candidate_confidence: 0.5,
@@ -152,7 +154,7 @@ function messageFor(error: unknown): string {
       <details class="harness-settings-group">
         <summary class="harness-settings-group-heading">
           <h2>Plan 子 Agent</h2>
-          <p>每个工具子任务由受限 ReAct Agent 循环执行；每轮实际工具调用仍受总工具预算、权限和审批控制。</p>
+          <p>每个工具子任务由受限 ReAct Agent 循环执行。历史成功结果仅供 Planner 参考，不代表本轮已完成；实际工具调用仍受总预算、权限和审批控制。</p>
         </summary>
         <label>
           <span>Plan 最多拆分子任务数</span>
@@ -186,6 +188,30 @@ function messageFor(error: unknown): string {
             aria-label="每个任务最多检索工具数"
             required
           >
+        </label>
+        <label>
+          <span>Plan 历史成功结果条数</span>
+          <input
+            v-model.number="configuration.plan_result_history_limit"
+            type="number"
+            min="1"
+            max="128"
+            aria-label="Plan 历史成功结果条数"
+            required
+          >
+          <small>每个新 Plan 最多读取当前会话之前的最近记录；不会删除 SQLite 中的旧记录。</small>
+        </label>
+        <label>
+          <span>Plan 历史结果总字符数</span>
+          <input
+            v-model.number="configuration.plan_result_history_max_chars"
+            type="number"
+            min="1"
+            max="262144"
+            aria-label="Plan 历史结果总字符数"
+            required
+          >
+          <small>按任务说明、输入、依赖、输出和执行摘要累计；历史内容仅作为 Planner 参考。</small>
         </label>
       </details>
 

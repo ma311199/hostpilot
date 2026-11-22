@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -13,6 +14,7 @@ from hostpilot.contracts import (
     BudgetLimits,
     ContextSnapshot,
     ModelTokenUsage,
+    ToolRetryClass,
     ToolSideEffect,
 )
 from hostpilot.models import (
@@ -28,6 +30,11 @@ from hostpilot.runtime import (
     RuntimeExecutionRequest,
     RuntimeExecutionStatus,
     RuntimeToolReplay,
+)
+from hostpilot.runtime.execution import (
+    ToolInvocationRecoveryAction,
+    decide_tool_invocation_recovery,
+    stable_tool_invocation_identity,
 )
 from hostpilot.runtime.execution_loop import DefaultRuntimeExecutionLoop, RuntimeToolProposalError
 
@@ -46,6 +53,222 @@ def execution_context() -> RequestContext:
             )
         ),
     )
+
+
+def test_stable_tool_identity_uses_logical_business_fields_and_request_fingerprint() -> None:
+    first = stable_tool_invocation_identity(
+        plan_run_id="plan-run-1",
+        task_id="send-invoice",
+        call_index=1,
+        tool_id="billing/send_invoice",
+        arguments={"invoice_id": "invoice-42", "amount": 25},
+        business_fields=("invoice_id",),
+    )
+    reordered = stable_tool_invocation_identity(
+        plan_run_id="plan-run-1",
+        task_id="send-invoice",
+        call_index=1,
+        tool_id="billing/send_invoice",
+        arguments={"amount": 25, "invoice_id": "invoice-42"},
+        business_fields=("invoice_id",),
+    )
+    changed_payload = stable_tool_invocation_identity(
+        plan_run_id="plan-run-1",
+        task_id="send-invoice",
+        call_index=1,
+        tool_id="billing/send_invoice",
+        arguments={"invoice_id": "invoice-42", "amount": 50},
+        business_fields=("invoice_id",),
+    )
+    other_business_item = stable_tool_invocation_identity(
+        plan_run_id="plan-run-1",
+        task_id="send-invoice",
+        call_index=1,
+        tool_id="billing/send_invoice",
+        arguments={"invoice_id": "invoice-43", "amount": 25},
+        business_fields=("invoice_id",),
+    )
+
+    assert first == reordered
+    assert first[0] == changed_payload[0]
+    assert first[1] != changed_payload[1]
+    assert first[0] != other_business_item[0]
+
+
+def test_loop_journals_tool_before_provider_and_marks_it_after_checkpoint() -> None:
+    events: list[str] = []
+    context = execution_context()
+    call = ModelToolCall("call-1", "search_files", {"pattern": "*.py"})
+    model = SequenceModelPort(
+        [ModelResponse(text="", tool_calls=(call,)), ModelResponse(text="Done.")]
+    )
+
+    class InvocationJournal:
+        async def prepare_invocation(self, **kwargs) -> None:
+            events.append(f"prepared:{kwargs['tool_id']}")
+
+        async def complete_invocation(self, invocation_id: str, *, plan_run_id) -> None:
+            events.append(f"completed:{invocation_id}")
+
+    class OrderedToolPort(RecordingToolPort):
+        async def execute(self, request_context, tool_call):
+            events.append(f"provider:{tool_call.name}")
+            return await super().execute(request_context, tool_call)
+
+    async def persist(messages) -> None:
+        if any(message.role is ModelRole.TOOL for message in messages):
+            events.append("checkpoint:tool-result")
+
+    async def scenario() -> None:
+        await DefaultRuntimeExecutionLoop(model, OrderedToolPort()).run(
+            RuntimeExecutionRequest(
+                request_context=context,
+                messages=(ModelMessage(role=ModelRole.USER, content="Find Python files."),),
+                tools=(definition(),),
+                allowed_tool_ids=frozenset({"search_files"}),
+                tool_side_effects={"search_files": ToolSideEffect.NONE},
+                tool_invocations=InvocationJournal(),
+                message_sink=persist,
+            )
+        )
+
+    asyncio.run(scenario())
+    assert events[:3] == [
+        "prepared:search_files",
+        "provider:search_files",
+        "checkpoint:tool-result",
+    ]
+    assert events[3].startswith("completed:invocation:hostpilot:v1:")
+
+
+def test_loop_does_not_dispatch_when_invocation_journal_write_fails() -> None:
+    context = execution_context()
+    call = ModelToolCall("call-1", "search_files", {"pattern": "*.py"})
+    model = SequenceModelPort(
+        [ModelResponse(text="", tool_calls=(call,)), ModelResponse(text="Done.")]
+    )
+    tools = RecordingToolPort()
+
+    class FailingInvocationJournal:
+        async def prepare_invocation(self, **kwargs) -> None:
+            raise OSError("SQLite is unavailable")
+
+        async def complete_invocation(self, invocation_id: str, *, plan_run_id) -> None:
+            raise AssertionError("A failed prepare must not be completed.")
+
+    async def scenario() -> None:
+        with pytest.raises(OSError, match="SQLite is unavailable"):
+            await DefaultRuntimeExecutionLoop(model, tools).run(
+                RuntimeExecutionRequest(
+                    request_context=context,
+                    messages=(ModelMessage(role=ModelRole.USER, content="Find files."),),
+                    tools=(definition(),),
+                    allowed_tool_ids=frozenset({"search_files"}),
+                    tool_side_effects={"search_files": ToolSideEffect.NONE},
+                    tool_invocations=FailingInvocationJournal(),
+                )
+            )
+
+    asyncio.run(scenario())
+    assert tools.calls == []
+
+
+def test_loop_refuses_idempotent_write_without_durable_invocation_journal() -> None:
+    context = execution_context()
+    call = ModelToolCall("call-1", "send_message", {"message_id": "message-1"})
+    model = SequenceModelPort(
+        [ModelResponse(text="", tool_calls=(call,)), ModelResponse(text="Done.")]
+    )
+    tools = RecordingToolPort()
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeError, match="requires a durable invocation journal"):
+            await DefaultRuntimeExecutionLoop(model, tools).run(
+                RuntimeExecutionRequest(
+                    request_context=context,
+                    messages=(ModelMessage(role=ModelRole.USER, content="Send it."),),
+                    tools=(definition("send_message"),),
+                    allowed_tool_ids=frozenset({"send_message"}),
+                    tool_retry_classes={
+                        "send_message": ToolRetryClass.IDEMPOTENT_WRITE,
+                    },
+                    idempotency_windows={"send_message": 600},
+                    tool_outcomes=RecordingOutcomeLifecycle([]),
+                )
+            )
+
+    asyncio.run(scenario())
+    assert tools.calls == []
+
+
+def test_recovery_decision_retries_pure_reads_and_only_replays_valid_idempotent_writes() -> None:
+    now = datetime(2026, 11, 22, 10, 0, tzinfo=UTC)
+    assert (
+        decide_tool_invocation_recovery(
+            retry_class=ToolRetryClass.PURE_READ,
+            prepared_record_exists=True,
+            request_fingerprint="sha256:same",
+            prior_request_fingerprint="sha256:same",
+            now=now,
+        ).action
+        is ToolInvocationRecoveryAction.RETRY_READ
+    )
+    assert (
+        decide_tool_invocation_recovery(
+            retry_class=ToolRetryClass.IDEMPOTENT_WRITE,
+            prepared_record_exists=True,
+            request_fingerprint="sha256:same",
+            prior_request_fingerprint="sha256:same",
+            idempotency_key="hostpilot:v1:key",
+            idempotency_expires_at=now + timedelta(seconds=30),
+            idempotency_supported=True,
+            now=now,
+        ).action
+        is ToolInvocationRecoveryAction.REPLAY_WITH_KEY
+    )
+
+
+@pytest.mark.parametrize(
+    ("retry_class", "fingerprint", "expires_at", "supported", "key"),
+    [
+        (ToolRetryClass.IDEMPOTENT_WRITE, "sha256:changed", None, True, "key"),
+        (
+            ToolRetryClass.IDEMPOTENT_WRITE,
+            "sha256:same",
+            datetime(2026, 11, 22, 9, 0, tzinfo=UTC),
+            True,
+            "key",
+        ),
+        (ToolRetryClass.NON_IDEMPOTENT_WRITE, "sha256:same", None, False, None),
+        (ToolRetryClass.UNKNOWN, "sha256:same", None, False, None),
+    ],
+)
+def test_recovery_decision_reconciles_when_write_replay_cannot_be_proven(
+    retry_class, fingerprint, expires_at, supported, key
+) -> None:
+    decision = decide_tool_invocation_recovery(
+        retry_class=retry_class,
+        prepared_record_exists=True,
+        request_fingerprint=fingerprint,
+        prior_request_fingerprint="sha256:same",
+        idempotency_key=key,
+        idempotency_expires_at=expires_at,
+        idempotency_supported=supported,
+        now=datetime(2026, 11, 22, 10, 0, tzinfo=UTC),
+    )
+
+    assert decision.action is ToolInvocationRecoveryAction.RECONCILE
+
+
+def test_recovery_decision_allows_new_dispatch_only_when_no_prepared_record_exists() -> None:
+    decision = decide_tool_invocation_recovery(
+        retry_class=ToolRetryClass.UNKNOWN,
+        prepared_record_exists=False,
+        request_fingerprint="sha256:new",
+        now=datetime(2026, 11, 22, 10, 0, tzinfo=UTC),
+    )
+
+    assert decision.action is ToolInvocationRecoveryAction.DISPATCH
 
 
 def definition(name: str = "search_files") -> ModelToolDefinition:

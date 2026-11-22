@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,8 +23,12 @@ from hostpilot.skills.compensation import CancellationSnapshot
 from hostpilot.task_results import (
     CompletedPlanTaskResult,
     FailedPlanTaskSummary,
+    PlanRunSnapshot,
+    PlanRunState,
     StoredPlanTaskFailure,
     StoredPlanTaskResult,
+    ToolInvocationRecord,
+    ToolInvocationState,
 )
 
 
@@ -170,6 +174,100 @@ class TaskStore(Protocol):
 
     async def initialize(self) -> None: ...
 
+    async def create_plan_run(
+        self,
+        *,
+        plan_run_id: str,
+        turn_id: str,
+        session_id: str,
+        runtime_host_id: str,
+        goal: str,
+        snapshot: Mapping[str, object],
+        started_at: datetime,
+    ) -> None: ...
+
+    async def update_plan_run(
+        self,
+        plan_run_id: str,
+        *,
+        runtime_host_id: str,
+        state: PlanRunState,
+        snapshot: Mapping[str, object],
+        updated_at: datetime,
+    ) -> None: ...
+
+    async def get_plan_run(self, plan_run_id: str) -> PlanRunSnapshot | None: ...
+
+    async def list_recoverable_plan_runs(self, session_id: str) -> tuple[PlanRunSnapshot, ...]: ...
+
+    async def claim_plan_run(
+        self, plan_run_id: str, *, runtime_host_id: str, now: datetime
+    ) -> bool: ...
+
+    async def release_plan_run_claim(self, plan_run_id: str, *, runtime_host_id: str) -> None: ...
+
+    async def record_tool_invocation(
+        self,
+        *,
+        invocation_id: str,
+        plan_run_id: str,
+        task_run_id: str,
+        task_id: str,
+        call_index: int,
+        tool_id: str,
+        retry_class: str,
+        idempotency_key: str | None,
+        request_fingerprint: str,
+        arguments_json: str,
+        created_at: datetime,
+        runtime_host_id: str,
+        idempotency_window_seconds: int | None = None,
+    ) -> None: ...
+
+    async def record_runtime_tool_invocation(
+        self,
+        *,
+        invocation_id: str,
+        session_id: str,
+        turn_id: str,
+        runtime_host_id: str,
+        task_run_id: str | None,
+        task_id: str,
+        call_index: int,
+        tool_id: str,
+        retry_class: str,
+        idempotency_key: str | None,
+        request_fingerprint: str,
+        arguments_json: str,
+        idempotency_window_seconds: int | None,
+        created_at: datetime,
+    ) -> None: ...
+
+    async def finish_tool_invocation(
+        self,
+        invocation_id: str,
+        *,
+        plan_run_id: str | None,
+        runtime_host_id: str,
+        state: ToolInvocationState,
+        finished_at: datetime,
+    ) -> None: ...
+
+    async def list_tool_invocations(
+        self, plan_run_id: str | None = None, *, session_id: str | None = None
+    ) -> tuple[ToolInvocationRecord, ...]: ...
+
+    async def resolve_tool_invocation(
+        self,
+        invocation_id: str,
+        *,
+        plan_run_id: str,
+        runtime_host_id: str,
+        state: Literal["user_reported", "not_executed"],
+        reported_result: str | None,
+        resolved_at: datetime,
+    ) -> None: ...
+
     async def create_task_run(
         self,
         *,
@@ -190,6 +288,8 @@ class TaskStore(Protocol):
         finished_at: datetime,
         completed_result: CompletedPlanTaskResult | None = None,
         failure_summary: FailedPlanTaskSummary | None = None,
+        plan_run_id: str | None = None,
+        plan_snapshot: Mapping[str, object] | None = None,
     ) -> None: ...
 
     async def find_completed_task_result(
@@ -201,7 +301,12 @@ class TaskStore(Protocol):
     ) -> tuple[StoredPlanTaskFailure, ...]: ...
 
     async def list_completed_task_results(
-        self, *, session_id: str, exclude_turn_id: str, limit: int
+        self,
+        *,
+        session_id: str,
+        exclude_turn_id: str,
+        limit: int,
+        max_chars: int = 65_536,
     ) -> tuple[StoredPlanTaskResult, ...]: ...
 
     async def interrupt_inactive_host_tasks(self, *, now: datetime) -> int: ...

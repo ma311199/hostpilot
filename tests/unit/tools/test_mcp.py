@@ -22,6 +22,7 @@ from hostpilot.contracts import (
     TimeoutProfile,
     ToolConnectionState,
     ToolDescriptor,
+    ToolRetryClass,
     ToolSideEffect,
     ToolType,
     TrustLevel,
@@ -768,6 +769,9 @@ def test_remote_mcp_server_tools_are_namespaced_and_require_approval() -> None:
         assert descriptor.trust_level is TrustLevel.THIRD_PARTY
         assert descriptor.execution_env is ExecutionEnvironment.SERVICE
         assert descriptor.high_impact is True
+        assert descriptor.effective_retry_class is ToolRetryClass.UNKNOWN
+        assert descriptor.idempotency_window_seconds is None
+        assert descriptor.rejects_idempotency_body_conflict is False
 
         try:
             await provider.call_tool("knowledge_search", {}, budget=_budget())

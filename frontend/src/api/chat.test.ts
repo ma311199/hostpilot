@@ -3,7 +3,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   deleteConversation,
   listPendingToolOutcomes,
+  listRecoverablePlanRuns,
+  resolvePlanInvocation,
   resolveToolOutcome,
+  resumePlanRun,
   upgradeConversationSandbox,
 } from './chat'
 
@@ -82,5 +85,42 @@ describe('Conversation API', () => {
         body: JSON.stringify({ resolution: 'completed', result_text: 'Verified output' }),
       }),
     )
+  })
+
+  it('lists, explicitly resumes, and resolves one encoded PlanRun', async () => {
+    const planRuns = [{
+      plan_run_id: 'plan/one',
+      goal: 'Prepare a report',
+      state: 'interrupted',
+      tasks: [],
+      pending_invocations: [],
+      updated_at: '2026-11-22T00:00:00Z',
+    }]
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(planRuns), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        plan_run_id: 'plan/one', state: 'completed', status: 'completed', reason_code: null,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ resolved: true }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(listRecoverablePlanRuns('session/one')).resolves.toEqual(planRuns)
+    await expect(resumePlanRun('session/one', 'plan/one')).resolves.toEqual({
+      plan_run_id: 'plan/one', state: 'completed', status: 'completed', reason_code: null,
+    })
+    await expect(resolvePlanInvocation('session/one', 'plan/one', 'invocation/one', {
+      resolution: 'executed', result_text: 'Observed result',
+    })).resolves.toEqual({ resolved: true })
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'http://127.0.0.1:8000/api/v1/conversations/session%2Fone/plan-runs/recoverable',
+      'http://127.0.0.1:8000/api/v1/conversations/session%2Fone/plan-runs/plan%2Fone/resume',
+      'http://127.0.0.1:8000/api/v1/conversations/session%2Fone/plan-runs/plan%2Fone/invocations/invocation%2Fone/resolve',
+    ])
+    expect(fetchMock.mock.calls[1]?.[1]).toEqual(expect.objectContaining({ method: 'POST' }))
+    expect(fetchMock.mock.calls[2]?.[1]).toEqual(expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ resolution: 'executed', result_text: 'Observed result' }),
+    }))
   })
 })

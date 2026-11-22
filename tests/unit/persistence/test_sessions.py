@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from hostpilot.persistence import SQLiteSessionLifecycleStore, SQLiteTurnStore
+from hostpilot.persistence import SQLiteSessionLifecycleStore, SQLiteTaskStore, SQLiteTurnStore
 
 
 def test_session_store_grants_and_releases_lease(tmp_path) -> None:
@@ -110,3 +110,58 @@ def test_deleted_session_tombstone_prevents_legacy_backfill_resurrection(tmp_pat
             await sessions.acquire_lease("session-1", "lease-1", "host-a", now)
 
     asyncio.run(scenario())
+
+
+def test_session_delete_removes_plan_snapshots_and_private_tool_arguments(tmp_path) -> None:
+    async def scenario() -> int:
+        now = datetime.now(UTC)
+        database_path = tmp_path / "runtime.sqlite3"
+        hosts = SQLiteTurnStore(database_path)
+        await hosts.initialize()
+        await hosts.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
+        sessions = SQLiteSessionLifecycleStore(database_path)
+        await sessions.initialize()
+        await sessions.register_session("session-1")
+        tasks = SQLiteTaskStore(database_path)
+        await tasks.create_plan_run(
+            plan_run_id="plan-run-1",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            goal="Send invoice",
+            snapshot={"version": 1, "tasks": []},
+            started_at=now,
+        )
+        await tasks.record_tool_invocation(
+            invocation_id="invocation-1",
+            plan_run_id="plan-run-1",
+            task_run_id="task-run-1",
+            task_id="send-invoice",
+            call_index=1,
+            tool_id="billing/send_invoice",
+            retry_class="non_idempotent_write",
+            idempotency_key="plan-run-1:send-invoice:1:invoice-42",
+            request_fingerprint="sha256:request-1",
+            arguments_json='{"invoice_id":"invoice-42"}',
+            created_at=now,
+            runtime_host_id="host-a",
+            idempotency_window_seconds=3600,
+        )
+        await sessions.begin_close("session-1", "host-a")
+        await sessions.finish_delete("session-1")
+        import sqlite3
+
+        with sqlite3.connect(database_path) as connection:
+            return int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM runtime_plan_runs WHERE session_id = ?",
+                    ("session-1",),
+                ).fetchone()[0]
+            ) + int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM runtime_tool_invocations WHERE session_id = ?",
+                    ("session-1",),
+                ).fetchone()[0]
+            )
+
+    assert asyncio.run(scenario()) == 0
