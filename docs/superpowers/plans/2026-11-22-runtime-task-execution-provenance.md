@@ -65,4 +65,4 @@
 
 - [x] Document stored provenance, missing legacy summaries, and the distinction between reusing a result and re-executing its tools.
 - [x] Run full Python and frontend suites, Ruff lint/format, mypy, ESLint, TypeScript, frontend production build, and `git diff --check`.
-- [ ] Record failures, fixes, final metrics, review status, and local merge commit; do not push.
+- [x] Record failures, fixes, final metrics, review status, and local merge commit `01e6496`; do not push.
