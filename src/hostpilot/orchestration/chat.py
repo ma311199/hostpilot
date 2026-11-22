@@ -42,7 +42,9 @@ from hostpilot.runtime import (
     TaskLifecycleManager,
     TurnLifecycleManager,
 )
+from hostpilot.runtime.context import TaskCacheApprovalProvider
 from hostpilot.tools.executor import AsyncConfirmationProvider
+from hostpilot.tools.facade import ToolFacade
 
 
 class GovernedToolProvider(Protocol):
@@ -50,11 +52,12 @@ class GovernedToolProvider(Protocol):
 
     async def call_tool(
         self,
-        name: str,
+        tool_id: str,
         arguments: Mapping[str, Any],
         *,
         budget: RequestBudget,
         confirmation_provider: AsyncConfirmationProvider | None = None,
+        task_cache_approval_provider: TaskCacheApprovalProvider | None = None,
     ) -> str: ...
 
 
@@ -85,7 +88,7 @@ class ChatService:
         budget_limits: BudgetLimits | None = None,
         max_request_chars: int = 32_000,
         router: Router | None = None,
-        tool_provider: GovernedToolProvider | None = None,
+        tool_provider: GovernedToolProvider | ToolFacade | None = None,
         output_processor: OutputProcessor | None = None,
         cost_sink: CostSink | None = None,
         trace_sink: TraceSink | None = None,
@@ -120,6 +123,7 @@ class ChatService:
         message: str,
         *,
         confirmation_provider: AsyncConfirmationProvider | None = None,
+        task_cache_approval_provider: TaskCacheApprovalProvider | None = None,
     ) -> ChatTurnResult:
         """Run one chat turn and update the session activity timestamp."""
         if len(message) > self.max_request_chars:
@@ -132,6 +136,7 @@ class ChatService:
                 session_id,
                 message,
                 confirmation_provider=confirmation_provider,
+                task_cache_approval_provider=task_cache_approval_provider,
             )
 
     async def _send_leased(
@@ -140,6 +145,7 @@ class ChatService:
         message: str,
         *,
         confirmation_provider: AsyncConfirmationProvider | None,
+        task_cache_approval_provider: TaskCacheApprovalProvider | None,
     ) -> ChatTurnResult:
         """Run chat after the caller has acquired its Session operation lease."""
         async with _lease_runtime(self.runtime) as runtime:
@@ -156,6 +162,7 @@ class ChatService:
                     snapshot=context,
                     budget=budget,
                     confirmation_provider=confirmation_provider,
+                    task_cache_approval_provider=task_cache_approval_provider,
                     task_lifecycle=self.task_lifecycle,
                 )
                 if self.turn_lifecycle is not None:

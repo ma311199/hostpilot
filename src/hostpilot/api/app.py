@@ -156,6 +156,7 @@ from hostpilot.persistence.sqlite_path import prepare_sqlite_database_path
 from hostpilot.policy.confirmation import ConfirmationDecision, ConfirmationRequest
 from hostpilot.routing import CommandRouter, Router
 from hostpilot.runtime import RuntimeContext, RuntimeHost
+from hostpilot.runtime.context import TaskCacheApprovalRequest, TaskCacheDecision
 from hostpilot.sandbox import SandboxBackendFactory, SandboxBackendSet, sandbox_mode_scope
 from hostpilot.skills.plan_plugins import PlanComponentRegistry
 from hostpilot.tools.executor import (
@@ -215,6 +216,16 @@ class ToolConfirmationDecisionRequest(BaseModel):
     decision: ConfirmationDecision
 
 
+class PlanTaskCacheDecisionRequest(BaseModel):
+    """Explicit user response to a successful Plan task cache candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str = Field(pattern="^plan.task.cache.decision$")
+    request_id: str = Field(min_length=1, max_length=64)
+    decision: TaskCacheDecision
+
+
 class WebSocketConfirmationProvider(AsyncConfirmationProvider):
     """Pause a chat turn and ask its connected browser to approve a tool call."""
 
@@ -254,6 +265,46 @@ class WebSocketConfirmationProvider(AsyncConfirmationProvider):
             return ConfirmationDecision.TIMED_OUT
         except WebSocketDisconnect:
             return ConfirmationDecision.CANCELLED
+
+
+class WebSocketTaskCacheApprovalProvider:
+    """Wait for a human to choose whether one stored task result should be reused."""
+
+    def __init__(self, websocket: WebSocket) -> None:
+        self.websocket = websocket
+        self._decision_lock = asyncio.Lock()
+
+    async def decide(self, request: TaskCacheApprovalRequest) -> TaskCacheDecision | None:
+        async with self._decision_lock:
+            await self.websocket.send_json(
+                {
+                    "type": "plan.task.cache.request",
+                    "data": {
+                        "request_id": request.request_id,
+                        "task_id": request.task_id,
+                        "description": request.description,
+                        "source_turn_id": request.source_turn_id,
+                        "finished_at": request.finished_at.isoformat(),
+                        "output": request.output,
+                    },
+                }
+            )
+            try:
+                async with asyncio.timeout(CHAT_CONFIRMATION_TIMEOUT_SECONDS):
+                    while True:
+                        raw_message = await self.websocket.receive_text()
+                        if len(raw_message.encode("utf-8")) > 1024:
+                            continue
+                        try:
+                            response = PlanTaskCacheDecisionRequest.model_validate_json(raw_message)
+                        except (ValidationError, ValueError, json.JSONDecodeError):
+                            continue
+                        if response.request_id == request.request_id:
+                            return response.decision
+            except TimeoutError:
+                return None
+            except WebSocketDisconnect as error:
+                raise asyncio.CancelledError from error
 
 
 class CreateConversationRequest(BaseModel):
@@ -1588,6 +1639,9 @@ async def chat_websocket(websocket: WebSocket) -> None:
                                 body.session_id,
                                 body.message,
                                 confirmation_provider=WebSocketConfirmationProvider(websocket),
+                                task_cache_approval_provider=(
+                                    WebSocketTaskCacheApprovalProvider(websocket)
+                                ),
                             )
                     finally:
                         _set_runtime_sandbox_mode(websocket.scope["app"], None)

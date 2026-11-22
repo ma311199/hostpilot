@@ -20,7 +20,12 @@ if TYPE_CHECKING:
         ToolOutcomeStore,
         TurnStore,
     )
-    from hostpilot.task_results import CompletedPlanTaskResult, StoredPlanTaskResult
+    from hostpilot.task_results import (
+        CompletedPlanTaskResult,
+        FailedPlanTaskSummary,
+        StoredPlanTaskFailure,
+        StoredPlanTaskResult,
+    )
 
 
 class TurnState(StrEnum):
@@ -503,10 +508,30 @@ class TaskRunHandle:
     def __init__(self) -> None:
         self.terminal_state = TaskState.COMPLETED
         self.completed_result: CompletedPlanTaskResult | None = None
+        self.failure_summary: FailedPlanTaskSummary | None = None
 
-    def fail(self) -> None:
+    def fail(
+        self,
+        *,
+        task_fingerprint: str | None = None,
+        description: str | None = None,
+        input: Mapping[str, object] | None = None,
+        error_code: str | None = None,
+        side_effect_count: int = 0,
+    ) -> None:
         self.terminal_state = TaskState.FAILED
         self.completed_result = None
+        self.failure_summary = None
+        if all((task_fingerprint, description, input is not None, error_code)):
+            from hostpilot.task_results import FailedPlanTaskSummary
+
+            self.failure_summary = FailedPlanTaskSummary(
+                task_fingerprint=task_fingerprint or "",
+                description=description or "",
+                input=input or {},
+                error_code=error_code or "",
+                side_effect_count=side_effect_count,
+            )
 
     def complete(
         self,
@@ -515,6 +540,7 @@ class TaskRunHandle:
         input: Mapping[str, object],
         depends_on: tuple[str, ...],
         output: object,
+        task_fingerprint: str,
     ) -> None:
         """Persist a successful Plan result with its task context."""
         from hostpilot.task_results import CompletedPlanTaskResult
@@ -525,7 +551,9 @@ class TaskRunHandle:
             input=input,
             depends_on=depends_on,
             output=output,
+            task_fingerprint=task_fingerprint,
         )
+        self.failure_summary = None
 
 
 class TaskLifecycleManager:
@@ -573,6 +601,30 @@ class TaskLifecycleManager:
         if self._store is None:
             return ()
         return await self._store.list_completed_task_results(
+            session_id=session_id,
+            exclude_turn_id=exclude_turn_id,
+            limit=limit,
+        )
+
+    async def find_completed_task_result(
+        self, session_id: str, *, exclude_turn_id: str, task_fingerprint: str
+    ) -> StoredPlanTaskResult | None:
+        """Look up one exact successful task candidate in the current Session."""
+        if self._store is None:
+            return None
+        return await self._store.find_completed_task_result(
+            session_id=session_id,
+            exclude_turn_id=exclude_turn_id,
+            task_fingerprint=task_fingerprint,
+        )
+
+    async def list_recent_task_failures(
+        self, session_id: str, *, exclude_turn_id: str, limit: int = 16
+    ) -> tuple[StoredPlanTaskFailure, ...]:
+        """Load safe failed-task references for a new planning attempt."""
+        if self._store is None:
+            return ()
+        return await self._store.list_recent_task_failures(
             session_id=session_id,
             exclude_turn_id=exclude_turn_id,
             limit=limit,
@@ -647,6 +699,9 @@ class TaskLifecycleManager:
                             handle.completed_result
                             if terminal_state is TaskState.COMPLETED
                             else None
+                        ),
+                        failure_summary=(
+                            handle.failure_summary if terminal_state is TaskState.FAILED else None
                         ),
                     )
 

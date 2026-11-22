@@ -9,6 +9,7 @@ from hostpilot.persistence import (
     SQLiteTaskStore,
     SQLiteTurnStore,
 )
+from hostpilot.task_results import FailedPlanTaskSummary
 
 
 def test_task_store_persists_terminal_metadata_across_reopen(tmp_path) -> None:
@@ -170,6 +171,34 @@ def test_task_store_schema_excludes_task_payload_fields(tmp_path) -> None:
     }
 
 
+def test_task_store_migrates_legacy_result_table_with_no_fingerprint(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE runtime_plan_task_results (
+                task_run_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                description TEXT NOT NULL,
+                input_json TEXT NOT NULL,
+                depends_on_json TEXT NOT NULL,
+                output_json TEXT NOT NULL,
+                finished_at TEXT NOT NULL
+            )
+            """
+        )
+
+    asyncio.run(SQLiteTaskStore(database_path).initialize())
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(runtime_plan_task_results)").fetchall()
+        }
+    assert "task_fingerprint" in columns
+
+
 def test_task_store_persists_and_lists_completed_results_by_session(tmp_path) -> None:
     database_path = tmp_path / "runtime.sqlite3"
     now = datetime(2026, 11, 22, 11, 0, tzinfo=UTC)
@@ -205,6 +234,7 @@ def test_task_store_persists_and_lists_completed_results_by_session(tmp_path) ->
                 state="completed",
                 finished_at=started_at + timedelta(seconds=1),
                 completed_result=CompletedPlanTaskResult(
+                    task_fingerprint=f"v1:{'a' * 64}",
                     description=f"description-{task_id}",
                     input={"source": task_id},
                     depends_on=("prepare",),
@@ -255,7 +285,11 @@ def test_task_store_result_history_is_bounded_and_newest_first_within_window(tmp
                 state="completed",
                 finished_at=started_at + timedelta(seconds=1),
                 completed_result=CompletedPlanTaskResult(
-                    description=f"task {index}", input={}, depends_on=(), output=index
+                    task_fingerprint=f"v1:{index:064x}",
+                    description=f"task {index}",
+                    input={},
+                    depends_on=(),
+                    output=index,
                 ),
             )
         return await store.list_completed_task_results(
@@ -294,6 +328,7 @@ def test_task_store_bounds_total_result_history_payload_size(tmp_path) -> None:
                 state="completed",
                 finished_at=started_at + timedelta(seconds=1),
                 completed_result=CompletedPlanTaskResult(
+                    task_fingerprint=f"v1:{index:064x}",
                     description=f"large task {index}",
                     input={},
                     depends_on=(),
@@ -332,7 +367,11 @@ def test_task_store_does_not_persist_result_for_noncompleted_task(tmp_path) -> N
                 state="failed",
                 finished_at=now + timedelta(seconds=1),
                 completed_result=CompletedPlanTaskResult(
-                    description="failed task", input={}, depends_on=(), output={"secret": "x"}
+                    task_fingerprint=f"v1:{1:064x}",
+                    description="failed task",
+                    input={},
+                    depends_on=(),
+                    output={"secret": "x"},
                 ),
             )
         assert (
@@ -369,6 +408,7 @@ def test_task_store_rejects_oversized_result_without_marking_task_completed(tmp_
                 state="completed",
                 finished_at=now + timedelta(seconds=1),
                 completed_result=CompletedPlanTaskResult(
+                    task_fingerprint=f"v1:{2:064x}",
                     description="large result",
                     input={},
                     depends_on=(),
@@ -383,5 +423,173 @@ def test_task_store_rejects_oversized_result_without_marking_task_completed(tmp_
             )
             == ()
         )
+
+    asyncio.run(scenario())
+
+
+def test_task_store_finds_only_exact_successful_fingerprint_in_same_session(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 11, 0, tzinfo=UTC)
+
+    async def scenario() -> None:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
+        store = SQLiteTaskStore(database_path)
+        await store.create_task_run(
+            task_run_id="fingerprint-run",
+            task_id="inspect",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            started_at=now,
+        )
+        await store.finish_task_run(
+            "fingerprint-run",
+            runtime_host_id="host-a",
+            state="completed",
+            finished_at=now + timedelta(seconds=1),
+            completed_result=CompletedPlanTaskResult(
+                task_fingerprint=f"v1:{3:064x}",
+                description="Inspect README",
+                input={"path": "README.md"},
+                depends_on=(),
+                output={"summary": "HostPilot"},
+            ),
+        )
+        reopened = SQLiteTaskStore(database_path)
+        exact = await reopened.find_completed_task_result(
+            session_id="session-1",
+            exclude_turn_id="turn-2",
+            task_fingerprint=f"v1:{3:064x}",
+        )
+        miss = await reopened.find_completed_task_result(
+            session_id="session-1",
+            exclude_turn_id="turn-2",
+            task_fingerprint=f"v1:{4:064x}",
+        )
+        other_session = await reopened.find_completed_task_result(
+            session_id="session-2",
+            exclude_turn_id="turn-2",
+            task_fingerprint=f"v1:{3:064x}",
+        )
+        assert exact is not None
+        assert exact.output == {"summary": "HostPilot"}
+        assert miss is None
+        assert other_session is None
+
+    asyncio.run(scenario())
+
+
+def test_task_store_persists_bounded_failure_summaries_without_output(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 11, 0, tzinfo=UTC)
+
+    async def scenario() -> None:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
+        store = SQLiteTaskStore(database_path)
+        await store.create_task_run(
+            task_run_id="failed-run",
+            task_id="inspect",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            started_at=now,
+        )
+        await store.finish_task_run(
+            "failed-run",
+            runtime_host_id="host-a",
+            state="failed",
+            finished_at=now + timedelta(seconds=1),
+            failure_summary=FailedPlanTaskSummary(
+                task_fingerprint=f"v1:{5:064x}",
+                description="Inspect README",
+                input={},
+                error_code="tool_unavailable",
+                side_effect_count=0,
+            ),
+        )
+        failures = await SQLiteTaskStore(database_path).list_recent_task_failures(
+            session_id="session-1", exclude_turn_id="turn-2", limit=16
+        )
+        assert len(failures) == 1
+        assert failures[0].task_fingerprint == f"v1:{5:064x}"
+        assert failures[0].input == {}
+        assert failures[0].error_code == "tool_unavailable"
+        assert failures[0].side_effect_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_task_store_rejects_unsafe_failure_code_without_finishing_run(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 11, 0, tzinfo=UTC)
+
+    async def scenario() -> None:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
+        store = SQLiteTaskStore(database_path)
+        await store.create_task_run(
+            task_run_id="unsafe-failure-run",
+            task_id="inspect",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            started_at=now,
+        )
+        with pytest.raises(ValueError, match="error code"):
+            await store.finish_task_run(
+                "unsafe-failure-run",
+                runtime_host_id="host-a",
+                state="failed",
+                finished_at=now + timedelta(seconds=1),
+                failure_summary=FailedPlanTaskSummary(
+                    task_fingerprint=f"v1:{6:064x}",
+                    description="Inspect README",
+                    input={},
+                    error_code="secret:raw exception",
+                    side_effect_count=0,
+                ),
+            )
+        assert (await store.list_task_runs(turn_id="turn-1"))[0].state == "running"
+
+    asyncio.run(scenario())
+
+
+def test_task_store_rejects_failed_task_input_without_finishing_run(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 11, 0, tzinfo=UTC)
+
+    async def scenario() -> None:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
+        store = SQLiteTaskStore(database_path)
+        await store.create_task_run(
+            task_run_id="input-failure-run",
+            task_id="inspect",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            started_at=now,
+        )
+        with pytest.raises(ValueError, match="cannot persist task input"):
+            await store.finish_task_run(
+                "input-failure-run",
+                runtime_host_id="host-a",
+                state="failed",
+                finished_at=now + timedelta(seconds=1),
+                failure_summary=FailedPlanTaskSummary(
+                    task_fingerprint=f"v1:{7:064x}",
+                    description="Inspect README",
+                    input={"token": "sensitive"},
+                    error_code="tool_unavailable",
+                    side_effect_count=0,
+                ),
+            )
+        assert (await store.list_task_runs(turn_id="turn-1"))[0].state == "running"
 
     asyncio.run(scenario())

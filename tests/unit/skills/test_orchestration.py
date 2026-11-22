@@ -11,6 +11,7 @@ from hostpilot.models.budget import complete_with_budget
 from hostpilot.observability import TraceContext, TraceEvent, trace_context_scope
 from hostpilot.persistence import SQLiteTaskStore, SQLiteTurnStore
 from hostpilot.runtime import RequestContext, TaskLifecycleManager
+from hostpilot.runtime.context import TaskCacheDecision
 from hostpilot.skills.compensation import (
     CompensationRegistry,
     CompensationStatus,
@@ -24,6 +25,7 @@ from hostpilot.skills.orchestration import (
     PlanTaskResult,
     PlanValidation,
     PlanVerification,
+    _task_fingerprint,
 )
 from hostpilot.skills.runtime import (
     SkillExecutionRequest,
@@ -31,6 +33,7 @@ from hostpilot.skills.runtime import (
     SkillSideEffect,
 )
 from hostpilot.skills.yaml_registry import SideEffectLevel
+from hostpilot.tools.executor import RemoteToolOutcomeUnknownError
 
 
 def request(
@@ -39,6 +42,7 @@ def request(
     task_lifecycle: TaskLifecycleManager | None = None,
     request_id: str = "orchestration-test",
     session_id: str = "conversation-1",
+    task_cache_approval_provider=None,
 ) -> SkillExecutionRequest:
     return SkillExecutionRequest(
         "builtin/orchestrator_plan",
@@ -55,6 +59,7 @@ def request(
                     )
                 )
             ),
+            task_cache_approval_provider=task_cache_approval_provider,
             task_lifecycle=task_lifecycle,
         ),
     )
@@ -74,6 +79,14 @@ def task(
         depends_on=depends_on,
         input=input,
     )
+
+
+def test_task_fingerprint_preserves_dependency_output_associations() -> None:
+    downstream = task("combine", depends_on=("left", "right"))
+    original = _task_fingerprint(downstream, {"left": "A", "right": "B"})
+    swapped = _task_fingerprint(downstream, {"left": "B", "right": "A"})
+
+    assert original != swapped
 
 
 class FakePlanner:
@@ -118,6 +131,16 @@ class FakeTaskExecutor:
             output={"task": call.task.task_id},
             idempotency_key=call.idempotency_key,
         )
+
+
+class FakeTaskCacheApprovalProvider:
+    def __init__(self, decision: TaskCacheDecision) -> None:
+        self.decision = decision
+        self.requests = []
+
+    async def decide(self, request):
+        self.requests.append(request)
+        return self.decision
 
 
 class FakeVerifier:
@@ -769,7 +792,9 @@ def test_plan_task_attempts_persist_status_without_reusing_run_ids(tmp_path) -> 
     assert records[0].task_run_id != records[1].task_run_id
 
 
-def test_new_turn_receives_prior_results_without_auto_skipping_matching_task_id(tmp_path) -> None:
+def test_new_turn_without_cache_approval_provider_stops_without_reuse_or_execution(
+    tmp_path,
+) -> None:
     async def scenario():
         database_path = tmp_path / "runtime.sqlite3"
         turns = SQLiteTurnStore(database_path)
@@ -805,25 +830,145 @@ def test_new_turn_receives_prior_results_without_auto_skipping_matching_task_id(
             FakeReplanner(),
             max_replans=0,
         )
-        await second.execute(
+        result = await second.execute(
             request(task_lifecycle=lifecycle, request_id="turn-2", session_id="session-1")
         )
-        return second_planner.blackboards[0], second_executor, await store.list_task_runs()
+        return result, second_planner.blackboards[0], second_executor, await store.list_task_runs()
 
-    board, task_executor, task_runs = asyncio.run(scenario())
+    result, board, task_executor, task_runs = asyncio.run(scenario())
 
     assert board.states == ()
-    assert len(board.prior_results) == 1
-    assert board.prior_results[0].task_id == "inspect"
-    assert board.prior_results[0].output == {"task": "inspect"}
-    assert len(task_executor.calls) == 1
-    assert task_executor.calls[0].blackboard.prior_results == ()
-    assert [record.state for record in task_runs] == ["completed", "completed"]
+    assert board.prior_failed_tasks == ()
+    assert task_executor.calls == []
+    assert result.status is SkillExecutionStatus.CLARIFICATION
+    assert len(task_runs) == 1
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_task_calls", "expected_task_runs"),
+    [
+        (TaskCacheDecision.REUSE, 1, 2),
+        (TaskCacheDecision.EXECUTE, 2, 3),
+    ],
+)
+def test_matching_successful_task_obeys_explicit_user_decision(
+    tmp_path, decision, expected_task_calls, expected_task_runs
+) -> None:
+    async def scenario():
+        database_path = tmp_path / "runtime.sqlite3"
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        now = datetime.now(UTC)
+        await turns.register_host("host-1", now=now, lease_expires_at=now + timedelta(minutes=2))
+        store = SQLiteTaskStore(database_path)
+        lifecycle = TaskLifecycleManager(store=store, runtime_host_id="host-1")
+        first = OrchestratorPlanExecutor(
+            FakePlanner(ExecutionPlan((task("inspect"),))),
+            FakeValidator(),
+            FakeTaskExecutor(),
+            FakeVerifier(),
+            FakeReplanner(),
+            max_replans=0,
+        )
+        await first.execute(
+            request(task_lifecycle=lifecycle, request_id="turn-1", session_id="session-1")
+        )
+
+        approval = FakeTaskCacheApprovalProvider(decision)
+        trace = TraceRecorder()
+        task_executor = FakeTaskExecutor()
+        second = OrchestratorPlanExecutor(
+            FakePlanner(
+                ExecutionPlan((task("inspect"), task("summarize", depends_on=("inspect",))))
+            ),
+            FakeValidator(),
+            task_executor,
+            FakeVerifier(),
+            FakeReplanner(),
+            max_replans=0,
+            trace_sink=trace,
+        )
+        result = await second.execute(
+            request(
+                task_lifecycle=lifecycle,
+                request_id="turn-2",
+                session_id="session-1",
+                task_cache_approval_provider=approval,
+            )
+        )
+        return result, approval, task_executor, await store.list_task_runs(), trace
+
+    result, approval, task_executor, task_runs, trace = asyncio.run(scenario())
+    assert result.status is SkillExecutionStatus.COMPLETED
+    assert result.output["task_results"] == {
+        "inspect": {"task": "inspect"},
+        "summarize": {"task": "summarize"},
+    }
+    assert len(approval.requests) == 1
+    assert approval.requests[0].output == {"task": "inspect"}
+    assert len(task_executor.calls) == expected_task_calls
+    assert len(task_runs) == expected_task_runs
+    summarize_call = next(call for call in task_executor.calls if call.task.task_id == "summarize")
+    assert summarize_call.dependencies == {"inspect": {"task": "inspect"}}
+    events = [event for event in trace.events if event.name == "plan.task"]
+    assert any(event.attributes["status"] == "cache_candidate" for event in events)
+    if decision is TaskCacheDecision.REUSE:
+        chosen = next(event for event in events if event.attributes["status"] == "cache_reused")
+        assert chosen.attributes["cache_decision"] == "reuse"
+        assert "source_task_run_id" in chosen.attributes
+    else:
+        chosen = next(event for event in events if event.attributes["status"] == "cache_ignored")
+        assert chosen.attributes["cache_decision"] == "execute"
+    assert "output" not in chosen.attributes
+
+
+def test_uncertain_remote_outcome_is_not_a_planner_failure_reference(tmp_path) -> None:
+    class UnknownOutcomeExecutor:
+        async def execute_task(self, call):
+            del call
+            raise RemoteToolOutcomeUnknownError("remote result is uncertain")
+
+    async def scenario():
+        database_path = tmp_path / "runtime.sqlite3"
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        now = datetime.now(UTC)
+        await turns.register_host("host-1", now=now, lease_expires_at=now + timedelta(minutes=2))
+        store = SQLiteTaskStore(database_path)
+        lifecycle = TaskLifecycleManager(store=store, runtime_host_id="host-1")
+        verifier = FakeVerifier()
+        replanner = FakeReplanner()
+        executor = OrchestratorPlanExecutor(
+            FakePlanner(ExecutionPlan((task("remote_call"),))),
+            FakeValidator(),
+            UnknownOutcomeExecutor(),
+            verifier,
+            replanner,
+            max_replans=2,
+        )
+        result = await executor.execute(
+            request(task_lifecycle=lifecycle, request_id="turn-uncertain", session_id="session-1")
+        )
+        failures = await store.list_recent_task_failures(
+            session_id="session-1", exclude_turn_id="turn-next", limit=16
+        )
+        return result, failures, verifier, replanner
+
+    result, failures, verifier, replanner = asyncio.run(scenario())
+    assert result.status is SkillExecutionStatus.FAILED
+    assert result.output["error_code"] == "remote_tool_outcome_unknown"
+    assert failures == ()
+    assert verifier.calls == 0
+    assert replanner.calls == []
 
 
 def test_plan_does_not_call_task_executor_when_task_start_write_fails() -> None:
     class FailingTaskStore:
-        async def list_completed_task_results(self, **kwargs):
+        async def find_completed_task_result(self, **kwargs):
+            del kwargs
+            return None
+
+        async def list_recent_task_failures(self, **kwargs):
             del kwargs
             return ()
 

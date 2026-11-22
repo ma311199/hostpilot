@@ -19,6 +19,15 @@ const chatMocks = vi.hoisted(() => ({
     summary: string
   }) => void) | null,
   respondToConfirmation: vi.fn(),
+  taskCacheHandler: null as ((request: {
+    request_id: string
+    task_id: string
+    description: string
+    source_turn_id: string
+    finished_at: string
+    output: unknown
+  }) => void) | null,
+  respondToTaskCacheApproval: vi.fn(),
   close: vi.fn(),
 }))
 
@@ -47,7 +56,16 @@ vi.mock('./api/chatSocket', () => ({
       chatMocks.confirmationHandler = handler
     }
 
+    get onTaskCacheApproval() {
+      return chatMocks.taskCacheHandler
+    }
+
+    set onTaskCacheApproval(handler) {
+      chatMocks.taskCacheHandler = handler
+    }
+
     respondToConfirmation = chatMocks.respondToConfirmation
+    respondToTaskCacheApproval = chatMocks.respondToTaskCacheApproval
     close = chatMocks.close
     send = vi.fn()
   },
@@ -58,6 +76,7 @@ describe('chat tool approval dialog', () => {
     vi.clearAllMocks()
     window.localStorage.clear()
     chatMocks.confirmationHandler = null
+    chatMocks.taskCacheHandler = null
     chatMocks.listConversations.mockResolvedValue([])
     chatMocks.getWorkspace.mockResolvedValue({
       path: '/home/user/project',
@@ -361,4 +380,35 @@ describe('chat tool approval dialog', () => {
     confirmSpy.mockRestore()
     wrapper.unmount()
   })
+})
+
+it('shows successful cached task output and requires an explicit reuse or execute choice', async () => {
+  const wrapper = mount(ChatPanel)
+  chatMocks.taskCacheHandler?.({
+    request_id: 'cache-1',
+    task_id: 'inspect',
+    description: 'Read project status',
+    source_turn_id: 'turn-old',
+    finished_at: '2026-11-22T10:00:00Z',
+    output: { status: 'ready' },
+  })
+  await flushPromises()
+
+  expect(wrapper.text()).toContain('发现已完成的相同子任务')
+  expect(wrapper.text()).toContain('"status": "ready"')
+  await wrapper.get('button.approval-reject').trigger('click')
+  expect(chatMocks.respondToTaskCacheApproval).toHaveBeenCalledWith('cache-1', 'execute')
+
+  chatMocks.taskCacheHandler?.({
+    request_id: 'cache-2',
+    task_id: 'inspect',
+    description: 'Read project status',
+    source_turn_id: 'turn-old',
+    finished_at: '2026-11-22T10:00:00Z',
+    output: { status: 'ready' },
+  })
+  await wrapper.vm.$nextTick()
+  await wrapper.get('button.approval-accept').trigger('click')
+  expect(chatMocks.respondToTaskCacheApproval).toHaveBeenLastCalledWith('cache-2', 'reuse')
+  wrapper.unmount()
 })

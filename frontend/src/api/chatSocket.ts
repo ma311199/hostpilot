@@ -21,7 +21,25 @@ interface ToolConfirmationRequestMessage {
   data: ToolConfirmationMessage
 }
 
-type ChatServerMessage = ChatResponseMessage | ChatErrorMessage | ToolConfirmationRequestMessage
+export interface PlanTaskCacheMessage {
+  request_id: string
+  task_id: string
+  description: string
+  source_turn_id: string
+  finished_at: string
+  output: unknown
+}
+
+interface PlanTaskCacheRequestMessage {
+  type: 'plan.task.cache.request'
+  data: PlanTaskCacheMessage
+}
+
+type ChatServerMessage =
+  | ChatResponseMessage
+  | ChatErrorMessage
+  | ToolConfirmationRequestMessage
+  | PlanTaskCacheRequestMessage
 
 const errorMessages: Record<string, string> = {
   budget_exceeded: '本次请求已达到预算上限。',
@@ -91,6 +109,25 @@ function parseChatMessage(raw: string): ChatServerMessage | null {
         }
       }
     }
+    if (
+      candidate.type === 'plan.task.cache.request' &&
+      typeof candidate.data === 'object' &&
+      candidate.data
+    ) {
+      const data = candidate.data as Record<string, unknown>
+      if (
+        typeof data.request_id === 'string' &&
+        typeof data.task_id === 'string' &&
+        typeof data.description === 'string' &&
+        typeof data.source_turn_id === 'string' &&
+        typeof data.finished_at === 'string'
+      ) {
+        return {
+          type: 'plan.task.cache.request',
+          data: data as unknown as PlanTaskCacheMessage,
+        }
+      }
+    }
   } catch {
     return null
   }
@@ -105,6 +142,7 @@ export class ChatSocketClient {
     reject: (error: Error) => void
   } | null = null
   onConfirmation: ((request: ToolConfirmationMessage) => void) | null = null
+  onTaskCacheApproval: ((request: PlanTaskCacheMessage) => void) | null = null
 
   async send(sessionId: string, message: string): Promise<ChatResponse> {
     await this.connect()
@@ -146,6 +184,15 @@ export class ChatSocketClient {
     }))
   }
 
+  respondToTaskCacheApproval(requestId: string, decision: 'reuse' | 'execute'): void {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return
+    this.socket.send(JSON.stringify({
+      type: 'plan.task.cache.decision',
+      request_id: requestId,
+      decision,
+    }))
+  }
+
   private connect(): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN) return Promise.resolve()
     if (this.connecting) return this.connecting
@@ -182,6 +229,10 @@ export class ChatSocketClient {
     if (!message) return
     if (message.type === 'tool.confirmation.request') {
       this.onConfirmation?.(message.data)
+      return
+    }
+    if (message.type === 'plan.task.cache.request') {
+      this.onTaskCacheApproval?.(message.data)
       return
     }
     if (!this.pending) return
