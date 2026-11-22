@@ -30,6 +30,7 @@ def test_task_lifecycle_persists_outcomes_and_unique_attempt_ids(tmp_path) -> No
                 input={"source": "about.txt"},
                 depends_on=(),
                 output={"summary": "HostPilot"},
+                task_fingerprint=f"v1:{'a' * 64}",
             )
 
         records = await store.list_task_runs(turn_id="turn-1")

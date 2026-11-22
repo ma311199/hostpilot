@@ -34,9 +34,7 @@ class SQLiteSkillExecutionStore:
                 if row is None:
                     await connection.execute(_create_table_sql("skill_execution_preferences"))
                 elif "'deepagents'" in str(row[0]).lower().replace(" ", ""):
-                    await connection.execute(
-                        _create_table_sql("skill_execution_preferences_new")
-                    )
+                    await connection.execute(_create_table_sql("skill_execution_preferences_new"))
                     await connection.execute(
                         """INSERT INTO skill_execution_preferences_new (skill_id, execution_mode)
                            SELECT skill_id,

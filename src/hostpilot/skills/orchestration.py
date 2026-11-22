@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from collections.abc import AsyncIterator, Mapping
@@ -12,7 +13,7 @@ from enum import StrEnum
 from time import perf_counter
 from types import MappingProxyType
 from typing import Any, Protocol
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from hostpilot.budget import BudgetExceededError
 from hostpilot.observability import (
@@ -22,6 +23,7 @@ from hostpilot.observability import (
     child_trace_context,
     trace_context_scope,
 )
+from hostpilot.runtime.context import TaskCacheApprovalRequest, TaskCacheDecision
 from hostpilot.skills.compensation import (
     CancellationSink,
     CancellationSnapshot,
@@ -35,7 +37,8 @@ from hostpilot.skills.runtime import (
     SkillExecutionStatus,
     SkillSideEffect,
 )
-from hostpilot.task_results import StoredPlanTaskResult
+from hostpilot.task_results import StoredPlanTaskFailure
+from hostpilot.tools.executor import RemoteToolOutcomeUnknownError
 
 
 @asynccontextmanager
@@ -118,7 +121,7 @@ class BlackboardSnapshot:
     """Read-only copy of execution state passed to model and task adapters."""
 
     states: tuple[PlanTaskState, ...]
-    prior_results: tuple[StoredPlanTaskResult, ...] = ()
+    prior_failed_tasks: tuple[StoredPlanTaskFailure, ...] = ()
 
     @property
     def results(self) -> Mapping[str, Any]:
@@ -278,12 +281,12 @@ class OrchestratorPlanExecutor:
             request.request_context.budget.ensure_available()
         except BudgetExceededError:
             return _failed_result("budget_exceeded", blackboard=BlackboardSnapshot(()))
-        prior_results: tuple[StoredPlanTaskResult, ...] = ()
+        prior_failures: tuple[StoredPlanTaskFailure, ...] = ()
         task_lifecycle = request.request_context.task_lifecycle
         session_id = request.request_context.snapshot.session_id
         if task_lifecycle is not None and session_id is not None:
             try:
-                prior_results = await task_lifecycle.list_completed_task_results(
+                prior_failures = await task_lifecycle.list_recent_task_failures(
                     session_id,
                     exclude_turn_id=request.request_context.snapshot.request_id,
                 )
@@ -297,7 +300,7 @@ class OrchestratorPlanExecutor:
             return BlackboardSnapshot(tuple(states.values()))
 
         def planning_board() -> BlackboardSnapshot:
-            return BlackboardSnapshot(tuple(states.values()), prior_results)
+            return BlackboardSnapshot(tuple(states.values()), prior_failures)
 
         try:
             plan = await self.planner.create_plan(request, planning_board())
@@ -357,6 +360,7 @@ class OrchestratorPlanExecutor:
             for wave in _execution_waves(plan):
                 wave_board = current_board()
                 leaders: list[PlanTask] = []
+                fingerprints: dict[str, str] = {}
                 signatures: dict[str, tuple[PlanExecutionType, str | None, str, str]] = {}
                 followers: dict[str, str] = {}
                 wave_leader_by_signature: dict[
@@ -388,6 +392,81 @@ class OrchestratorPlanExecutor:
                     if signature in failures:
                         failure_reason = "repeated_failed_task_without_new_information"
                         break
+                    dependencies = {
+                        dependency: wave_board.results[dependency]
+                        for dependency in task_item.depends_on
+                        if dependency in wave_board.results
+                    }
+                    fingerprint = _task_fingerprint(task_item, dependencies)
+                    fingerprints[task_item.task_id] = fingerprint
+                    candidate = None
+                    if task_lifecycle is not None and session_id is not None:
+                        try:
+                            candidate = await task_lifecycle.find_completed_task_result(
+                                session_id,
+                                exclude_turn_id=request.request_context.snapshot.request_id,
+                                task_fingerprint=fingerprint,
+                            )
+                        except Exception as error:
+                            return _failed_result(
+                                f"task_result_lookup_{type(error).__name__}",
+                                blackboard=wave_board,
+                            )
+                    if candidate is not None:
+                        self._record_task_event(
+                            child_trace_context(),
+                            task_item,
+                            status="cache_candidate",
+                            source_task_run_id=candidate.task_run_id,
+                        )
+                        provider = request.request_context.task_cache_approval_provider
+                        decision = (
+                            await provider.decide(
+                                TaskCacheApprovalRequest(
+                                    request_id=str(uuid4()),
+                                    task_id=task_item.task_id,
+                                    description=candidate.description,
+                                    source_turn_id=candidate.turn_id,
+                                    finished_at=candidate.finished_at,
+                                    output=candidate.output,
+                                )
+                            )
+                            if provider is not None
+                            else None
+                        )
+                        if decision is None:
+                            self._record_task_event(
+                                child_trace_context(),
+                                task_item,
+                                status="cache_decision_missing",
+                                source_task_run_id=candidate.task_run_id,
+                            )
+                            return _clarification_result(
+                                "发现同 Session 的历史成功子任务，但当前没有可用的审批通道"
+                                "或审批未完成；未复用历史结果，也未执行该子任务。"
+                                "请通过交互式聊天查看结果并选择后再继续。"
+                            )
+                        if decision is TaskCacheDecision.REUSE:
+                            states[task_item.task_id] = PlanTaskState(
+                                task_id=task_item.task_id,
+                                status="completed",
+                                output=candidate.output,
+                            )
+                            self._record_task_event(
+                                child_trace_context(),
+                                task_item,
+                                status="cache_reused",
+                                source_task_run_id=candidate.task_run_id,
+                                cache_decision=decision.value,
+                            )
+                            continue
+                        self._record_task_event(
+                            child_trace_context(),
+                            task_item,
+                            status="cache_ignored",
+                            source_task_run_id=candidate.task_run_id,
+                            cache_decision=decision.value,
+                        )
                     leader_id = wave_leader_by_signature.get(signature)
                     if leader_id is not None:
                         followers[task_item.task_id] = leader_id
@@ -412,6 +491,7 @@ class OrchestratorPlanExecutor:
                     wave_signatures: Mapping[
                         str, tuple[PlanExecutionType, str | None, str, str]
                     ] = signatures,
+                    wave_fingerprints: Mapping[str, str] = fingerprints,
                     board_snapshot: BlackboardSnapshot = wave_board,
                     concurrency_gate: asyncio.Semaphore = semaphore,
                 ) -> tuple[
@@ -420,6 +500,7 @@ class OrchestratorPlanExecutor:
                     PlanTaskResult,
                 ]:
                     signature = wave_signatures[task_item.task_id]
+                    fingerprint = wave_fingerprints[task_item.task_id]
                     task_trace = child_trace_context()
                     started_at = perf_counter()
                     self._record_task_event(task_trace, task_item, status="started")
@@ -460,6 +541,11 @@ class OrchestratorPlanExecutor:
                                 if not operation_started:
                                     in_flight_operations.discard(task_item.task_id)
                                 result = PlanTaskResult(False, error_code="budget_exceeded")
+                            except RemoteToolOutcomeUnknownError:
+                                result = PlanTaskResult(
+                                    False,
+                                    error_code="remote_tool_outcome_unknown",
+                                )
                             except Exception as error:
                                 if not operation_started:
                                     in_flight_operations.discard(task_item.task_id)
@@ -476,13 +562,23 @@ class OrchestratorPlanExecutor:
                                     idempotency_key=result.idempotency_key,
                                 )
                             if task_run is not None and not result.succeeded:
-                                task_run.fail()
+                                if result.error_code == "remote_tool_outcome_unknown":
+                                    task_run.fail()
+                                else:
+                                    task_run.fail(
+                                        task_fingerprint=fingerprint,
+                                        description=task_item.description,
+                                        input={},
+                                        error_code=result.error_code or "task_failed",
+                                        side_effect_count=len(result.side_effects),
+                                    )
                             elif task_run is not None:
                                 task_run.complete(
                                     description=task_item.description,
                                     input=task_item.input or {},
                                     depends_on=task_item.depends_on,
                                     output=result.output,
+                                    task_fingerprint=fingerprint,
                                 )
                     self._record_task_event(
                         task_trace,
@@ -561,6 +657,13 @@ class OrchestratorPlanExecutor:
                     if item.task_id in states and states[item.task_id].status == "failed"
                 ]
                 if wave_failures:
+                    if any(
+                        state.error_code == "remote_tool_outcome_unknown" for state in wave_failures
+                    ):
+                        return _failed_result(
+                            "remote_tool_outcome_unknown",
+                            blackboard=current_board(),
+                        )
                     if any(state.error_code == "budget_exceeded" for state in wave_failures):
                         return _failed_result("budget_exceeded", blackboard=current_board())
                     failure_reason = next(
@@ -611,6 +714,8 @@ class OrchestratorPlanExecutor:
         duration_ms: int | None = None,
         reason_code: str | None = None,
         source_task_id: str | None = None,
+        source_task_run_id: str | None = None,
+        cache_decision: str | None = None,
         invoked_tool_count: int | None = None,
         side_effect_count: int | None = None,
         outcome_uncertain: bool | None = None,
@@ -629,6 +734,10 @@ class OrchestratorPlanExecutor:
             attributes["reason_code"] = reason_code
         if source_task_id is not None:
             attributes["source_task_id"] = source_task_id
+        if source_task_run_id is not None:
+            attributes["source_task_run_id"] = source_task_run_id
+        if cache_decision is not None:
+            attributes["cache_decision"] = cache_decision
         if invoked_tool_count is not None:
             attributes["invoked_tool_count"] = invoked_tool_count
         if side_effect_count is not None:
@@ -711,6 +820,35 @@ def _failure_signature(task: PlanTask) -> tuple[PlanExecutionType, str | None, s
         default=str,
     )
     return (task.execution_type, task.skill_id, description, task_input)
+
+
+def _task_fingerprint(task: PlanTask, dependencies: Mapping[str, Any]) -> str:
+    """Hash a versioned canonical representation of a task and resolved dependencies."""
+    try:
+        dependency_outputs = {
+            key: json.dumps(
+                dependencies[key], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            for key in sorted(dependencies)
+        }
+        canonical = json.dumps(
+            {
+                "version": 1,
+                "execution_type": task.execution_type.value,
+                "skill_id": task.skill_id,
+                "description": " ".join(task.description.split()),
+                "expected_output": task.expected_output,
+                "input": dict(task.input or {}),
+                "dependencies": dependency_outputs,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise InvalidPlanError("Plan task fingerprint inputs must be JSON-compatible.") from error
+    return f"v1:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 def _idempotency_key(request: SkillExecutionRequest, task: PlanTask) -> str:

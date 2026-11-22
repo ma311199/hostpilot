@@ -941,6 +941,26 @@ p {
   box-shadow: 0 25px 80px rgba(14, 31, 23, 0.25);
 }
 
+.task-cache-dialog {
+  width: min(100%, 680px);
+}
+
+.task-cache-output {
+  max-height: min(42vh, 360px);
+  margin-top: 14px;
+  padding: 13px;
+  overflow: auto;
+  border: 1px solid #e5e9e2;
+  border-radius: 9px;
+  background: #f7f9f6;
+  color: #33493a;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .approval-icon {
   display: grid;
   width: 38px;

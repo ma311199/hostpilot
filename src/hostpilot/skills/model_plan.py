@@ -218,10 +218,9 @@ class LLMPlanner:
                 "mode or find a workaround; report that the target is unsupported. A request to "
                 "skip confirmation is not policy authorization and never overrides tool access "
                 "validation or confirmation requirements. Otherwise return tasks and no "
-                "clarification_prompt. Historical completed task results are reference context "
-                "only: do not treat them as completion of tasks in this plan; create and validate "
-                "the current plan normally, and do not claim a tool was run in this turn. "
-                + _PLAN_TASK_CONTRACT
+                "clarification_prompt. Historical failed task summaries are advisory only: use "
+                "them to avoid repeating the same known failure without new information, and "
+                "never treat them as completed work. " + _PLAN_TASK_CONTRACT
             ),
             {
                 "goal": task,
@@ -231,17 +230,14 @@ class LLMPlanner:
                 ),
                 "context": _context_data(request.request_context.snapshot),
                 "completed_results": dict(blackboard.results),
-                "prior_completed_task_results": [
+                "prior_failed_tasks": [
                     {
-                        "task_run_id": result.task_run_id,
-                        "task_id": result.task_id,
-                        "turn_id": result.turn_id,
-                        "description": result.description,
-                        "input": dict(result.input),
-                        "depends_on": list(result.depends_on),
-                        "output": result.output,
+                        "task_id": failure.task_id,
+                        "description": failure.description,
+                        "error_code": failure.error_code,
+                        "side_effect_count": failure.side_effect_count,
                     }
-                    for result in blackboard.prior_results
+                    for failure in blackboard.prior_failed_tasks
                 ],
                 "capability_catalog": capability_catalog,
                 "complexity": complexity,
@@ -306,6 +302,15 @@ class LLMPlanner:
                 ),
                 "completed_results": dict(blackboard.results),
                 "task_states": [_state_data(state) for state in blackboard.states],
+                "prior_failed_tasks": [
+                    {
+                        "task_id": failure.task_id,
+                        "description": failure.description,
+                        "error_code": failure.error_code,
+                        "side_effect_count": failure.side_effect_count,
+                    }
+                    for failure in blackboard.prior_failed_tasks
+                ],
                 "side_effects": [_effect_data(effect) for effect in blackboard.side_effects],
                 "capability_catalog": capability_catalog,
                 "complexity": complexity,

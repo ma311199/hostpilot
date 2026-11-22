@@ -20,7 +20,6 @@ from hostpilot.contracts import (
     TrustLevel,
 )
 from hostpilot.models import ModelResponse, ModelToolCall
-from hostpilot.persistence import StoredPlanTaskResult
 from hostpilot.runtime import RequestContext
 from hostpilot.skills.llm_actions import register_llm_completion_action
 from hostpilot.skills.model_plan import (
@@ -57,6 +56,7 @@ from hostpilot.skills.runtime import (
     StepActionRegistry,
 )
 from hostpilot.skills.yaml_registry import YamlSkillRegistry
+from hostpilot.task_results import StoredPlanTaskFailure
 
 
 def request(
@@ -711,7 +711,7 @@ def test_planner_parses_json_from_provider_response() -> None:
     asyncio.run(scenario())
 
 
-def test_planner_receives_prior_task_results_as_reference_context() -> None:
+def test_planner_receives_safe_prior_failure_summaries() -> None:
     model = FakeTextModel(
         {
             "tasks": [
@@ -725,33 +725,31 @@ def test_planner_receives_prior_task_results_as_reference_context() -> None:
             ]
         }
     )
-    prior = StoredPlanTaskResult(
+    prior = StoredPlanTaskFailure(
         task_run_id="run-1",
         task_id="inspect",
         turn_id="turn-1",
         session_id="conversation-1",
+        task_fingerprint=f"v1:{'a' * 64}",
         description="Inspect the source file",
         input={"path": "about.txt"},
-        depends_on=(),
-        output={"summary": "HostPilot"},
+        error_code="tool_unavailable",
+        side_effect_count=0,
         finished_at=datetime(2026, 11, 22, tzinfo=UTC),
     )
 
     async def scenario() -> None:
         await LLMPlanner(model, ()).create_plan(
-            request(), BlackboardSnapshot((), prior_results=(prior,))
+            request(), BlackboardSnapshot((), prior_failed_tasks=(prior,))
         )
 
     asyncio.run(scenario())
-    assert model.data["prior_completed_task_results"] == [
+    assert model.data["prior_failed_tasks"] == [
         {
-            "task_run_id": "run-1",
             "task_id": "inspect",
-            "turn_id": "turn-1",
             "description": "Inspect the source file",
-            "input": {"path": "about.txt"},
-            "depends_on": [],
-            "output": {"summary": "HostPilot"},
+            "error_code": "tool_unavailable",
+            "side_effect_count": 0,
         }
     ]
 

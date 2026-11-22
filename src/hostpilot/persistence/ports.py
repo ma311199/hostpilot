@@ -20,7 +20,12 @@ from hostpilot.persistence.routing_model_configuration import RoutingModelConfig
 from hostpilot.persistence.skill_execution import SkillExecutionMode
 from hostpilot.persistence.traces import StoredTraceEvent, TraceSummary
 from hostpilot.skills.compensation import CancellationSnapshot
-from hostpilot.task_results import CompletedPlanTaskResult, StoredPlanTaskResult
+from hostpilot.task_results import (
+    CompletedPlanTaskResult,
+    FailedPlanTaskSummary,
+    StoredPlanTaskFailure,
+    StoredPlanTaskResult,
+)
 
 
 class ConversationStore(Protocol):
@@ -184,7 +189,16 @@ class TaskStore(Protocol):
         state: Literal["completed", "failed", "cancelled"],
         finished_at: datetime,
         completed_result: CompletedPlanTaskResult | None = None,
+        failure_summary: FailedPlanTaskSummary | None = None,
     ) -> None: ...
+
+    async def find_completed_task_result(
+        self, *, session_id: str, exclude_turn_id: str, task_fingerprint: str
+    ) -> StoredPlanTaskResult | None: ...
+
+    async def list_recent_task_failures(
+        self, *, session_id: str, exclude_turn_id: str, limit: int
+    ) -> tuple[StoredPlanTaskFailure, ...]: ...
 
     async def list_completed_task_results(
         self, *, session_id: str, exclude_turn_id: str, limit: int

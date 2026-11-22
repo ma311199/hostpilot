@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from datetime import datetime
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any, Protocol
 
 from hostpilot.budget import RequestBudget
 from hostpilot.contracts import ContextSnapshot
@@ -20,4 +22,30 @@ class RequestContext:
     snapshot: ContextSnapshot
     budget: RequestBudget
     confirmation_provider: AsyncConfirmationProvider | None = None
+    task_cache_approval_provider: TaskCacheApprovalProvider | None = None
     task_lifecycle: TaskLifecycleManager | None = None
+
+
+class TaskCacheDecision(StrEnum):
+    """Explicit user choice for one exact successful Plan task match."""
+
+    REUSE = "reuse"
+    EXECUTE = "execute"
+
+
+@dataclass(frozen=True)
+class TaskCacheApprovalRequest:
+    """Historical result shown to a user before deciding whether to reuse it."""
+
+    request_id: str
+    task_id: str
+    description: str
+    source_turn_id: str
+    finished_at: datetime
+    output: Any
+
+
+class TaskCacheApprovalProvider(Protocol):
+    """Request a human decision before skipping a matching successful task."""
+
+    async def decide(self, request: TaskCacheApprovalRequest) -> TaskCacheDecision | None: ...

@@ -15,7 +15,11 @@ import {
   type SandboxMode,
 } from './api/chat'
 import { getWorkspace, selectWorkspace, type WorkspaceStatus } from './api/workspace'
-import { ChatSocketClient, type ToolConfirmationMessage } from './api/chatSocket'
+import {
+  ChatSocketClient,
+  type PlanTaskCacheMessage,
+  type ToolConfirmationMessage,
+} from './api/chatSocket'
 
 const conversations = ref<ConversationSummary[]>([])
 const activeSessionId = ref<string | null>(null)
@@ -33,6 +37,7 @@ const messageList = ref<HTMLElement | null>(null)
 const composerInput = ref<HTMLTextAreaElement | null>(null)
 const chatSocket = new ChatSocketClient()
 const pendingApproval = ref<ToolConfirmationMessage | null>(null)
+const pendingTaskCacheApproval = ref<PlanTaskCacheMessage | null>(null)
 const pendingToolOutcomes = ref<PendingToolOutcome[]>([])
 const outcomeResultDrafts = ref<Record<string, string>>({})
 const resolvingToolCallId = ref<string | null>(null)
@@ -95,6 +100,9 @@ const suggestions = [
 
 chatSocket.onConfirmation = (request) => {
   pendingApproval.value = request
+}
+chatSocket.onTaskCacheApproval = (request) => {
+  pendingTaskCacheApproval.value = request
 }
 
 async function refreshConversations(): Promise<void> {
@@ -391,6 +399,22 @@ function respondToApproval(decision: 'approved' | 'rejected' | 'cancelled'): voi
   if (!request) return
   pendingApproval.value = null
   chatSocket.respondToConfirmation(request.request_id, decision)
+}
+
+function respondToTaskCacheApproval(decision: 'reuse' | 'execute'): void {
+  const request = pendingTaskCacheApproval.value
+  if (!request) return
+  pendingTaskCacheApproval.value = null
+  chatSocket.respondToTaskCacheApproval(request.request_id, decision)
+}
+
+function formatTaskCacheOutput(output: unknown): string {
+  if (typeof output === 'string') return output
+  try {
+    return JSON.stringify(output, null, 2) ?? String(output)
+  } catch {
+    return String(output)
+  }
 }
 
 function conversationTime(value: string): string {
@@ -896,6 +920,49 @@ onUnmounted(() => chatSocket.close())
             @click="respondToApproval('approved')"
           >
             批准并执行
+          </button>
+        </footer>
+      </section>
+    </div>
+    <div
+      v-if="pendingTaskCacheApproval"
+      class="tool-approval-backdrop"
+    >
+      <section
+        class="tool-approval-dialog task-cache-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="task-cache-title"
+      >
+        <span class="chat-kicker">HISTORICAL TASK RESULT</span>
+        <h2 id="task-cache-title">
+          发现已完成的相同子任务
+        </h2>
+        <p class="approval-summary">
+          {{ pendingTaskCacheApproval.description }}
+        </p>
+        <p class="approval-note">
+          来源 Turn：{{ pendingTaskCacheApproval.source_turn_id }} ·
+          {{ new Date(pendingTaskCacheApproval.finished_at).toLocaleString() }}
+        </p>
+        <pre class="task-cache-output">{{ formatTaskCacheOutput(pendingTaskCacheApproval.output) }}</pre>
+        <p class="approval-note">
+          请检查结果是否仍适用于当前请求，再选择是否复用。
+        </p>
+        <footer class="approval-actions">
+          <button
+            type="button"
+            class="approval-reject"
+            @click="respondToTaskCacheApproval('execute')"
+          >
+            忽略结果并执行
+          </button>
+          <button
+            type="button"
+            class="approval-accept"
+            @click="respondToTaskCacheApproval('reuse')"
+          >
+            复用并跳过
           </button>
         </footer>
       </section>
