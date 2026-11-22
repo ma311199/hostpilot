@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         ToolOutcomeStore,
         TurnStore,
     )
+    from hostpilot.task_results import CompletedPlanTaskResult, StoredPlanTaskResult
 
 
 class TurnState(StrEnum):
@@ -497,13 +498,34 @@ class _ActiveTaskRun:
 
 
 class TaskRunHandle:
-    """Allow an executor to mark a returned unsuccessful result as failed."""
+    """Capture the terminal state and optional successful result for a TaskRun."""
 
     def __init__(self) -> None:
         self.terminal_state = TaskState.COMPLETED
+        self.completed_result: CompletedPlanTaskResult | None = None
 
     def fail(self) -> None:
         self.terminal_state = TaskState.FAILED
+        self.completed_result = None
+
+    def complete(
+        self,
+        *,
+        description: str,
+        input: Mapping[str, object],
+        depends_on: tuple[str, ...],
+        output: object,
+    ) -> None:
+        """Persist a successful Plan result with its task context."""
+        from hostpilot.task_results import CompletedPlanTaskResult
+
+        self.terminal_state = TaskState.COMPLETED
+        self.completed_result = CompletedPlanTaskResult(
+            description=description,
+            input=input,
+            depends_on=depends_on,
+            output=output,
+        )
 
 
 class TaskLifecycleManager:
@@ -543,6 +565,18 @@ class TaskLifecycleManager:
             raise ValueError("Runtime Host ID must be non-empty and trimmed.")
         self._store = store
         self._runtime_host_id = runtime_host_id
+
+    async def list_completed_task_results(
+        self, session_id: str, *, exclude_turn_id: str, limit: int = 32
+    ) -> tuple[StoredPlanTaskResult, ...]:
+        """Load bounded prior results for a new Plan in this Session."""
+        if self._store is None:
+            return ()
+        return await self._store.list_completed_task_results(
+            session_id=session_id,
+            exclude_turn_id=exclude_turn_id,
+            limit=limit,
+        )
 
     @asynccontextmanager
     async def track(
@@ -609,6 +643,11 @@ class TaskLifecycleManager:
                             terminal_state.value,
                         ),
                         finished_at=finished_at,
+                        completed_result=(
+                            handle.completed_result
+                            if terminal_state is TaskState.COMPLETED
+                            else None
+                        ),
                     )
 
     async def cancel_all(self) -> int:

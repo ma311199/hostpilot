@@ -20,6 +20,7 @@ from hostpilot.contracts import (
     TrustLevel,
 )
 from hostpilot.models import ModelResponse, ModelToolCall
+from hostpilot.persistence import StoredPlanTaskResult
 from hostpilot.runtime import RequestContext
 from hostpilot.skills.llm_actions import register_llm_completion_action
 from hostpilot.skills.model_plan import (
@@ -708,6 +709,51 @@ def test_planner_parses_json_from_provider_response() -> None:
         assert model.data["goal"] == "Summarize these notes"
 
     asyncio.run(scenario())
+
+
+def test_planner_receives_prior_task_results_as_reference_context() -> None:
+    model = FakeTextModel(
+        {
+            "tasks": [
+                {
+                    "task_id": "answer",
+                    "description": "Use relevant prior findings to answer",
+                    "execution_type": "reasoning_task",
+                    "expected_output": "A grounded answer",
+                    "input": {},
+                }
+            ]
+        }
+    )
+    prior = StoredPlanTaskResult(
+        task_run_id="run-1",
+        task_id="inspect",
+        turn_id="turn-1",
+        session_id="conversation-1",
+        description="Inspect the source file",
+        input={"path": "about.txt"},
+        depends_on=(),
+        output={"summary": "HostPilot"},
+        finished_at=datetime(2026, 11, 22, tzinfo=UTC),
+    )
+
+    async def scenario() -> None:
+        await LLMPlanner(model, ()).create_plan(
+            request(), BlackboardSnapshot((), prior_results=(prior,))
+        )
+
+    asyncio.run(scenario())
+    assert model.data["prior_completed_task_results"] == [
+        {
+            "task_run_id": "run-1",
+            "task_id": "inspect",
+            "turn_id": "turn-1",
+            "description": "Inspect the source file",
+            "input": {"path": "about.txt"},
+            "depends_on": [],
+            "output": {"summary": "HostPilot"},
+        }
+    ]
 
 
 def test_planner_rejects_capability_selection_inside_task_input() -> None:

@@ -37,12 +37,14 @@ def request(
     *,
     total_tokens: int = 100,
     task_lifecycle: TaskLifecycleManager | None = None,
+    request_id: str = "orchestration-test",
+    session_id: str = "conversation-1",
 ) -> SkillExecutionRequest:
     return SkillExecutionRequest(
         "builtin/orchestrator_plan",
         {"task_description": "Prepare the requested report"},
         RequestContext(
-            ContextSnapshot(request_id="orchestration-test", session_id="conversation-1"),
+            ContextSnapshot(request_id=request_id, session_id=session_id),
             RequestBudget.start(
                 BudgetContext(
                     limits=BudgetLimits(
@@ -78,9 +80,11 @@ class FakePlanner:
     def __init__(self, *plans: ExecutionPlan) -> None:
         self.plans = list(plans)
         self.calls = 0
+        self.blackboards = []
 
     async def create_plan(self, request, blackboard):
         self.calls += 1
+        self.blackboards.append(blackboard)
         return self.plans.pop(0)
 
 
@@ -765,8 +769,64 @@ def test_plan_task_attempts_persist_status_without_reusing_run_ids(tmp_path) -> 
     assert records[0].task_run_id != records[1].task_run_id
 
 
+def test_new_turn_receives_prior_results_without_auto_skipping_matching_task_id(tmp_path) -> None:
+    async def scenario():
+        database_path = tmp_path / "runtime.sqlite3"
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        now = datetime.now(UTC)
+        await turns.register_host(
+            "host-1",
+            now=now,
+            lease_expires_at=now + timedelta(seconds=30),
+        )
+        store = SQLiteTaskStore(database_path)
+        lifecycle = TaskLifecycleManager(store=store, runtime_host_id="host-1")
+
+        first = OrchestratorPlanExecutor(
+            FakePlanner(ExecutionPlan((task("inspect"),))),
+            FakeValidator(),
+            FakeTaskExecutor(),
+            FakeVerifier(),
+            FakeReplanner(),
+            max_replans=0,
+        )
+        await first.execute(
+            request(task_lifecycle=lifecycle, request_id="turn-1", session_id="session-1")
+        )
+
+        second_planner = FakePlanner(ExecutionPlan((task("inspect"),)))
+        second_executor = FakeTaskExecutor()
+        second = OrchestratorPlanExecutor(
+            second_planner,
+            FakeValidator(),
+            second_executor,
+            FakeVerifier(),
+            FakeReplanner(),
+            max_replans=0,
+        )
+        await second.execute(
+            request(task_lifecycle=lifecycle, request_id="turn-2", session_id="session-1")
+        )
+        return second_planner.blackboards[0], second_executor, await store.list_task_runs()
+
+    board, task_executor, task_runs = asyncio.run(scenario())
+
+    assert board.states == ()
+    assert len(board.prior_results) == 1
+    assert board.prior_results[0].task_id == "inspect"
+    assert board.prior_results[0].output == {"task": "inspect"}
+    assert len(task_executor.calls) == 1
+    assert task_executor.calls[0].blackboard.prior_results == ()
+    assert [record.state for record in task_runs] == ["completed", "completed"]
+
+
 def test_plan_does_not_call_task_executor_when_task_start_write_fails() -> None:
     class FailingTaskStore:
+        async def list_completed_task_results(self, **kwargs):
+            del kwargs
+            return ()
+
         async def create_task_run(self, **kwargs) -> None:
             del kwargs
             raise OSError("task store unavailable")
