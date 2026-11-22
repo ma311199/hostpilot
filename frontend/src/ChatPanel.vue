@@ -417,6 +417,32 @@ function formatTaskCacheOutput(output: unknown): string {
   }
 }
 
+function taskEffectLabel(level: string): string {
+  const labels: Record<string, string> = {
+    read_only: '只读',
+    idempotent: '幂等',
+    reversible: '可撤销',
+    irreversible: '不可逆',
+    unknown: '未知',
+  }
+  return labels[level] ?? '未知'
+}
+
+function taskConfirmationSummary(decisions: string[]): string {
+  if (decisions.length === 0) return '没有记录到人工确认'
+  const counts = new Map<string, number>()
+  for (const decision of decisions) counts.set(decision, (counts.get(decision) ?? 0) + 1)
+  const labels: Record<string, string> = {
+    approved: '批准',
+    rejected: '拒绝',
+    cancelled: '取消',
+    timed_out: '超时',
+  }
+  return [...counts.entries()]
+    .map(([decision, count]) => `${labels[decision] ?? '未知'} ${count} 次`)
+    .join('、')
+}
+
 function conversationTime(value: string): string {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return ''
@@ -945,9 +971,39 @@ onUnmounted(() => chatSocket.close())
           来源 Turn：{{ pendingTaskCacheApproval.source_turn_id }} ·
           {{ new Date(pendingTaskCacheApproval.finished_at).toLocaleString() }}
         </p>
+        <section
+          v-if="pendingTaskCacheApproval.execution_summary"
+          class="task-cache-provenance"
+          aria-label="历史执行摘要"
+        >
+          <h3>历史工具调用</h3>
+          <ul v-if="pendingTaskCacheApproval.execution_summary.tools.length">
+            <li
+              v-for="usage in pendingTaskCacheApproval.execution_summary.tools"
+              :key="usage.tool_id"
+            >
+              <code>{{ usage.tool_id }}</code>
+              · {{ usage.call_count }} 次 · {{ taskEffectLabel(usage.side_effect_level) }}
+            </li>
+          </ul>
+          <p v-else>
+            没有记录到工具调用。
+          </p>
+          <p>
+            人工确认：{{
+              taskConfirmationSummary(pendingTaskCacheApproval.execution_summary.confirmation_decisions)
+            }}
+          </p>
+        </section>
+        <p
+          v-else
+          class="task-cache-unknown"
+        >
+          执行摘要不可用：这条旧记录没有保存工具调用或影响等级，当前无法判断其历史执行风险。
+        </p>
         <pre class="task-cache-output">{{ formatTaskCacheOutput(pendingTaskCacheApproval.output) }}</pre>
         <p class="approval-note">
-          请检查结果是否仍适用于当前请求，再选择是否复用。
+          复用会跳过上述调用；重新执行会再次运行子任务，可能重复产生副作用，并仍受当前工具策略和确认保护。
         </p>
         <footer class="approval-actions">
           <button

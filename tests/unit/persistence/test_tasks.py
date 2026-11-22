@@ -9,7 +9,11 @@ from hostpilot.persistence import (
     SQLiteTaskStore,
     SQLiteTurnStore,
 )
-from hostpilot.task_results import FailedPlanTaskSummary
+from hostpilot.task_results import (
+    FailedPlanTaskSummary,
+    PlanTaskExecutionSummary,
+    PlanTaskToolUsage,
+)
 
 
 def test_task_store_persists_terminal_metadata_across_reopen(tmp_path) -> None:
@@ -197,6 +201,190 @@ def test_task_store_migrates_legacy_result_table_with_no_fingerprint(tmp_path) -
             for row in connection.execute("PRAGMA table_info(runtime_plan_task_results)").fetchall()
         }
     assert "task_fingerprint" in columns
+
+
+def test_task_store_migrates_legacy_result_table_with_nullable_execution_summary(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE runtime_plan_task_results (
+                task_run_id TEXT PRIMARY KEY,
+                task_fingerprint TEXT,
+                task_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                description TEXT NOT NULL,
+                input_json TEXT NOT NULL,
+                depends_on_json TEXT NOT NULL,
+                output_json TEXT NOT NULL,
+                finished_at TEXT NOT NULL
+            )
+            """
+        )
+
+    asyncio.run(SQLiteTaskStore(database_path).initialize())
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1]: row[3]
+            for row in connection.execute("PRAGMA table_info(runtime_plan_task_results)").fetchall()
+        }
+    assert columns["execution_summary_json"] == 0
+
+
+def test_task_store_persists_execution_summary_across_reopen(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 11, 0, tzinfo=UTC)
+    summary = PlanTaskExecutionSummary(
+        tools=(
+            PlanTaskToolUsage("read_text_file", 2, "read_only"),
+            PlanTaskToolUsage("write_text_file", 1, "irreversible"),
+        ),
+        confirmation_decisions=("approved", "timed_out"),
+    )
+
+    async def scenario() -> None:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
+        store = SQLiteTaskStore(database_path)
+        await store.create_task_run(
+            task_run_id="run-summary",
+            task_id="prepare_report",
+            turn_id="turn-old",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            started_at=now,
+        )
+        await store.finish_task_run(
+            "run-summary",
+            runtime_host_id="host-a",
+            state="completed",
+            finished_at=now + timedelta(seconds=1),
+            completed_result=CompletedPlanTaskResult(
+                task_fingerprint=f"v1:{'b' * 64}",
+                description="Prepare report",
+                input={"source": "notes.txt"},
+                depends_on=(),
+                output={"ready": True},
+                execution_summary=summary,
+            ),
+        )
+        results = await SQLiteTaskStore(database_path).list_completed_task_results(
+            session_id="session-1", exclude_turn_id="turn-new", limit=32
+        )
+        assert results[0].execution_summary == summary
+
+    asyncio.run(scenario())
+
+
+def test_task_store_rolls_back_terminal_state_if_summary_insert_fails(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 11, 0, tzinfo=UTC)
+
+    async def scenario() -> None:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
+        store = SQLiteTaskStore(database_path)
+        await store.create_task_run(
+            task_run_id="run-atomic",
+            task_id="summarize",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            started_at=now,
+        )
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_task_result BEFORE INSERT ON runtime_plan_task_results
+                BEGIN SELECT RAISE(ABORT, 'forced result insert failure'); END
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="forced result insert failure"):
+            await store.finish_task_run(
+                "run-atomic",
+                runtime_host_id="host-a",
+                state="completed",
+                finished_at=now + timedelta(seconds=1),
+                completed_result=CompletedPlanTaskResult(
+                    task_fingerprint=f"v1:{'d' * 64}",
+                    description="Summarize",
+                    input={},
+                    depends_on=(),
+                    output="done",
+                    execution_summary=PlanTaskExecutionSummary(),
+                ),
+            )
+        records = await store.list_task_runs(turn_id="turn-1")
+        assert records[0].state == "running"
+        assert records[0].finished_at is None
+        with sqlite3.connect(database_path) as connection:
+            assert (
+                connection.execute("SELECT COUNT(*) FROM runtime_plan_task_results").fetchone()[0]
+                == 0
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        PlanTaskExecutionSummary(
+            tools=(PlanTaskToolUsage("read_text_file", 0, "read_only"),),
+        ),
+        PlanTaskExecutionSummary(
+            tools=(PlanTaskToolUsage("read_text_file", 1, "assume_safe"),),
+        ),
+        PlanTaskExecutionSummary(confirmation_decisions=("approval from Alice",)),
+        PlanTaskExecutionSummary(
+            tools=tuple(
+                PlanTaskToolUsage(f"tool_{index}", 1, "read_only") for index in range(5000)
+            ),
+        ),
+    ],
+)
+def test_task_store_rejects_invalid_execution_summary_without_finishing_run(
+    tmp_path, summary
+) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime(2026, 11, 22, 11, 0, tzinfo=UTC)
+
+    async def scenario() -> None:
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        await turns.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
+        store = SQLiteTaskStore(database_path)
+        await store.create_task_run(
+            task_run_id="run-invalid-summary",
+            task_id="summarize",
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="host-a",
+            started_at=now,
+        )
+        with pytest.raises(ValueError):
+            await store.finish_task_run(
+                "run-invalid-summary",
+                runtime_host_id="host-a",
+                state="completed",
+                finished_at=now + timedelta(seconds=1),
+                completed_result=CompletedPlanTaskResult(
+                    task_fingerprint=f"v1:{'c' * 64}",
+                    description="Summarize",
+                    input={},
+                    depends_on=(),
+                    output="done",
+                    execution_summary=summary,
+                ),
+            )
+        records = await store.list_task_runs(turn_id="turn-1")
+        assert records[0].state == "running"
+        assert records[0].finished_at is None
+
+    asyncio.run(scenario())
 
 
 def test_task_store_persists_and_lists_completed_results_by_session(tmp_path) -> None:

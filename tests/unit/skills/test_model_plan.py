@@ -56,7 +56,7 @@ from hostpilot.skills.runtime import (
     StepActionRegistry,
 )
 from hostpilot.skills.yaml_registry import YamlSkillRegistry
-from hostpilot.task_results import StoredPlanTaskFailure
+from hostpilot.task_results import PlanTaskToolUsage, StoredPlanTaskFailure
 
 
 def request(
@@ -595,6 +595,10 @@ def test_tool_task_react_agent_can_call_multiple_tools_in_one_task() -> None:
             "read_text_file",
             "write_text_file",
         ]
+        assert result.tool_usage == (
+            PlanTaskToolUsage("read_text_file", 2, "read_only"),
+            PlanTaskToolUsage("write_text_file", 1, "unknown"),
+        )
         assert executor.tool_agent_diagnostics[0]["turn_count"] == 3
 
     asyncio.run(scenario())

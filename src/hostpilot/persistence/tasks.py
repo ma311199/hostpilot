@@ -19,6 +19,8 @@ from hostpilot.persistence.sqlite_path import prepare_sqlite_database_path
 from hostpilot.task_results import (
     CompletedPlanTaskResult,
     FailedPlanTaskSummary,
+    PlanTaskExecutionSummary,
+    PlanTaskToolUsage,
     StoredPlanTaskFailure,
     StoredPlanTaskResult,
 )
@@ -90,6 +92,7 @@ class SQLiteTaskStore:
                         input_json TEXT NOT NULL,
                         depends_on_json TEXT NOT NULL,
                         output_json TEXT NOT NULL,
+                        execution_summary_json TEXT,
                         finished_at TEXT NOT NULL
                     )
                     """
@@ -101,6 +104,11 @@ class SQLiteTaskStore:
                 if "task_fingerprint" not in result_columns:
                     await connection.execute(
                         "ALTER TABLE runtime_plan_task_results ADD COLUMN task_fingerprint TEXT"
+                    )
+                if "execution_summary_json" not in result_columns:
+                    await connection.execute(
+                        "ALTER TABLE runtime_plan_task_results "
+                        "ADD COLUMN execution_summary_json TEXT"
                     )
                 await connection.execute(
                     """
@@ -242,8 +250,9 @@ class SQLiteTaskStore:
                     """
                     INSERT INTO runtime_plan_task_results (
                         task_run_id, task_fingerprint, task_id, turn_id, session_id, description,
-                        input_json, depends_on_json, output_json, finished_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        input_json, depends_on_json, output_json, execution_summary_json,
+                        finished_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_run_id,
@@ -341,7 +350,7 @@ class SQLiteTaskStore:
                 """
                 SELECT r.task_run_id, r.task_id, r.turn_id, r.session_id, r.description,
                        r.task_fingerprint, r.input_json, r.depends_on_json,
-                       r.output_json, r.finished_at
+                       r.output_json, r.execution_summary_json, r.finished_at
                 FROM runtime_plan_task_results AS r
                 JOIN runtime_task_runs AS t ON t.task_run_id = r.task_run_id
                 WHERE r.session_id = ? AND r.turn_id != ? AND t.state = 'completed'
@@ -361,6 +370,7 @@ class SQLiteTaskStore:
                     "input_json",
                     "depends_on_json",
                     "output_json",
+                    "execution_summary_json",
                 )
             )
             if total_bytes + result_bytes > _MAX_RESULT_HISTORY_BYTES:
@@ -383,7 +393,7 @@ class SQLiteTaskStore:
                 """
                 SELECT r.task_run_id, r.task_id, r.turn_id, r.session_id,
                        r.task_fingerprint, r.description, r.input_json,
-                       r.depends_on_json, r.output_json, r.finished_at
+                       r.depends_on_json, r.output_json, r.execution_summary_json, r.finished_at
                 FROM runtime_plan_task_results AS r
                 JOIN runtime_task_runs AS t ON t.task_run_id = r.task_run_id
                 WHERE r.session_id = ? AND r.turn_id != ?
@@ -464,7 +474,7 @@ def _stored_task_run(row: sqlite3.Row) -> StoredTaskRun:
 
 def _serialize_task_result(
     result: CompletedPlanTaskResult,
-) -> tuple[str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str | None]:
     _validate_fingerprint(result.task_fingerprint)
     if not result.description.strip():
         raise ValueError("Completed Plan task description cannot be blank.")
@@ -474,16 +484,82 @@ def _serialize_task_result(
         input_json = json.dumps(dict(result.input), ensure_ascii=False, allow_nan=False)
         depends_on_json = json.dumps(list(result.depends_on), ensure_ascii=False)
         output_json = json.dumps(result.output, ensure_ascii=False, allow_nan=False)
+        summary_json = _serialize_execution_summary(result.execution_summary)
     except (TypeError, ValueError) as error:
         raise ValueError(
             "Completed Plan task result must contain JSON-compatible values."
         ) from error
     total_bytes = len(result.description.encode("utf-8")) + sum(
-        len(value.encode("utf-8")) for value in (input_json, depends_on_json, output_json)
+        len(value.encode("utf-8"))
+        for value in (input_json, depends_on_json, output_json, summary_json or "")
     )
     if total_bytes > _MAX_RESULT_BYTES:
         raise ValueError("Completed Plan task result exceeds the 65536-byte persistence limit.")
-    return result.task_fingerprint, result.description, input_json, depends_on_json, output_json
+    return (
+        result.task_fingerprint,
+        result.description,
+        input_json,
+        depends_on_json,
+        output_json,
+        summary_json,
+    )
+
+
+def _serialize_execution_summary(summary: PlanTaskExecutionSummary | None) -> str | None:
+    if summary is None:
+        return None
+    if not isinstance(summary, PlanTaskExecutionSummary):
+        raise ValueError("Plan task execution summary has an invalid type.")
+    if not isinstance(summary.tools, tuple) or not isinstance(
+        summary.confirmation_decisions, tuple
+    ):
+        raise ValueError("Plan task execution summary collections must be tuples.")
+    tool_ids: set[str] = set()
+    tools: list[dict[str, str | int]] = []
+    allowed_effects = {"read_only", "idempotent", "reversible", "irreversible", "unknown"}
+    for usage in summary.tools:
+        if not isinstance(usage, PlanTaskToolUsage):
+            raise ValueError("Plan task execution summary contains an invalid tool record.")
+        if not isinstance(usage.tool_id, str) or not _SAFE_CACHE_VALUE.fullmatch(usage.tool_id):
+            raise ValueError("Plan task execution summary contains an unsafe tool ID.")
+        if usage.tool_id in tool_ids:
+            raise ValueError("Plan task execution summary must aggregate each tool only once.")
+        if isinstance(usage.call_count, bool) or usage.call_count < 1:
+            raise ValueError("Plan task tool call count must be positive.")
+        if (
+            not isinstance(usage.side_effect_level, str)
+            or usage.side_effect_level not in allowed_effects
+        ):
+            raise ValueError("Plan task execution summary contains an unknown effect level.")
+        tool_ids.add(usage.tool_id)
+        tools.append(
+            {
+                "tool_id": usage.tool_id,
+                "call_count": usage.call_count,
+                "side_effect_level": usage.side_effect_level,
+            }
+        )
+    allowed_decisions = {"approved", "rejected", "cancelled", "timed_out"}
+    if any(
+        not isinstance(decision, str) or decision not in allowed_decisions
+        for decision in summary.confirmation_decisions
+    ):
+        raise ValueError("Plan task execution summary contains an invalid confirmation decision.")
+    try:
+        serialized = json.dumps(
+            {
+                "tools": tools,
+                "confirmation_decisions": list(summary.confirmation_decisions),
+            },
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("Plan task execution summary is not JSON-compatible.") from error
+    if len(serialized.encode("utf-8")) > _MAX_RESULT_BYTES:
+        raise ValueError("Plan task execution summary exceeds the persistence limit.")
+    return serialized
 
 
 def _stored_task_result(row: sqlite3.Row) -> StoredPlanTaskResult:
@@ -502,7 +578,48 @@ def _stored_task_result(row: sqlite3.Row) -> StoredPlanTaskResult:
         depends_on=tuple(str(item) for item in dependencies),
         output=json.loads(str(row["output_json"])),
         finished_at=datetime.fromisoformat(str(row["finished_at"])),
+        execution_summary=_deserialize_execution_summary(row["execution_summary_json"]),
     )
+
+
+def _deserialize_execution_summary(value: Any) -> PlanTaskExecutionSummary | None:
+    if value is None:
+        return None
+    payload = json.loads(str(value))
+    if not isinstance(payload, dict) or set(payload) != {"tools", "confirmation_decisions"}:
+        raise ValueError("Stored Plan task execution summary has an invalid shape.")
+    tools = payload["tools"]
+    decisions = payload["confirmation_decisions"]
+    if not isinstance(tools, list) or not isinstance(decisions, list):
+        raise ValueError("Stored Plan task execution summary has invalid collections.")
+    if any(
+        not isinstance(item, dict) or set(item) != {"tool_id", "call_count", "side_effect_level"}
+        for item in tools
+    ):
+        raise ValueError("Stored Plan task execution summary has an invalid tool record.")
+    if any(
+        not isinstance(item, dict)
+        or set(item) != {"tool_id", "call_count", "side_effect_level"}
+        or not isinstance(item.get("tool_id"), str)
+        or isinstance(item.get("call_count"), bool)
+        or not isinstance(item.get("call_count"), int)
+        or not isinstance(item.get("side_effect_level"), str)
+        for item in tools
+    ) or any(not isinstance(item, str) for item in decisions):
+        raise ValueError("Stored Plan task execution summary contains invalid values.")
+    summary = PlanTaskExecutionSummary(
+        tools=tuple(
+            PlanTaskToolUsage(
+                tool_id=item["tool_id"],
+                call_count=item["call_count"],
+                side_effect_level=item["side_effect_level"],
+            )
+            for item in tools
+        ),
+        confirmation_decisions=tuple(str(item) for item in decisions),
+    )
+    _serialize_execution_summary(summary)
+    return summary
 
 
 def _serialize_task_failure(

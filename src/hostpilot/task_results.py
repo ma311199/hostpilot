@@ -17,6 +17,24 @@ class CompletedPlanTaskResult:
     depends_on: tuple[str, ...]
     output: Any
     task_fingerprint: str = ""
+    execution_summary: PlanTaskExecutionSummary | None = None
+
+
+@dataclass(frozen=True)
+class PlanTaskToolUsage:
+    """Allowlisted aggregate of calls to one tool during a Plan subtask."""
+
+    tool_id: str
+    call_count: int
+    side_effect_level: str
+
+
+@dataclass(frozen=True)
+class PlanTaskExecutionSummary:
+    """Safe execution provenance, excluding tool arguments and returned values."""
+
+    tools: tuple[PlanTaskToolUsage, ...] = ()
+    confirmation_decisions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -33,6 +51,7 @@ class StoredPlanTaskResult:
     depends_on: tuple[str, ...]
     output: Any
     finished_at: datetime
+    execution_summary: PlanTaskExecutionSummary | None = None
 
 
 @dataclass(frozen=True)

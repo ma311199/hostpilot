@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -10,6 +11,7 @@ from hostpilot.models import ModelMessage, ModelRequest, ModelResponse, ModelRol
 from hostpilot.models.budget import complete_with_budget
 from hostpilot.observability import TraceContext, TraceEvent, trace_context_scope
 from hostpilot.persistence import SQLiteTaskStore, SQLiteTurnStore
+from hostpilot.policy.confirmation import ConfirmationDecision, ConfirmationRequest
 from hostpilot.runtime import RequestContext, TaskLifecycleManager
 from hostpilot.runtime.context import TaskCacheDecision
 from hostpilot.skills.compensation import (
@@ -33,6 +35,7 @@ from hostpilot.skills.runtime import (
     SkillSideEffect,
 )
 from hostpilot.skills.yaml_registry import SideEffectLevel
+from hostpilot.task_results import PlanTaskToolUsage
 from hostpilot.tools.executor import RemoteToolOutcomeUnknownError
 
 
@@ -271,12 +274,85 @@ def test_plan_task_trace_records_safe_lifecycle_metadata() -> None:
     }
     assert completed.attributes["status"] == "completed"
     assert completed.attributes["invoked_tool_count"] == 1
+    assert '"side_effect_level":"unknown"' in completed.attributes["tool_usage"]
     assert "duration_ms" in completed.attributes
     assert started.context.trace_id == parent.trace_id
     assert started.context.parent_span_id == parent.span_id
     assert completed.context.span_id == started.context.span_id
     assert "private plan description" not in str(trace.events)
     assert "task output" not in str(trace.events)
+
+
+def test_successful_task_persists_tool_usage_and_confirmation_decisions(tmp_path) -> None:
+    class ConfirmingProvider:
+        def __init__(self) -> None:
+            self.requests: list[ConfirmationRequest] = []
+
+        async def confirm(self, request: ConfirmationRequest) -> ConfirmationDecision:
+            self.requests.append(request)
+            return ConfirmationDecision.APPROVED
+
+    class ConfirmingExecutor:
+        async def execute_task(self, call):
+            decision = await call.request.request_context.confirmation_provider.confirm(
+                ConfirmationRequest("confirm-1", "write_text_file", "private path and content")
+            )
+            assert decision is ConfirmationDecision.APPROVED
+            return PlanTaskResult(
+                True,
+                output={"written": True},
+                invoked_tool_ids=("write_text_file",),
+                tool_usage=(PlanTaskToolUsage("write_text_file", 1, "irreversible"),),
+                idempotency_key=call.idempotency_key,
+            )
+
+    async def scenario():
+        database_path = tmp_path / "runtime.sqlite3"
+        turns = SQLiteTurnStore(database_path)
+        await turns.initialize()
+        now = datetime.now(UTC)
+        await turns.register_host("host-1", now=now, lease_expires_at=now + timedelta(minutes=1))
+        store = SQLiteTaskStore(database_path)
+        lifecycle = TaskLifecycleManager(store=store, runtime_host_id="host-1")
+        confirmation = ConfirmingProvider()
+        trace = TraceRecorder()
+        current_request = request(task_lifecycle=lifecycle)
+        current_request = replace(
+            current_request,
+            request_context=replace(
+                current_request.request_context,
+                confirmation_provider=confirmation,
+            ),
+        )
+        executor = OrchestratorPlanExecutor(
+            FakePlanner(ExecutionPlan((task("write_report"),))),
+            FakeValidator(),
+            ConfirmingExecutor(),
+            FakeVerifier(),
+            FakeReplanner(),
+            max_replans=0,
+            trace_sink=trace,
+        )
+        result = await executor.execute(current_request)
+        stored = await store.list_completed_task_results(
+            session_id="conversation-1", exclude_turn_id="next-turn", limit=32
+        )
+        events = [event for event in trace.events if event.name == "plan.task"]
+        return result, confirmation, stored, events
+
+    result, confirmation, stored, events = asyncio.run(scenario())
+    assert result.status is SkillExecutionStatus.COMPLETED
+    assert len(confirmation.requests) == 1
+    assert len(stored) == 1
+    assert stored[0].execution_summary is not None
+    assert stored[0].execution_summary.tools == (
+        PlanTaskToolUsage("write_text_file", 1, "irreversible"),
+    )
+    assert stored[0].execution_summary.confirmation_decisions == ("approved",)
+    completed = next(event for event in events if event.attributes["status"] == "completed")
+    assert '"side_effect_level":"irreversible"' in completed.attributes["tool_usage"]
+    assert '"approved"' in completed.attributes["confirmation_decisions"]
+    assert "private path and content" not in str(events)
 
 
 def test_independent_plan_tasks_run_concurrently_and_join_after_dependencies() -> None:

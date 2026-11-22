@@ -25,6 +25,10 @@
 | Web / API / 前端 | 未建立统一用户任务成功率基线 | 页面、API、Vitest、Playwright E2E 在分项报告中记录；模型配置弹窗拖选模型名称时误关闭已修复，前端 Vitest **80 passed**、ESLint、TypeScript 检查和生产构建通过。详见[弹窗回归记录](test-results/2026-11-20-model-settings-selection-close.md) | 按用户流程维护 E2E 成功率、失败率和关键页面缺陷；单测数不等同可用性指标 |
 | Trace / Audit / 可观测性 | 未建立查询质量基线 | 持久化、过滤、脱敏、分页和导出有测试报告 | 补充事件关联完整率、查询正确率和保留策略验证；禁止把敏感正文纳入采集 |
 
+### Plan 子任务历史执行摘要
+
+2026-11-22 为成功 Plan 子任务结果增加安全执行摘要：历史调用按工具 ID 聚合，记录调用次数、效果等级和人工确认决策；缺失效果级别为 `unknown`。缓存审批卡片显示摘要和旧记录信息缺失状态，并明确重新执行可能重复副作用。持久化/生命周期/Plan/API 定向测试 **79 passed**；全量 Python **669 passed**，1 条既有 Authlib 弃用警告；前端 **85 passed**；Ruff 全仓 lint、12 个改动 Python 文件格式检查、mypy 128 个源码文件、ESLint、TypeScript、生产构建及 `git diff --check` 通过。故障注入确认结果插入失败时状态与摘要事务回滚。该项是功能回归，不建立模型或任务质量准确率基线。详细失败/修复记录见[执行摘要验证报告](test-results/2026-11-22-runtime-task-execution-provenance.md)与[ADR-0037](decisions/0037-plan-task-execution-provenance.md)。
+
 ### Runtime 执行循环边界契约
 
 2026-11-19 定义 `RuntimeExecutionRequest`/`RuntimeExecutionResult` 和 Model/Tool/Skill/Loop Protocol；新增 `DefaultRuntimeExecutionLoop`、`ModelProviderRuntimeAdapter` 和 `ToolFacadeRuntimeAdapter`。Runtime 定向回归 **33 passed**，全量 pytest **529 passed**，有 1 条 FastMCP/Authlib 弃用警告；Ruff lint、211 个 Python 文件格式检查、全仓 mypy（119 个源码文件）和 `git diff --check` 通过。执行循环测试覆盖终答、工具提案整批拒绝、allowlist、消息 call ID 回填、步数上限、预算和取消；适配器测试覆盖模型 Token 记账和审批/预算转发。循环按本轮消息输入、返回增量，不持有 Session/Checkpointer；生产 Chat Runtime 仍使用 LangGraph。最终计数与失败诊断见[执行循环验证](test-results/2026-11-19-runtime-execution-loop.md)。

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from hostpilot.task_results import (
         CompletedPlanTaskResult,
         FailedPlanTaskSummary,
+        PlanTaskExecutionSummary,
         StoredPlanTaskFailure,
         StoredPlanTaskResult,
     )
@@ -541,6 +542,7 @@ class TaskRunHandle:
         depends_on: tuple[str, ...],
         output: object,
         task_fingerprint: str,
+        execution_summary: PlanTaskExecutionSummary | None = None,
     ) -> None:
         """Persist a successful Plan result with its task context."""
         from hostpilot.task_results import CompletedPlanTaskResult
@@ -552,6 +554,7 @@ class TaskRunHandle:
             depends_on=depends_on,
             output=output,
             task_fingerprint=task_fingerprint,
+            execution_summary=execution_summary,
         )
         self.failure_summary = None
 

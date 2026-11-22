@@ -28,6 +28,14 @@ export interface PlanTaskCacheMessage {
   source_turn_id: string
   finished_at: string
   output: unknown
+  execution_summary?: {
+    tools: {
+      tool_id: string
+      call_count: number
+      side_effect_level: 'read_only' | 'idempotent' | 'reversible' | 'irreversible' | 'unknown'
+    }[]
+    confirmation_decisions: ('approved' | 'rejected' | 'cancelled' | 'timed_out')[]
+  } | null
 }
 
 interface PlanTaskCacheRequestMessage {

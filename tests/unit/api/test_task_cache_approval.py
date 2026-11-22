@@ -8,6 +8,7 @@ from starlette.websockets import WebSocketDisconnect
 import hostpilot.api.app as app_module
 from hostpilot.api.app import WebSocketTaskCacheApprovalProvider
 from hostpilot.runtime.context import TaskCacheApprovalRequest, TaskCacheDecision
+from hostpilot.task_results import PlanTaskExecutionSummary, PlanTaskToolUsage
 
 
 class FakeWebSocket:
@@ -53,6 +54,10 @@ def test_websocket_task_cache_provider_sends_result_and_returns_explicit_decisio
         source_turn_id="turn-previous",
         finished_at=datetime(2026, 11, 22, tzinfo=UTC),
         output={"summary": "HostPilot"},
+        execution_summary=PlanTaskExecutionSummary(
+            tools=(PlanTaskToolUsage("write_text_file", 1, "irreversible"),),
+            confirmation_decisions=("approved",),
+        ),
     )
 
     decision = asyncio.run(provider.decide(request))
@@ -68,6 +73,16 @@ def test_websocket_task_cache_provider_sends_result_and_returns_explicit_decisio
                 "source_turn_id": "turn-previous",
                 "finished_at": "2026-11-22T00:00:00+00:00",
                 "output": {"summary": "HostPilot"},
+                "execution_summary": {
+                    "tools": [
+                        {
+                            "tool_id": "write_text_file",
+                            "call_count": 1,
+                            "side_effect_level": "irreversible",
+                        }
+                    ],
+                    "confirmation_decisions": ["approved"],
+                },
             },
         }
     ]
