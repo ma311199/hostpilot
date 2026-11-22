@@ -112,6 +112,8 @@ v4 direct/clarify 首批 10 例路由与 Skill 匹配均为 10/10；总 Token 43
 
 2026-11-21 Plan TaskRun 生命周期持久化：新增可替换 `TaskStore` Port、SQLite TaskRun 元数据存储及 Runtime-owned `TaskLifecycleManager`，覆盖实际 Plan 子任务的开始、完成、失败和取消。发现正常停止 Host 若终态写入失败，会留下无法再运行的 `running` TaskRun；新增回归测试先失败（预期中断 1 项、实际 0 项），修复后过期/停止 Host 的残留任务均恢复为 `interrupted`，活跃 Host 隔离保持。生命周期、Plan、Host 插件、Chat 与重启集成定向测试 **58 passed**；全量 pytest **596 passed**（1 条既有 Authlib 弃用警告）；Ruff 全仓 lint、全仓 mypy（125 个源码文件）、22 个改动 Python 文件格式检查及 `git diff --check` 通过。全仓格式检查仍只有未修改的 `src/hostpilot/persistence/skill_execution.py:37` 存量差异（219 个文件已格式化）。TaskRun 仅存元数据，不恢复、不重试、不重放；保留/清理策略尚未制定。详见[持久化 Task 生命周期验证](test-results/2026-11-21-persistent-task-lifecycle.md)。
 
+2026-11-22 Plan 成功子任务结果持久化：新增独立 SQLite 结果表，TaskRun 完成状态与成功输出在同一事务写入；新 Turn 查询同一 Session 的最近最多 32 条、总 payload 不超过 65,536 字节的结果，交给 Planner 重新规划。失败/取消/中断结果不作为历史输出；历史结果不会自动满足新任务，Task Executor 不接收历史 Blackboard。TDD 验证覆盖 SQLite 重开、Session 隔离、当前 Turn 排除、状态过滤、结果单项及聚合大小上限、task_id 冲突下的新任务执行和 Planner 上下文。定向测试 **64 passed**；全量 pytest **648 passed**（1 条既有 Authlib 弃用警告）；Ruff 全仓 lint、mypy（128 个源码文件）、11 个改动 Python 文件格式检查及 `git diff --check` 通过。旧 Plan DAG、执行游标恢复及数据清理策略仍未实现。详见[Plan 子任务结果持久化验证](test-results/2026-11-22-runtime-persistent-plan-results.md)。
+
 ## 更新流程
 
 1. 每次新增测试报告后，在对应模块行更新当前状态，并在“已有质量评测数据”追加可比较的量化结果。

@@ -20,6 +20,7 @@ from hostpilot.persistence.routing_model_configuration import RoutingModelConfig
 from hostpilot.persistence.skill_execution import SkillExecutionMode
 from hostpilot.persistence.traces import StoredTraceEvent, TraceSummary
 from hostpilot.skills.compensation import CancellationSnapshot
+from hostpilot.task_results import CompletedPlanTaskResult, StoredPlanTaskResult
 
 
 class ConversationStore(Protocol):
@@ -160,7 +161,7 @@ ToolOutcomeStoreFactory = Callable[[Path], ToolOutcomeStore]
 
 
 class TaskStore(Protocol):
-    """Persist payload-free Runtime TaskRun lifecycle metadata."""
+    """Persist Runtime TaskRun lifecycle metadata and completed Plan outputs."""
 
     async def initialize(self) -> None: ...
 
@@ -182,7 +183,12 @@ class TaskStore(Protocol):
         runtime_host_id: str,
         state: Literal["completed", "failed", "cancelled"],
         finished_at: datetime,
+        completed_result: CompletedPlanTaskResult | None = None,
     ) -> None: ...
+
+    async def list_completed_task_results(
+        self, *, session_id: str, exclude_turn_id: str, limit: int
+    ) -> tuple[StoredPlanTaskResult, ...]: ...
 
     async def interrupt_inactive_host_tasks(self, *, now: datetime) -> int: ...
 

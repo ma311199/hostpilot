@@ -77,6 +77,7 @@ from hostpilot.persistence.tool_outcomes import SQLiteToolOutcomeStore
 from hostpilot.persistence.traces import SQLiteTraceStore, StoredTraceEvent, TraceSummary
 from hostpilot.persistence.turns import SQLiteTurnStore, StoredTurn
 from hostpilot.persistence.workspace_configuration import SQLiteWorkspaceConfigurationStore
+from hostpilot.task_results import CompletedPlanTaskResult, StoredPlanTaskResult
 
 __all__ = [
     "ConversationNotFoundError",
@@ -84,6 +85,7 @@ __all__ = [
     "AuditStoreFactory",
     "CancellationStore",
     "CancellationStoreFactory",
+    "CompletedPlanTaskResult",
     "CheckpointerFactory",
     "ConversationCheckpointer",
     "ConversationStore",
@@ -111,6 +113,7 @@ __all__ = [
     "ToolOutcomeStoreFactory",
     "TaskStore",
     "TaskStoreFactory",
+    "StoredPlanTaskResult",
     "WorkspaceConfigurationStore",
     "WorkspaceConfigurationStoreFactory",
     "CancellationAuditEntry",

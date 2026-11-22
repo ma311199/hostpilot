@@ -24,13 +24,23 @@ def test_task_lifecycle_persists_outcomes_and_unique_attempt_ids(tmp_path) -> No
         async with manager.track("summarize", "turn-1", "session-1") as attempt:
             assert manager.active_task_runs[0].state is TaskState.RUNNING
             attempt.fail()
-        async with manager.track("summarize", "turn-1", "session-1"):
-            pass
+        async with manager.track("summarize", "turn-1", "session-1") as attempt:
+            attempt.complete(
+                description="Summarize the source",
+                input={"source": "about.txt"},
+                depends_on=(),
+                output={"summary": "HostPilot"},
+            )
 
         records = await store.list_task_runs(turn_id="turn-1")
-        return manager, records
+        prior_results = await store.list_completed_task_results(
+            session_id="session-1",
+            exclude_turn_id="turn-2",
+            limit=32,
+        )
+        return manager, records, prior_results
 
-    manager, records = asyncio.run(scenario())
+    manager, records, prior_results = asyncio.run(scenario())
 
     assert len(records) == 2
     assert records[0].task_id == records[1].task_id == "summarize"
@@ -38,6 +48,8 @@ def test_task_lifecycle_persists_outcomes_and_unique_attempt_ids(tmp_path) -> No
     assert [record.state for record in records] == ["failed", "completed"]
     assert all(record.finished_at is not None for record in records)
     assert [item.state for item in manager.history] == [TaskState.FAILED, TaskState.COMPLETED]
+    assert len(prior_results) == 1
+    assert prior_results[0].output == {"summary": "HostPilot"}
 
 
 def test_task_lifecycle_persists_cancellation(tmp_path) -> None:

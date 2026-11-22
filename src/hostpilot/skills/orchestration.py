@@ -35,6 +35,7 @@ from hostpilot.skills.runtime import (
     SkillExecutionStatus,
     SkillSideEffect,
 )
+from hostpilot.task_results import StoredPlanTaskResult
 
 
 @asynccontextmanager
@@ -117,6 +118,7 @@ class BlackboardSnapshot:
     """Read-only copy of execution state passed to model and task adapters."""
 
     states: tuple[PlanTaskState, ...]
+    prior_results: tuple[StoredPlanTaskResult, ...] = ()
 
     @property
     def results(self) -> Mapping[str, Any]:
@@ -276,12 +278,31 @@ class OrchestratorPlanExecutor:
             request.request_context.budget.ensure_available()
         except BudgetExceededError:
             return _failed_result("budget_exceeded", blackboard=BlackboardSnapshot(()))
+        prior_results: tuple[StoredPlanTaskResult, ...] = ()
+        task_lifecycle = request.request_context.task_lifecycle
+        session_id = request.request_context.snapshot.session_id
+        if task_lifecycle is not None and session_id is not None:
+            try:
+                prior_results = await task_lifecycle.list_completed_task_results(
+                    session_id,
+                    exclude_turn_id=request.request_context.snapshot.request_id,
+                )
+            except Exception as error:
+                return _failed_result(
+                    f"task_result_history_{type(error).__name__}",
+                    blackboard=BlackboardSnapshot(()),
+                )
+
+        def current_board() -> BlackboardSnapshot:
+            return BlackboardSnapshot(tuple(states.values()))
+
+        def planning_board() -> BlackboardSnapshot:
+            return BlackboardSnapshot(tuple(states.values()), prior_results)
+
         try:
-            plan = await self.planner.create_plan(request, BlackboardSnapshot(()))
+            plan = await self.planner.create_plan(request, planning_board())
         except Exception as error:
-            return _failed_result(
-                f"planner_{type(error).__name__}", blackboard=BlackboardSnapshot(())
-            )
+            return _failed_result(f"planner_{type(error).__name__}", blackboard=current_board())
         if plan.clarification_prompt is not None:
             return _clarification_result(plan.clarification_prompt)
 
@@ -290,16 +311,14 @@ class OrchestratorPlanExecutor:
                 _validate_plan(plan, self.max_tasks)
             except InvalidPlanError as error:
                 if replan_count == self.max_replans:
-                    return _failed_result(
-                        "invalid_plan", str(error), BlackboardSnapshot(tuple(states.values()))
-                    )
-                board = BlackboardSnapshot(tuple(states.values()))
+                    return _failed_result("invalid_plan", str(error), current_board())
+                board = current_board()
                 try:
                     request.request_context.budget.ensure_available()
                 except BudgetExceededError:
                     return _failed_result("budget_exceeded", blackboard=board)
                 try:
-                    plan = await self.replanner.replan(request, "invalid_plan", board)
+                    plan = await self.replanner.replan(request, "invalid_plan", planning_board())
                 except Exception as replan_error:
                     if isinstance(replan_error, BudgetExceededError):
                         return _failed_result("budget_exceeded", blackboard=board)
@@ -310,7 +329,7 @@ class OrchestratorPlanExecutor:
                     return _clarification_result(plan.clarification_prompt)
                 continue
 
-            board = BlackboardSnapshot(tuple(states.values()))
+            board = current_board()
             try:
                 validation = await self.validator.validate(request, plan, board)
             except Exception as error:
@@ -323,7 +342,9 @@ class OrchestratorPlanExecutor:
                 except BudgetExceededError:
                     return _failed_result("budget_exceeded", blackboard=board)
                 try:
-                    plan = await self.replanner.replan(request, validation.reason_code, board)
+                    plan = await self.replanner.replan(
+                        request, validation.reason_code, planning_board()
+                    )
                 except Exception as error:
                     if isinstance(error, BudgetExceededError):
                         return _failed_result("budget_exceeded", blackboard=board)
@@ -334,7 +355,7 @@ class OrchestratorPlanExecutor:
 
             failure_reason: str | None = None
             for wave in _execution_waves(plan):
-                wave_board = BlackboardSnapshot(tuple(states.values()))
+                wave_board = current_board()
                 leaders: list[PlanTask] = []
                 signatures: dict[str, tuple[PlanExecutionType, str | None, str, str]] = {}
                 followers: dict[str, str] = {}
@@ -456,6 +477,13 @@ class OrchestratorPlanExecutor:
                                 )
                             if task_run is not None and not result.succeeded:
                                 task_run.fail()
+                            elif task_run is not None:
+                                task_run.complete(
+                                    description=task_item.description,
+                                    input=task_item.input or {},
+                                    depends_on=task_item.depends_on,
+                                    output=result.output,
+                                )
                     self._record_task_event(
                         task_trace,
                         task_item,
@@ -534,16 +562,14 @@ class OrchestratorPlanExecutor:
                 ]
                 if wave_failures:
                     if any(state.error_code == "budget_exceeded" for state in wave_failures):
-                        return _failed_result(
-                            "budget_exceeded", blackboard=BlackboardSnapshot(tuple(states.values()))
-                        )
+                        return _failed_result("budget_exceeded", blackboard=current_board())
                     failure_reason = next(
                         (state.error_code for state in wave_failures if state.error_code),
                         "task_failed",
                     )
                     break
 
-            board = BlackboardSnapshot(tuple(states.values()))
+            board = current_board()
             if failure_reason is None:
                 try:
                     request.request_context.budget.ensure_available()
@@ -566,7 +592,7 @@ class OrchestratorPlanExecutor:
             except BudgetExceededError:
                 return _failed_result("budget_exceeded", blackboard=board)
             try:
-                plan = await self.replanner.replan(request, failure_reason, board)
+                plan = await self.replanner.replan(request, failure_reason, planning_board())
             except Exception as error:
                 if isinstance(error, BudgetExceededError):
                     return _failed_result("budget_exceeded", blackboard=board)
@@ -574,9 +600,7 @@ class OrchestratorPlanExecutor:
             if plan.clarification_prompt is not None:
                 return _clarification_result(plan.clarification_prompt)
 
-        return _failed_result(
-            "replan_limit_reached", blackboard=BlackboardSnapshot(tuple(states.values()))
-        )
+        return _failed_result("replan_limit_reached", blackboard=current_board())
 
     def _record_task_event(
         self,
