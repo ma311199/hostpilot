@@ -5,6 +5,7 @@ import pytest
 
 from hostpilot.persistence import SQLiteTaskStore, SQLiteTurnStore
 from hostpilot.runtime import TaskLifecycleManager, TaskState
+from hostpilot.task_results import PlanTaskExecutionSummary, PlanTaskToolUsage
 
 
 def test_task_lifecycle_persists_outcomes_and_unique_attempt_ids(tmp_path) -> None:
@@ -31,6 +32,10 @@ def test_task_lifecycle_persists_outcomes_and_unique_attempt_ids(tmp_path) -> No
                 depends_on=(),
                 output={"summary": "HostPilot"},
                 task_fingerprint=f"v1:{'a' * 64}",
+                execution_summary=PlanTaskExecutionSummary(
+                    tools=(PlanTaskToolUsage("read_text_file", 1, "read_only"),),
+                    confirmation_decisions=("approved",),
+                ),
             )
 
         records = await store.list_task_runs(turn_id="turn-1")
@@ -51,6 +56,10 @@ def test_task_lifecycle_persists_outcomes_and_unique_attempt_ids(tmp_path) -> No
     assert [item.state for item in manager.history] == [TaskState.FAILED, TaskState.COMPLETED]
     assert len(prior_results) == 1
     assert prior_results[0].output == {"summary": "HostPilot"}
+    assert prior_results[0].execution_summary == PlanTaskExecutionSummary(
+        tools=(PlanTaskToolUsage("read_text_file", 1, "read_only"),),
+        confirmation_decisions=("approved",),
+    )
 
 
 def test_task_lifecycle_persists_cancellation(tmp_path) -> None:

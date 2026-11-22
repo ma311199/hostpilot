@@ -286,6 +286,23 @@ class WebSocketTaskCacheApprovalProvider:
                         "source_turn_id": request.source_turn_id,
                         "finished_at": request.finished_at.isoformat(),
                         "output": request.output,
+                        "execution_summary": (
+                            {
+                                "tools": [
+                                    {
+                                        "tool_id": usage.tool_id,
+                                        "call_count": usage.call_count,
+                                        "side_effect_level": usage.side_effect_level,
+                                    }
+                                    for usage in request.execution_summary.tools
+                                ],
+                                "confirmation_decisions": list(
+                                    request.execution_summary.confirmation_decisions
+                                ),
+                            }
+                            if request.execution_summary is not None
+                            else None
+                        ),
                     },
                 }
             )

@@ -58,6 +58,7 @@ from hostpilot.skills.runtime import (
     SkillSideEffect,
 )
 from hostpilot.skills.yaml_registry import SideEffectLevel, YamlSkillPackage, YamlSkillRegistry
+from hostpilot.task_results import PlanTaskToolUsage
 from hostpilot.tools.executor import ToolConfirmationDeniedError, ToolDeniedError
 
 _PLAN_TOOL_AGENT_MAX_TURNS = 5
@@ -618,6 +619,7 @@ class GovernedPlanTaskExecutor:
                     side_effects=tuple(side_effects),
                     invoked_tool_ids=tuple(invoked_tool_ids),
                     idempotency_key=call.idempotency_key,
+                    tool_usage=_tool_usage_for_ids(invoked_tool_ids, self.tool_descriptors),
                 )
             if not response.tool_calls:
                 if not invoked_tool_ids:
@@ -629,6 +631,7 @@ class GovernedPlanTaskExecutor:
                     side_effects=tuple(side_effects),
                     invoked_tool_ids=tuple(invoked_tool_ids),
                     idempotency_key=call.idempotency_key,
+                    tool_usage=_tool_usage_for_ids(invoked_tool_ids, self.tool_descriptors),
                 )
 
             messages.append(
@@ -654,6 +657,7 @@ class GovernedPlanTaskExecutor:
                         side_effects=tuple(side_effects),
                         invoked_tool_ids=tuple(invoked_tool_ids),
                         idempotency_key=call.idempotency_key,
+                        tool_usage=_tool_usage_for_ids(invoked_tool_ids, self.tool_descriptors),
                     )
                 descriptor = candidates.get(tool_call.name)
                 if descriptor is None:
@@ -723,6 +727,7 @@ class GovernedPlanTaskExecutor:
             side_effects=tuple(side_effects),
             invoked_tool_ids=tuple(invoked_tool_ids),
             idempotency_key=call.idempotency_key,
+            tool_usage=_tool_usage_for_ids(invoked_tool_ids, self.tool_descriptors),
         )
 
     def _tool_candidates_for(self, call: PlanTaskCall) -> dict[str, ToolDescriptor]:
@@ -797,6 +802,11 @@ class GovernedPlanTaskExecutor:
                 result.snapshot.invoked_tool_ids if result.snapshot is not None else ()
             ),
             idempotency_key=call.idempotency_key,
+            tool_usage=_tool_usage_for_ids(
+                result.snapshot.invoked_tool_ids if result.snapshot is not None else (),
+                self.tool_descriptors,
+                effects,
+            ),
         )
 
     async def _select_capability(
@@ -1413,6 +1423,39 @@ def _tool_side_effect_level(descriptor: ToolDescriptor) -> SideEffectLevel:
     if descriptor.tool_type is ToolType.RETRIEVAL or descriptor.name == "read_text_file":
         return SideEffectLevel.READ_ONLY
     return SideEffectLevel.IRREVERSIBLE
+
+
+def _tool_usage_level(descriptor: ToolDescriptor) -> str:
+    if (
+        descriptor.tool_type is ToolType.RETRIEVAL
+        or descriptor.name == "read_text_file"
+        or descriptor.side_effect.value == "none"
+    ):
+        return SideEffectLevel.READ_ONLY.value
+    return "unknown"
+
+
+def _tool_usage_for_ids(
+    tool_ids: Sequence[str],
+    descriptors: Mapping[str, ToolDescriptor],
+    observed_effects: Sequence[SkillSideEffect] = (),
+) -> tuple[PlanTaskToolUsage, ...]:
+    counts: dict[str, int] = {}
+    for tool_id in tool_ids:
+        counts[tool_id] = counts.get(tool_id, 0) + 1
+    effect_levels = {effect.action: effect.level.value for effect in observed_effects}
+    return tuple(
+        PlanTaskToolUsage(
+            tool_id=tool_id,
+            call_count=count,
+            side_effect_level=(
+                effect_levels.get(tool_id, _tool_usage_level(descriptors[tool_id]))
+                if tool_id in descriptors
+                else effect_levels.get(tool_id, "unknown")
+            ),
+        )
+        for tool_id, count in counts.items()
+    )
 
 
 def _make_side_effect(action: str, level: SideEffectLevel, key: str) -> SkillSideEffect:

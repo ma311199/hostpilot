@@ -961,6 +961,41 @@ p {
   overflow-wrap: anywhere;
 }
 
+.task-cache-provenance {
+  margin: 16px 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #f7f8f4;
+  color: var(--ink);
+  font-size: 0.9rem;
+}
+
+.task-cache-provenance h3 {
+  margin: 0 0 8px;
+  font-size: 0.92rem;
+}
+
+.task-cache-provenance ul {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+
+.task-cache-provenance p,
+.task-cache-unknown {
+  margin: 8px 0 0;
+}
+
+.task-cache-unknown {
+  padding: 12px 14px;
+  border-radius: 10px;
+  color: #704b0e;
+  background: #fff5dc;
+  font-size: 0.9rem;
+}
+
 .approval-icon {
   display: grid;
   width: 38px;

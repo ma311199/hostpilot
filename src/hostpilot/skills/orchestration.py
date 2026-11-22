@@ -8,7 +8,7 @@ import json
 import re
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from time import perf_counter
 from types import MappingProxyType
@@ -23,6 +23,7 @@ from hostpilot.observability import (
     child_trace_context,
     trace_context_scope,
 )
+from hostpilot.policy.confirmation import ConfirmationDecision, ConfirmationRequest
 from hostpilot.runtime.context import TaskCacheApprovalRequest, TaskCacheDecision
 from hostpilot.skills.compensation import (
     CancellationSink,
@@ -37,8 +38,12 @@ from hostpilot.skills.runtime import (
     SkillExecutionStatus,
     SkillSideEffect,
 )
-from hostpilot.task_results import StoredPlanTaskFailure
-from hostpilot.tools.executor import RemoteToolOutcomeUnknownError
+from hostpilot.task_results import (
+    PlanTaskExecutionSummary,
+    PlanTaskToolUsage,
+    StoredPlanTaskFailure,
+)
+from hostpilot.tools.executor import AsyncConfirmationProvider, RemoteToolOutcomeUnknownError
 
 
 @asynccontextmanager
@@ -155,6 +160,20 @@ class PlanTaskResult:
     side_effects: tuple[SkillSideEffect, ...] = ()
     invoked_tool_ids: tuple[str, ...] = ()
     idempotency_key: str | None = None
+    tool_usage: tuple[PlanTaskToolUsage, ...] = ()
+
+
+class _TaskConfirmationRecorder:
+    """Delegate confirmations while retaining only safe decision enums."""
+
+    def __init__(self, delegate: AsyncConfirmationProvider, decisions: list[str]) -> None:
+        self._delegate = delegate
+        self.decisions = decisions
+
+    async def confirm(self, request: ConfirmationRequest) -> ConfirmationDecision:
+        decision = await self._delegate.confirm(request)
+        self.decisions.append(decision.value)
+        return decision
 
 
 @dataclass(frozen=True)
@@ -429,6 +448,7 @@ class OrchestratorPlanExecutor:
                                     source_turn_id=candidate.turn_id,
                                     finished_at=candidate.finished_at,
                                     output=candidate.output,
+                                    execution_summary=candidate.execution_summary,
                                 )
                             )
                             if provider is not None
@@ -513,14 +533,30 @@ class OrchestratorPlanExecutor:
                     async with concurrency_gate:
                         operation_started = False
                         async with _task_run_scope(request, task_item) as task_run:
+                            confirmation_decisions: list[str] = []
                             try:
                                 request.request_context.budget.ensure_available()
                                 operation_started = True
                                 in_flight_operations.add(task_item.task_id)
+                                confirmation_provider = (
+                                    request.request_context.confirmation_provider
+                                )
+                                task_request = request
+                                if confirmation_provider is not None:
+                                    task_request = replace(
+                                        request,
+                                        request_context=replace(
+                                            request.request_context,
+                                            confirmation_provider=_TaskConfirmationRecorder(
+                                                confirmation_provider,
+                                                confirmation_decisions,
+                                            ),
+                                        ),
+                                    )
                                 with trace_context_scope(task_trace):
                                     result = await self.task_executor.execute_task(
                                         PlanTaskCall(
-                                            request=request,
+                                            request=task_request,
                                             task=task_item,
                                             dependencies=MappingProxyType(dependencies),
                                             blackboard=board_snapshot,
@@ -560,6 +596,7 @@ class OrchestratorPlanExecutor:
                                     side_effects=result.side_effects,
                                     invoked_tool_ids=result.invoked_tool_ids,
                                     idempotency_key=result.idempotency_key,
+                                    tool_usage=result.tool_usage,
                                 )
                             if task_run is not None and not result.succeeded:
                                 if result.error_code == "remote_tool_outcome_unknown":
@@ -579,6 +616,9 @@ class OrchestratorPlanExecutor:
                                     depends_on=task_item.depends_on,
                                     output=result.output,
                                     task_fingerprint=fingerprint,
+                                    execution_summary=_execution_summary(
+                                        result, tuple(confirmation_decisions)
+                                    ),
                                 )
                     self._record_task_event(
                         task_trace,
@@ -588,6 +628,8 @@ class OrchestratorPlanExecutor:
                         reason_code=result.error_code,
                         invoked_tool_count=len(result.invoked_tool_ids),
                         side_effect_count=len(result.side_effects),
+                        tool_usage=_execution_summary(result, tuple(confirmation_decisions)).tools,
+                        confirmation_decisions=tuple(confirmation_decisions),
                     )
                     return task_item, signature, result
 
@@ -718,6 +760,8 @@ class OrchestratorPlanExecutor:
         cache_decision: str | None = None,
         invoked_tool_count: int | None = None,
         side_effect_count: int | None = None,
+        tool_usage: tuple[PlanTaskToolUsage, ...] | None = None,
+        confirmation_decisions: tuple[str, ...] = (),
         outcome_uncertain: bool | None = None,
     ) -> None:
         """Record allowlisted task progress without task content or execution payloads."""
@@ -742,6 +786,22 @@ class OrchestratorPlanExecutor:
             attributes["invoked_tool_count"] = invoked_tool_count
         if side_effect_count is not None:
             attributes["side_effect_count"] = side_effect_count
+        if tool_usage is not None:
+            attributes["tool_usage"] = json.dumps(
+                [
+                    {
+                        "tool_id": usage.tool_id,
+                        "call_count": usage.call_count,
+                        "side_effect_level": usage.side_effect_level,
+                    }
+                    for usage in tool_usage
+                ],
+                separators=(",", ":"),
+            )
+        if confirmation_decisions:
+            attributes["confirmation_decisions"] = json.dumps(
+                confirmation_decisions, separators=(",", ":")
+            )
         if outcome_uncertain is not None:
             attributes["outcome_uncertain"] = outcome_uncertain
         try:
@@ -770,6 +830,32 @@ def _validate_plan(plan: ExecutionPlan, max_tasks: int) -> None:
             )
 
     _topological_order(plan)
+
+
+def _execution_summary(
+    result: PlanTaskResult, confirmation_decisions: tuple[str, ...]
+) -> PlanTaskExecutionSummary:
+    """Reconcile observed successful calls and mark missing effect metadata unknown."""
+    calls: dict[str, int] = {}
+    for tool_id in result.invoked_tool_ids:
+        calls[tool_id] = calls.get(tool_id, 0) + 1
+    effect_levels: dict[str, str] = {}
+    for usage in result.tool_usage:
+        current = effect_levels.get(usage.tool_id)
+        effect_levels[usage.tool_id] = (
+            usage.side_effect_level if current in {None, usage.side_effect_level} else "unknown"
+        )
+    return PlanTaskExecutionSummary(
+        tools=tuple(
+            PlanTaskToolUsage(
+                tool_id=tool_id,
+                call_count=count,
+                side_effect_level=effect_levels.get(tool_id, "unknown"),
+            )
+            for tool_id, count in calls.items()
+        ),
+        confirmation_decisions=confirmation_decisions,
+    )
 
 
 def _topological_order(plan: ExecutionPlan) -> tuple[PlanTask, ...]:

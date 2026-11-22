@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from hostpilot.budget import RequestBudget
 from hostpilot.contracts import ContextSnapshot
+from hostpilot.task_results import PlanTaskExecutionSummary
 
 if TYPE_CHECKING:
     from hostpilot.runtime.lifecycle import TaskLifecycleManager
@@ -43,6 +44,7 @@ class TaskCacheApprovalRequest:
     source_turn_id: str
     finished_at: datetime
     output: Any
+    execution_summary: PlanTaskExecutionSummary | None = None
 
 
 class TaskCacheApprovalProvider(Protocol):

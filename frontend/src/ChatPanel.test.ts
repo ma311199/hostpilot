@@ -26,6 +26,10 @@ const chatMocks = vi.hoisted(() => ({
     source_turn_id: string
     finished_at: string
     output: unknown
+    execution_summary?: {
+      tools: { tool_id: string; call_count: number; side_effect_level: string }[]
+      confirmation_decisions: string[]
+    } | null
   }) => void) | null,
   respondToTaskCacheApproval: vi.fn(),
   close: vi.fn(),
@@ -391,10 +395,19 @@ it('shows successful cached task output and requires an explicit reuse or execut
     source_turn_id: 'turn-old',
     finished_at: '2026-11-22T10:00:00Z',
     output: { status: 'ready' },
+    execution_summary: {
+      tools: [
+        { tool_id: 'write_text_file', call_count: 1, side_effect_level: 'irreversible' },
+      ],
+      confirmation_decisions: ['approved'],
+    },
   })
   await flushPromises()
 
   expect(wrapper.text()).toContain('发现已完成的相同子任务')
+  expect(wrapper.text()).toContain('write_text_file')
+  expect(wrapper.text()).toContain('不可逆')
+  expect(wrapper.text()).toContain('人工确认：批准 1 次')
   expect(wrapper.text()).toContain('"status": "ready"')
   await wrapper.get('button.approval-reject').trigger('click')
   expect(chatMocks.respondToTaskCacheApproval).toHaveBeenCalledWith('cache-1', 'execute')
@@ -406,8 +419,10 @@ it('shows successful cached task output and requires an explicit reuse or execut
     source_turn_id: 'turn-old',
     finished_at: '2026-11-22T10:00:00Z',
     output: { status: 'ready' },
+    execution_summary: null,
   })
   await wrapper.vm.$nextTick()
+  expect(wrapper.text()).toContain('执行摘要不可用')
   await wrapper.get('button.approval-accept').trigger('click')
   expect(chatMocks.respondToTaskCacheApproval).toHaveBeenLastCalledWith('cache-2', 'reuse')
   wrapper.unmount()

@@ -80,6 +80,8 @@ from hostpilot.persistence.workspace_configuration import SQLiteWorkspaceConfigu
 from hostpilot.task_results import (
     CompletedPlanTaskResult,
     FailedPlanTaskSummary,
+    PlanTaskExecutionSummary,
+    PlanTaskToolUsage,
     StoredPlanTaskFailure,
     StoredPlanTaskResult,
 )
@@ -91,6 +93,8 @@ __all__ = [
     "CancellationStore",
     "CancellationStoreFactory",
     "CompletedPlanTaskResult",
+    "PlanTaskExecutionSummary",
+    "PlanTaskToolUsage",
     "FailedPlanTaskSummary",
     "CheckpointerFactory",
     "ConversationCheckpointer",
