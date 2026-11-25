@@ -1,4 +1,4 @@
-import type { ChatResponse, PlanRunResumeResponse } from './chat'
+import type { ChatResponse, ChatTurnResumeResponse, PlanRunResumeResponse } from './chat'
 
 interface ChatResponseMessage {
   type: 'chat.response'
@@ -13,6 +13,11 @@ interface ChatErrorMessage {
 interface PlanResumeResponseMessage {
   type: 'plan.resume.response'
   data: PlanRunResumeResponse
+}
+
+interface TurnResumeResponseMessage {
+  type: 'turn.resume.response'
+  data: ChatTurnResumeResponse
 }
 
 export interface ToolConfirmationMessage {
@@ -52,6 +57,7 @@ type ChatServerMessage =
   | ChatResponseMessage
   | ChatErrorMessage
   | PlanResumeResponseMessage
+  | TurnResumeResponseMessage
   | ToolConfirmationRequestMessage
   | PlanTaskCacheRequestMessage
 
@@ -70,6 +76,7 @@ const errorMessages: Record<string, string> = {
   tool_confirmation_rejected: '你已拒绝此操作，本次操作未执行。',
   tool_confirmation_cancelled: '你已取消此操作，本次操作未执行。',
   tool_confirmation_timed_out: '审批等待超时，本次操作未执行。',
+  turn_not_recoverable: '此对话已无法恢复，请刷新会话状态。',
   tool_failed: '工具执行失败或返回结果未通过验证。',
 }
 
@@ -117,6 +124,24 @@ function parseChatMessage(raw: string): ChatServerMessage | null {
         return {
           type: 'plan.resume.response',
           data: data as unknown as PlanRunResumeResponse,
+        }
+      }
+    }
+    if (
+      candidate.type === 'turn.resume.response' &&
+      typeof candidate.data === 'object' &&
+      candidate.data
+    ) {
+      const data = candidate.data as Record<string, unknown>
+      if (
+        typeof data.turn_id === 'string' &&
+        typeof data.status === 'string' &&
+        (typeof data.assistant_message === 'string' || data.assistant_message === undefined) &&
+        (typeof data.reason_code === 'string' || data.reason_code === null)
+      ) {
+        return {
+          type: 'turn.resume.response',
+          data: data as unknown as ChatTurnResumeResponse,
         }
       }
     }
@@ -180,6 +205,11 @@ export class ChatSocketClient {
         resolve: (response: PlanRunResumeResponse) => void
         reject: (error: Error) => void
       }
+    | {
+        kind: 'turn.resume'
+        resolve: (response: ChatTurnResumeResponse) => void
+        reject: (error: Error) => void
+      }
     | null = null
   onConfirmation: ((request: ToolConfirmationMessage) => void) | null = null
   onTaskCacheApproval: ((request: PlanTaskCacheMessage) => void) | null = null
@@ -227,6 +257,28 @@ export class ChatSocketClient {
       } catch {
         this.pending = null
         reject(new Error('无法恢复 Plan，请重试。'))
+      }
+    })
+  }
+
+  async resumeTurn(sessionId: string, turnId: string): Promise<ChatTurnResumeResponse> {
+    await this.connect()
+    if (this.pending) throw new Error('上一条消息仍在处理中。')
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error('聊天连接已断开，请重试。')
+    }
+
+    return new Promise<ChatTurnResumeResponse>((resolve, reject) => {
+      this.pending = { kind: 'turn.resume', resolve, reject }
+      try {
+        this.socket?.send(JSON.stringify({
+          type: 'turn.resume',
+          session_id: sessionId,
+          turn_id: turnId,
+        }))
+      } catch {
+        this.pending = null
+        reject(new Error('无法恢复对话，请重试。'))
       }
     })
   }
@@ -306,6 +358,8 @@ export class ChatSocketClient {
     if (message.type === 'chat.response' && pending.kind === 'chat') {
       pending.resolve(message.data)
     } else if (message.type === 'plan.resume.response' && pending.kind === 'plan.resume') {
+      pending.resolve(message.data)
+    } else if (message.type === 'turn.resume.response' && pending.kind === 'turn.resume') {
       pending.resolve(message.data)
     } else if (message.type === 'chat.error') {
       pending.reject(new Error(errorMessages[message.data.code] || '聊天请求失败。'))

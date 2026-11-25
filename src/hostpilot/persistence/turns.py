@@ -5,27 +5,15 @@ from __future__ import annotations
 import asyncio
 import os
 import sqlite3
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
 
+from hostpilot.persistence.ports import StoredTurn
 from hostpilot.persistence.sqlite_path import prepare_sqlite_database_path
 
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "interrupted"})
-
-
-@dataclass(frozen=True)
-class StoredTurn:
-    """Non-sensitive persisted lifecycle metadata for a single Turn."""
-
-    turn_id: str
-    session_id: str
-    runtime_host_id: str
-    state: str
-    started_at: datetime
-    finished_at: datetime | None
 
 
 class SQLiteTurnStore:
@@ -195,7 +183,7 @@ class SQLiteTurnStore:
         finished_at: datetime,
     ) -> None:
         """Record one terminal lifecycle state owned by the same Host."""
-        if state not in _TERMINAL_STATES - {"interrupted"}:
+        if state not in _TERMINAL_STATES:
             raise ValueError("Turn state must be a supported terminal state.")
         finished_value = _timestamp(finished_at)
         await self.initialize()
@@ -210,6 +198,72 @@ class SQLiteTurnStore:
             await connection.commit()
         if cursor.rowcount != 1:
             raise ValueError("Running Turn was not found for this Runtime Host.")
+
+    async def list_interrupted_turns(self, session_id: str) -> tuple[StoredTurn, ...]:
+        """List only interrupted Turns owned by the requested Session."""
+        self._validate_id(session_id, "Session")
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            cursor = await connection.execute(
+                "SELECT turn_id, session_id, runtime_host_id, state, started_at, finished_at "
+                "FROM runtime_turns WHERE session_id = ? AND state = 'interrupted' "
+                "ORDER BY started_at, turn_id",
+                (session_id,),
+            )
+            rows = await cursor.fetchall()
+        return tuple(_stored_turn(row) for row in rows)
+
+    async def claim_interrupted_turn(
+        self,
+        turn_id: str,
+        session_id: str,
+        runtime_host_id: str,
+        *,
+        claimed_at: datetime,
+    ) -> bool:
+        """Atomically transfer an interrupted Turn to one active, exclusive Host."""
+        self._validate_id(turn_id, "Turn")
+        self._validate_id(session_id, "Session")
+        self._validate_id(runtime_host_id, "Runtime Host")
+        claimed_value = _timestamp(claimed_at)
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            current_host_cursor = await connection.execute(
+                "SELECT 1 FROM runtime_hosts WHERE host_id = ? AND status = 'active' "
+                "AND lease_expires_at > ?",
+                (runtime_host_id, claimed_value),
+            )
+            if await current_host_cursor.fetchone() is None:
+                await connection.rollback()
+                return False
+            turn_cursor = await connection.execute(
+                "SELECT runtime_host_id FROM runtime_turns "
+                "WHERE turn_id = ? AND session_id = ? AND state = 'interrupted'",
+                (turn_id, session_id),
+            )
+            row = await turn_cursor.fetchone()
+            if row is None:
+                await connection.rollback()
+                return False
+            previous_host_id = str(row[0])
+            previous_host_cursor = await connection.execute(
+                "SELECT 1 FROM runtime_hosts WHERE host_id = ? AND status = 'active' "
+                "AND lease_expires_at > ?",
+                (previous_host_id, claimed_value),
+            )
+            if await previous_host_cursor.fetchone() is not None:
+                await connection.rollback()
+                return False
+            cursor = await connection.execute(
+                "UPDATE runtime_turns SET runtime_host_id = ?, state = 'running', "
+                "finished_at = NULL WHERE turn_id = ? AND session_id = ? "
+                "AND state = 'interrupted'",
+                (runtime_host_id, turn_id, session_id),
+            )
+            await connection.commit()
+        return cursor.rowcount == 1
 
     async def list_turns(self) -> tuple[StoredTurn, ...]:
         """Return lifecycle metadata in start order for diagnostics and tests."""

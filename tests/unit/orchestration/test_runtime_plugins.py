@@ -1,9 +1,11 @@
 import asyncio
+import importlib.util
 from types import SimpleNamespace
 
 import pytest
 
 from hostpilot.budget import RequestBudget
+from hostpilot.config import RemoteMCPServerSettings, Settings
 from hostpilot.contracts import BudgetContext, BudgetLimits, ContextSnapshot, ModelTokenUsage
 from hostpilot.models import ModelMessage, ModelRole, ModelToolDefinition
 from hostpilot.orchestration.runtime import (
@@ -33,6 +35,130 @@ class FakeChatRuntime:
 
     async def record_turn(self, session_id, user_message, assistant_message):
         return None
+
+
+def test_chat_runtime_assembly_plugin_builds_candidate_from_runtime_services(monkeypatch) -> None:
+    module_name = "hostpilot.orchestration.chat_runtime_assembly_host_plugin"
+    assert importlib.util.find_spec(module_name) is not None
+
+    from hostpilot.orchestration.chat_runtime_assembly_host_plugin import (
+        ChatRuntimeAssemblyHostPlugin,
+        ChatRuntimeAssemblyRequest,
+    )
+
+    settings = object()
+    tool_provider = object()
+    memory_controller = object()
+    checkpointer = object()
+    trace_sink = object()
+    cancellation_sink = object()
+    plan_component_registry = object()
+    chat_agent_runtime_registry = object()
+    model_provider_registry = object()
+    expected_runtime = FakeChatRuntime()
+    composer_calls = []
+
+    def composer(settings_arg, **kwargs):
+        composer_calls.append((settings_arg, kwargs))
+        return expected_runtime
+
+    monkeypatch.setattr(
+        "hostpilot.orchestration.chat_runtime_composition.build_configured_chat_agent_runtime",
+        composer,
+    )
+
+    def reject_legacy_factory(*_args, **_kwargs):
+        raise AssertionError("The Runtime assembly Plugin must use the canonical composer.")
+
+    monkeypatch.setattr(
+        "hostpilot.orchestration.runtime.create_configured_chat_agent_runtime",
+        reject_legacy_factory,
+    )
+    plugin = ChatRuntimeAssemblyHostPlugin(
+        plan_component_registry=plan_component_registry,
+        chat_agent_runtime_registry=chat_agent_runtime_registry,
+        model_provider_registry=model_provider_registry,
+    )
+    context = RuntimeContext()
+    context.services.register(
+        "hostpilot.conversation-checkpointer", checkpointer, owner="test.state"
+    )
+    context.services.register("hostpilot.trace-store", trace_sink, owner="test.app")
+    context.services.register("hostpilot.cancellation-store", cancellation_sink, owner="test.app")
+
+    async def setup() -> None:
+        await plugin.setup(context)
+
+    asyncio.run(setup())
+    request = ChatRuntimeAssemblyRequest(
+        settings=settings,
+        tools=("framework-tool",),
+        tool_provider=tool_provider,
+        memory_controller=memory_controller,
+        skill_execution_modes={"business/review": "yaml"},
+    )
+
+    assert plugin.build_candidate(request) is expected_runtime
+    assert context.services.resolve(plugin.service_id) is plugin
+    assert composer_calls == [
+        (
+            request.settings,
+            {
+                "checkpointer": checkpointer,
+                "tools": ("framework-tool",),
+                "tool_provider": tool_provider,
+                "memory_controller": memory_controller,
+                "cancellation_sink": cancellation_sink,
+                "skill_execution_modes": {"business/review": "yaml"},
+                "trace_sink": trace_sink,
+                "plan_component_registry": plan_component_registry,
+                "chat_agent_runtime_registry": chat_agent_runtime_registry,
+                "model_provider_registry": model_provider_registry,
+            },
+        )
+    ]
+    assert request.tools == ("framework-tool",)
+    with pytest.raises(TypeError):
+        request.skill_execution_modes["business/review"] = "markdown"
+
+
+def test_chat_runtime_assembly_plugin_setup_requires_runtime_services() -> None:
+    module_name = "hostpilot.orchestration.chat_runtime_assembly_host_plugin"
+    assert importlib.util.find_spec(module_name) is not None
+
+    from hostpilot.orchestration.chat_runtime_assembly_host_plugin import (
+        ChatRuntimeAssemblyHostPlugin,
+    )
+
+    plugin = ChatRuntimeAssemblyHostPlugin()
+    context = RuntimeContext()
+
+    with pytest.raises(KeyError, match="hostpilot.conversation-checkpointer"):
+        asyncio.run(plugin.setup(context))
+
+
+def test_chat_runtime_assembly_request_snapshots_nested_settings() -> None:
+    from pydantic import SecretStr
+
+    from hostpilot.orchestration.chat_runtime_assembly_host_plugin import (
+        ChatRuntimeAssemblyRequest,
+    )
+
+    original_settings = Settings(
+        mcp_servers=(
+            RemoteMCPServerSettings(
+                name="example",
+                url="https://example.test/mcp",
+                headers={"X-Token": SecretStr("original")},
+            ),
+        )
+    )
+    request = ChatRuntimeAssemblyRequest(settings=original_settings)
+
+    original_settings.mcp_servers[0].headers["X-Token"] = SecretStr("mutated")
+
+    assert request.settings is not original_settings
+    assert request.settings.mcp_servers[0].headers["X-Token"].get_secret_value() == "original"
 
 
 def test_chat_agent_runtime_registry_checks_version_contract_and_duplicate_ids() -> None:
@@ -223,27 +349,7 @@ def test_chat_agent_runtime_host_plugin_uses_runtime_agent_manager_and_closes_on
     asyncio.run(scenario())
 
 
-def test_chat_agent_runtime_host_plugin_forwards_sandbox_mode_to_current_agent() -> None:
-    class SandboxAwareRuntime(FakeChatRuntime):
-        def __init__(self) -> None:
-            self.sandbox_mode = None
-
-        def set_sandbox_mode(self, mode) -> None:
-            self.sandbox_mode = mode
-
-    from hostpilot.contracts import SandboxMode
-
-    runtime = SandboxAwareRuntime()
-    plugin = ChatAgentRuntimeHostPlugin(runtime)
-
-    plugin.set_sandbox_mode(SandboxMode.WORKSPACE_WRITE)
-
-    assert runtime.sandbox_mode is SandboxMode.WORKSPACE_WRITE
-
-
-def test_chat_agent_runtime_host_plugin_forwards_sandbox_mode_to_agent_provider() -> None:
-    from hostpilot.contracts import SandboxMode
-
+def test_chat_agent_runtime_host_plugin_does_not_discover_nested_sandbox_providers() -> None:
     class ToolProvider:
         def __init__(self) -> None:
             self.sandbox_mode = None
@@ -258,9 +364,8 @@ def test_chat_agent_runtime_host_plugin_forwards_sandbox_mode_to_agent_provider(
     runtime = AgentWithProvider()
     plugin = ChatAgentRuntimeHostPlugin(runtime)
 
-    plugin.set_sandbox_mode(SandboxMode.WORKSPACE_WRITE)
-
-    assert runtime.provider.sandbox_mode is SandboxMode.WORKSPACE_WRITE
+    assert not hasattr(plugin, "set_sandbox_mode")
+    assert runtime.provider.sandbox_mode is None
 
 
 def test_chat_agent_runtime_host_plugin_publishes_replacement_while_old_turn_drains() -> None:

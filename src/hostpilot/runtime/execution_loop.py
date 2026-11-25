@@ -49,6 +49,7 @@ class DefaultRuntimeExecutionLoop:
             for replay in request.tool_replays
         }
         executed_results: dict[tuple[str, str], str] = {}
+        recovery_call_id_offsets: dict[tuple[str, str], int] = {}
         allowed_tools = tuple(
             tool for tool in request.tools if tool.name in request.allowed_tool_ids
         )
@@ -72,18 +73,35 @@ class DefaultRuntimeExecutionLoop:
                 if not model_response.budget_usage_accounted:
                     request_context.budget.consume_tokens(usage.total_tokens)
 
-            assistant_message = ModelMessage(
-                role=ModelRole.ASSISTANT,
-                content=model_response.text,
-                tool_calls=model_response.tool_calls,
-            )
             if model_response.tool_calls:
                 self._validate_tool_proposals(
                     model_response.tool_calls,
                     request.tools,
                     request.allowed_tool_ids,
                 )
-            if model_response.tool_calls and step == request.max_steps:
+            remapped_calls: list[ModelToolCall] = []
+            for call in model_response.tool_calls:
+                key = runtime_tool_call_key(call)
+                recovery_ids = request.recovery_tool_call_ids.get(key, ())
+                offset = recovery_call_id_offsets.get(key, 0)
+                call_id = recovery_ids[offset] if offset < len(recovery_ids) else call.call_id
+                if offset < len(recovery_ids):
+                    recovery_call_id_offsets[key] = offset + 1
+                remapped_calls.append(ModelToolCall(call_id, call.name, call.arguments))
+            tool_calls = tuple(remapped_calls)
+
+            assistant_message = ModelMessage(
+                role=ModelRole.ASSISTANT,
+                content=model_response.text,
+                tool_calls=tool_calls,
+            )
+            if tool_calls:
+                self._validate_tool_proposals(
+                    tool_calls,
+                    request.tools,
+                    request.allowed_tool_ids,
+                )
+            if tool_calls and step == request.max_steps:
                 return RuntimeExecutionResult(
                     status=RuntimeExecutionStatus.MAX_STEPS_REACHED,
                     response_text=None,
@@ -100,7 +118,7 @@ class DefaultRuntimeExecutionLoop:
             request_messages.append(assistant_message)
             generated_messages.append(assistant_message)
 
-            if not model_response.tool_calls:
+            if not tool_calls:
                 response_text = model_response.text.strip()
                 if not response_text:
                     raise ValueError("Runtime Model Port returned no final text or tool proposal.")
@@ -119,7 +137,7 @@ class DefaultRuntimeExecutionLoop:
                 )
 
             await _publish_messages(request, (assistant_message,))
-            for tool_call in model_response.tool_calls:
+            for tool_call in tool_calls:
                 replay_key = runtime_tool_call_key(tool_call)
                 tool_result: str | None
                 dispatched = False
@@ -157,12 +175,13 @@ class DefaultRuntimeExecutionLoop:
                             "Idempotent tool execution requires a durable invocation journal."
                         )
                     invocation_id: str | None = None
+                    idempotency_key: str | None = None
                     if request.tool_invocations is not None:
                         session_id = request_context.snapshot.session_id
                         if session_id is None:
                             raise RuntimeError("Tool invocation journaling requires a Session ID.")
                         logical_plan_id = request.plan_run_id or request_context.snapshot.request_id
-                        key, fingerprint = stable_tool_invocation_identity(
+                        invocation_key, fingerprint = stable_tool_invocation_identity(
                             plan_run_id=logical_plan_id,
                             task_id=request.task_id,
                             call_index=next_call_index,
@@ -172,9 +191,9 @@ class DefaultRuntimeExecutionLoop:
                                 tool_call.name, ()
                             ),
                         )
-                        invocation_id = f"invocation:{key}"
+                        invocation_id = f"invocation:{invocation_key}"
                         idempotency_key = (
-                            key
+                            invocation_key
                             if idempotency_window is not None
                             and retry_class
                             in {
@@ -199,7 +218,10 @@ class DefaultRuntimeExecutionLoop:
                             arguments_json=arguments_json,
                             idempotency_window_seconds=idempotency_window,
                         )
-                    if side_effect is ToolSideEffect.POSSIBLE:
+                    if (
+                        side_effect is ToolSideEffect.POSSIBLE
+                        and tool_call.call_id not in request.claimed_recovery_outcome_ids
+                    ):
                         if request.tool_outcomes is None:
                             raise RuntimeError(
                                 "Side-effecting tool execution requires outcome persistence."
@@ -216,17 +238,6 @@ class DefaultRuntimeExecutionLoop:
                             tool_call_id=tool_call.call_id,
                             tool_name=tool_call.name,
                         )
-                    idempotency_key = (
-                        key
-                        if request.tool_invocations is not None
-                        and idempotency_window is not None
-                        and retry_class
-                        in {
-                            ToolRetryClass.IDEMPOTENT_WRITE,
-                            ToolRetryClass.NON_IDEMPOTENT_WRITE,
-                        }
-                        else None
-                    )
                     if idempotency_key is not None:
                         execute_idempotent = getattr(self.tools, "execute_idempotent", None)
                         if not callable(execute_idempotent):

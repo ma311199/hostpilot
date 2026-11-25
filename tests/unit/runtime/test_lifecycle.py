@@ -176,3 +176,74 @@ def test_cancel_all_reports_terminal_persistence_failure(tmp_path) -> None:
         assert task.done()
 
     asyncio.run(scenario())
+
+
+def test_recovery_track_finishes_claimed_turn_on_new_host(tmp_path) -> None:
+    async def scenario():
+        database = tmp_path / "runtime.sqlite3"
+        store = SQLiteTurnStore(database)
+        started_at = datetime.now(UTC)
+        await store.register_host(
+            "old-host",
+            now=started_at,
+            lease_expires_at=started_at + timedelta(seconds=1),
+        )
+        await store.create_turn(
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="old-host",
+            started_at=started_at,
+        )
+        now = started_at + timedelta(seconds=2)
+        await store.register_host(
+            "new-host",
+            now=now,
+            lease_expires_at=now + timedelta(seconds=30),
+        )
+        manager = TurnLifecycleManager(store=store, runtime_host_id="new-host")
+        recoverable = await manager.list_recoverable("session-1")
+        assert [turn.turn_id for turn in recoverable] == ["turn-1"]
+        assert await manager.claim_recovery("turn-1", "session-1") is True
+        async with manager.track_recovery("turn-1", "session-1"):
+            assert manager.active_turns[0].state is TurnState.RUNNING
+        return manager, await store.list_turns()
+
+    manager, records = asyncio.run(scenario())
+
+    assert records[0].state == "completed"
+    assert records[0].runtime_host_id == "new-host"
+    assert manager.history[0].state is TurnState.COMPLETED
+
+
+def test_cancelled_recovery_returns_turn_to_interrupted(tmp_path) -> None:
+    async def scenario():
+        store = SQLiteTurnStore(tmp_path / "runtime.sqlite3")
+        started_at = datetime.now(UTC)
+        await store.register_host(
+            "old-host",
+            now=started_at,
+            lease_expires_at=started_at + timedelta(seconds=1),
+        )
+        await store.create_turn(
+            turn_id="turn-1",
+            session_id="session-1",
+            runtime_host_id="old-host",
+            started_at=started_at,
+        )
+        now = started_at + timedelta(seconds=2)
+        await store.register_host(
+            "new-host",
+            now=now,
+            lease_expires_at=now + timedelta(seconds=30),
+        )
+        manager = TurnLifecycleManager(store=store, runtime_host_id="new-host")
+        assert await manager.claim_recovery("turn-1", "session-1") is True
+        with pytest.raises(asyncio.CancelledError):
+            async with manager.track_recovery("turn-1", "session-1"):
+                raise asyncio.CancelledError
+        return await store.list_turns()
+
+    records = asyncio.run(scenario())
+
+    assert records[0].state == "interrupted"
+    assert records[0].finished_at is not None

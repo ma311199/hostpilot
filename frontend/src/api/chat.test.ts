@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   deleteConversation,
   listPendingToolOutcomes,
+  listRecoverableChatTurns,
   listRecoverablePlanRuns,
   resolvePlanInvocation,
   resolveToolOutcome,
@@ -62,6 +63,25 @@ describe('Conversation API', () => {
     await expect(listPendingToolOutcomes('session/one')).resolves.toEqual(pending)
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:8000/api/v1/conversations/session%2Fone/tool-outcomes',
+      expect.objectContaining({ headers: { 'Content-Type': 'application/json' } }),
+    )
+  })
+
+  it('lists only safe recoverable Turn metadata for an encoded Session ID', async () => {
+    const turns = [{
+      turn_id: 'turn-1',
+      started_at: '2026-11-23T00:00:00Z',
+      recoverable: true,
+      reason_code: null,
+    }]
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(turns), { status: 200 }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(listRecoverableChatTurns('session/one')).resolves.toEqual(turns)
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:8000/api/v1/conversations/session%2Fone/turns/recoverable',
       expect.objectContaining({ headers: { 'Content-Type': 'application/json' } }),
     )
   })

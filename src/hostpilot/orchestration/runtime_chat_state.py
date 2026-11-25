@@ -57,6 +57,16 @@ def _from_framework_message(message: Any) -> ModelMessage:
     if not isinstance(content, str):
         content = get_buffer_string((message,))
     tool_call_id = getattr(message, "tool_call_id", None)
+    additional_kwargs = getattr(message, "additional_kwargs", {})
+    turn_id = (
+        additional_kwargs.get("hostpilot_turn_id")
+        if isinstance(additional_kwargs, Mapping)
+        else None
+    )
+    if turn_id is not None and (
+        not isinstance(turn_id, str) or not turn_id or turn_id.strip() != turn_id
+    ):
+        raise ValueError("Checkpoint contains an invalid HostPilot Turn association.")
     tool_calls: list[ModelToolCall] = []
     for call in getattr(message, "tool_calls", ()):
         if not isinstance(call, Mapping):
@@ -79,6 +89,7 @@ def _from_framework_message(message: Any) -> ModelMessage:
         content=content,
         tool_call_id=tool_call_id,
         tool_calls=tuple(tool_calls),
+        turn_id=turn_id,
     )
 
 
@@ -88,16 +99,30 @@ def _to_framework_message(message: ModelMessage) -> Any:
 
     if not isinstance(message, ModelMessage):
         raise TypeError("Runtime session messages must use ModelMessage values.")
+    if message.turn_id is not None and (
+        not isinstance(message.turn_id, str)
+        or not message.turn_id
+        or message.turn_id.strip() != message.turn_id
+    ):
+        raise ValueError("Runtime messages require a valid Turn association.")
+    additional_kwargs = (
+        {"hostpilot_turn_id": message.turn_id} if message.turn_id is not None else {}
+    )
     if message.role is ModelRole.USER:
-        return HumanMessage(content=message.content)
+        return HumanMessage(content=message.content, additional_kwargs=additional_kwargs)
     if message.role is ModelRole.SYSTEM:
-        return SystemMessage(content=message.content)
+        return SystemMessage(content=message.content, additional_kwargs=additional_kwargs)
     if message.role is ModelRole.TOOL:
         if not message.tool_call_id:
             raise ValueError("Runtime tool messages must include tool_call_id.")
-        return ToolMessage(content=message.content, tool_call_id=message.tool_call_id)
+        return ToolMessage(
+            content=message.content,
+            tool_call_id=message.tool_call_id,
+            additional_kwargs=additional_kwargs,
+        )
     return AIMessage(
         content=message.content,
+        additional_kwargs=additional_kwargs,
         tool_calls=[
             {
                 "id": call.call_id,

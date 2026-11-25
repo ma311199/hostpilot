@@ -7,6 +7,7 @@ import {
   getConversationMessages,
   listPendingToolOutcomes,
   listRecoverablePlanRuns,
+  listRecoverableChatTurns,
   listConversations,
   resolvePlanInvocation,
   resolveToolOutcome,
@@ -15,6 +16,7 @@ import {
   type ConversationSummary,
   type PendingToolOutcome,
   type RecoverablePlanRun,
+  type RecoverableChatTurn,
   type SandboxMode,
 } from './api/chat'
 import { getWorkspace, selectWorkspace, type WorkspaceStatus } from './api/workspace'
@@ -43,11 +45,13 @@ const pendingApproval = ref<ToolConfirmationMessage | null>(null)
 const pendingTaskCacheApproval = ref<PlanTaskCacheMessage | null>(null)
 const pendingToolOutcomes = ref<PendingToolOutcome[]>([])
 const recoverablePlanRuns = ref<RecoverablePlanRun[]>([])
+const recoverableChatTurns = ref<RecoverableChatTurn[]>([])
 const outcomeResultDrafts = ref<Record<string, string>>({})
 const resolvingToolCallId = ref<string | null>(null)
 const planInvocationResultDrafts = ref<Record<string, string>>({})
 const resolvingPlanInvocationId = ref<string | null>(null)
 const resumingPlanRunId = ref<string | null>(null)
+const resumingTurnId = ref<string | null>(null)
 const recoveryStatusMessage = ref('')
 interface ConversationPreference {
   title?: string
@@ -123,6 +127,10 @@ async function refreshPendingToolOutcomes(sessionId: string): Promise<void> {
 
 async function refreshRecoverablePlanRuns(sessionId: string): Promise<void> {
   recoverablePlanRuns.value = await listRecoverablePlanRuns(sessionId)
+}
+
+async function refreshRecoverableChatTurns(sessionId: string): Promise<void> {
+  recoverableChatTurns.value = await listRecoverableChatTurns(sessionId)
 }
 
 function loadConversationPreferences(): Record<string, ConversationPreference> {
@@ -201,6 +209,7 @@ async function openConversation(sessionId: string): Promise<void> {
   messages.value = []
   pendingToolOutcomes.value = []
   recoverablePlanRuns.value = []
+  recoverableChatTurns.value = []
   recoveryStatusMessage.value = ''
   loading.value = true
   errorMessage.value = ''
@@ -209,6 +218,7 @@ async function openConversation(sessionId: string): Promise<void> {
     messages.value = history.messages
     await refreshPendingToolOutcomes(sessionId)
     await refreshRecoverablePlanRuns(sessionId)
+    await refreshRecoverableChatTurns(sessionId)
     await scrollToLatest()
   } catch (error) {
     errorMessage.value = messageFor(error)
@@ -227,6 +237,7 @@ async function startConversation(): Promise<void> {
     messages.value = []
     pendingToolOutcomes.value = []
     recoverablePlanRuns.value = []
+    recoverableChatTurns.value = []
   } catch (error) {
     errorMessage.value = messageFor(error)
   }
@@ -256,6 +267,7 @@ async function removeConversation(conversation: ConversationSummary): Promise<vo
       messages.value = []
       pendingToolOutcomes.value = []
       recoverablePlanRuns.value = []
+      recoverableChatTurns.value = []
       const latest = conversations.value[0]
       if (latest) await openConversation(latest.session_id)
     }
@@ -336,6 +348,7 @@ async function submitMessage(): Promise<void> {
     messages.value = history.messages
     await refreshPendingToolOutcomes(sessionId)
     await refreshRecoverablePlanRuns(sessionId)
+    await refreshRecoverableChatTurns(sessionId)
     if (pendingToolOutcomes.value.length) {
       draft.value = message
       errorMessage.value = chatResponse.assistant_message
@@ -356,6 +369,39 @@ async function submitMessage(): Promise<void> {
     draft.value = message
     errorMessage.value = messageFor(error)
   } finally {
+    sending.value = false
+  }
+}
+
+async function resumeInterruptedTurn(turn: RecoverableChatTurn): Promise<void> {
+  const sessionId = activeSessionId.value
+  if (!sessionId || resumingTurnId.value || !turn.recoverable) return
+
+  resumingTurnId.value = turn.turn_id
+  recoveryStatusMessage.value = ''
+  errorMessage.value = ''
+  sending.value = true
+  try {
+    const result = await chatSocket.resumeTurn(sessionId, turn.turn_id)
+    if (result.assistant_message) {
+      recoveryStatusMessage.value = result.status === 'completed'
+        ? '对话已恢复并完成。'
+        : `对话恢复已暂停：${result.reason_code || result.status}。`
+    } else {
+      recoveryStatusMessage.value = `对话恢复已暂停：${result.reason_code || result.status}。`
+    }
+    const history = await getConversationMessages(sessionId)
+    messages.value = history.messages
+    await refreshRecoverableChatTurns(sessionId)
+    await refreshRecoverablePlanRuns(sessionId)
+    await refreshPendingToolOutcomes(sessionId)
+    await refreshConversations()
+    await scrollToLatest()
+  } catch (error) {
+    errorMessage.value = messageFor(error)
+    await refreshRecoverableChatTurns(sessionId)
+  } finally {
+    resumingTurnId.value = null
     sending.value = false
   }
 }
@@ -811,6 +857,45 @@ onUnmounted(() => chatSocket.close())
           <span class="chat-model-caption">由当前配置的模型提供支持</span>
         </div>
       </header>
+
+      <section
+        v-if="recoverableChatTurns.length"
+        class="turn-recovery"
+        aria-labelledby="turn-recovery-title"
+        role="region"
+      >
+        <div class="turn-recovery-heading">
+          <div>
+            <strong id="turn-recovery-title">有对话在中断后等待恢复</strong>
+            <p>恢复会从最近一次保存的进度继续，并使用当前预算、授权和工具策略。只有你点击恢复后才会继续执行。</p>
+          </div>
+        </div>
+        <article
+          v-for="turn in recoverableChatTurns"
+          :key="turn.turn_id"
+          class="turn-recovery-item"
+        >
+          <div class="turn-recovery-meta">
+            <strong>中断的对话</strong>
+            <time :datetime="turn.started_at">{{ new Date(turn.started_at).toLocaleString() }}</time>
+          </div>
+          <p
+            v-if="!turn.recoverable"
+            class="turn-recovery-reason"
+          >
+            此对话无法恢复：{{ turn.reason_code }}
+          </p>
+          <button
+            v-else
+            type="button"
+            class="plan-recovery-primary"
+            :disabled="sending || resumingTurnId !== null"
+            @click="resumeInterruptedTurn(turn)"
+          >
+            {{ resumingTurnId === turn.turn_id ? '正在恢复…' : '确认并恢复对话' }}
+          </button>
+        </article>
+      </section>
 
       <section
         v-if="recoverablePlanRuns.length"

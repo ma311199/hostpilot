@@ -335,6 +335,81 @@ class RecordingOutcomeLifecycle:
         self.events.append(f"cleared:{tool_call_id}")
 
 
+def test_loop_replays_claimed_idempotent_call_with_original_idempotency_identity() -> None:
+    context = execution_context()
+    arguments = {"message_id": "message-1"}
+    original_call_id = "provider-call-original"
+    replay_key = ("send_message", '{"message_id":"message-1"}')
+    model = SequenceModelPort(
+        [
+            ModelResponse(
+                text="",
+                tool_calls=(ModelToolCall("new-provider-call", "send_message", arguments),),
+            ),
+            ModelResponse(text="Sent."),
+        ]
+    )
+
+    class IdempotentToolPort(RecordingToolPort):
+        def __init__(self):
+            super().__init__()
+            self.keys: list[str] = []
+
+        async def execute_idempotent(self, request_context, tool_call, *, idempotency_key):
+            self.keys.append(idempotency_key)
+            self.calls.append((request_context, tool_call))
+            return "sent"
+
+    class InvocationJournal:
+        def __init__(self):
+            self.prepared: list[dict[str, object]] = []
+
+        async def prepare_invocation(self, **kwargs):
+            self.prepared.append(kwargs)
+
+        async def complete_invocation(self, invocation_id, *, plan_run_id):
+            del invocation_id, plan_run_id
+
+    events: list[str] = []
+    outcomes = RecordingOutcomeLifecycle(events)
+    tools = IdempotentToolPort()
+    journal = InvocationJournal()
+
+    async def persist(messages):
+        if any(message.role is ModelRole.TOOL for message in messages):
+            events.append("checkpointed")
+
+    request_context = RuntimeExecutionRequest(
+        request_context=context,
+        messages=(ModelMessage(role=ModelRole.USER, content="send message"),),
+        tools=(definition("send_message"),),
+        allowed_tool_ids=frozenset({"send_message"}),
+        tool_side_effects={"send_message": ToolSideEffect.POSSIBLE},
+        tool_outcomes=outcomes,
+        tool_invocations=journal,
+        tool_retry_classes={"send_message": ToolRetryClass.IDEMPOTENT_WRITE},
+        idempotency_windows={"send_message": 3600},
+        tool_call_index_start=1,
+        recovery_tool_call_ids={replay_key: original_call_id},
+        claimed_recovery_outcome_ids=frozenset({original_call_id}),
+        message_sink=persist,
+    )
+
+    asyncio.run(DefaultRuntimeExecutionLoop(model, tools).run(request_context))
+
+    expected_key, _ = stable_tool_invocation_identity(
+        plan_run_id="loop-test",
+        task_id="runtime_chat",
+        call_index=1,
+        tool_id="send_message",
+        arguments=arguments,
+    )
+    assert tools.keys == [expected_key]
+    assert tools.calls[0][1].call_id == original_call_id
+    assert events == ["checkpointed", f"cleared:{original_call_id}"]
+    assert journal.prepared[0]["invocation_id"] == f"invocation:{expected_key}"
+
+
 def test_loop_registers_side_effect_before_dispatch_and_clears_after_checkpoint() -> None:
     context = execution_context()
     call = ModelToolCall("write-1", "write_file", {"path": "report.txt"})

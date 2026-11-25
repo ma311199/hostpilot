@@ -3,18 +3,37 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
 
-from hostpilot.contracts import ContextSnapshot, Route
+from hostpilot.contracts import ContextSnapshot, Route, SandboxMode
 from hostpilot.observability import TraceEvent
 from hostpilot.orchestration.chat import ChatService
 from hostpilot.orchestration.runtime import ChatAgentResponse
 from hostpilot.orchestration.skill_runtime import SkillSelection
 from hostpilot.routing import CommandRouter
 from hostpilot.runtime import AgentLifecycleManager, RequestContext, TurnLifecycleManager
+from hostpilot.sandbox import current_sandbox_mode
+from hostpilot.skills.runtime import SkillExecutionResult, SkillExecutionStatus
+from hostpilot.tools.facade import ToolFacade
 
 
 class FakeConversationStore:
+    def __init__(self, sandbox_mode: SandboxMode = SandboxMode.READ_ONLY) -> None:
+        self.sandbox_mode = sandbox_mode
+
+    async def get(self, session_id: str):
+        return SimpleNamespace(session_id=session_id, sandbox_mode=self.sandbox_mode)
+
     async def touch(self, session_id: str) -> None:
         self.touched = session_id
+
+
+class SandboxModeProvider:
+    def __init__(self) -> None:
+        self.sandbox_mode = None
+        self.history = []
+
+    def set_sandbox_mode(self, mode) -> None:
+        self.sandbox_mode = mode
+        self.history.append(mode)
 
 
 class FakeContextBuilder:
@@ -335,7 +354,10 @@ def test_chat_turn_keeps_one_agent_generation_while_configuration_replaces_it() 
 
         class ConversationStore(FakeConversationStore):
             async def get(self, session_id: str):
-                return SimpleNamespace(session_id=session_id)
+                return SimpleNamespace(
+                    session_id=session_id,
+                    sandbox_mode=SandboxMode.READ_ONLY,
+                )
 
         class ContextBuilder:
             async def build(self, session_id, *, query=None, state_reader=None):
@@ -505,5 +527,158 @@ def test_chat_history_and_route_evaluation_hold_session_leases() -> None:
             "acquire:session-1",
             "release:session-1",
         ]
+
+    asyncio.run(scenario())
+
+
+def test_send_uses_persisted_sandbox_mode_in_request_context() -> None:
+    async def scenario() -> None:
+        provider = SandboxModeProvider()
+
+        class Runtime(FakeRuntime):
+            async def respond(self, message: str, request_context: RequestContext):
+                del message
+                assert provider.sandbox_mode is SandboxMode.WORKSPACE_WRITE
+                assert current_sandbox_mode() is SandboxMode.WORKSPACE_WRITE
+                self.request_context = request_context
+                return ChatAgentResponse("done", route=Route.DIRECT)
+
+        runtime = Runtime()
+        service = ChatService(
+            FakeConversationStore(SandboxMode.WORKSPACE_WRITE),
+            FakeContextBuilder(),
+            runtime,
+            tool_provider=ToolFacade(provider),
+        )
+
+        await service.send("session-1", "hello")
+
+        assert runtime.request_context.sandbox_mode is SandboxMode.WORKSPACE_WRITE
+        assert provider.history == [SandboxMode.WORKSPACE_WRITE, None]
+        assert current_sandbox_mode() is None
+
+    asyncio.run(scenario())
+
+
+def test_resume_plan_run_uses_persisted_sandbox_mode() -> None:
+    async def scenario() -> None:
+        provider = SandboxModeProvider()
+        run = SimpleNamespace(
+            session_id="session-1",
+            state="interrupted",
+            goal="resume the work",
+            snapshot=None,
+        )
+
+        class TaskLifecycle:
+            async def get_plan_run(self, plan_run_id):
+                assert plan_run_id == "plan-run-1"
+                return run
+
+            async def claim_plan_run(self, plan_run_id):
+                assert plan_run_id == "plan-run-1"
+                return True
+
+            async def update_plan_run(self, *args, **kwargs):
+                del args, kwargs
+
+        class Runtime(FakeRuntime):
+            async def resume_plan_run(self, plan_run_id, request_context):
+                assert plan_run_id == "plan-run-1"
+                assert provider.sandbox_mode is SandboxMode.DANGER_FULL_ACCESS
+                assert current_sandbox_mode() is SandboxMode.DANGER_FULL_ACCESS
+                self.request_context = request_context
+                return SkillExecutionResult(SkillExecutionStatus.COMPLETED)
+
+        runtime = Runtime()
+        service = ChatService(
+            FakeConversationStore(SandboxMode.DANGER_FULL_ACCESS),
+            FakeContextBuilder(),
+            runtime,
+            tool_provider=ToolFacade(provider),
+            task_lifecycle=TaskLifecycle(),
+        )
+
+        result = await service.resume_plan_run("session-1", "plan-run-1")
+
+        assert result.status is SkillExecutionStatus.COMPLETED
+        assert runtime.request_context.sandbox_mode is SandboxMode.DANGER_FULL_ACCESS
+        assert provider.history == [SandboxMode.DANGER_FULL_ACCESS, None]
+        assert current_sandbox_mode() is None
+
+    asyncio.run(scenario())
+
+
+def test_resume_turn_uses_persisted_sandbox_mode() -> None:
+    async def scenario() -> None:
+        provider = SandboxModeProvider()
+
+        class TurnLifecycle:
+            async def list_recoverable(self, session_id):
+                assert session_id == "session-1"
+                return (SimpleNamespace(turn_id="turn-1"),)
+
+            async def claim_recovery(self, turn_id, session_id):
+                assert (turn_id, session_id) == ("turn-1", "session-1")
+                return True
+
+            @asynccontextmanager
+            async def track_recovery(self, turn_id, session_id):
+                assert (turn_id, session_id) == ("turn-1", "session-1")
+                yield
+
+        class Runtime(FakeRuntime):
+            async def recoverability_reason(self, session_id, turn_id):
+                return None
+
+            async def recovery_tool_reason(self, session_id, turn_id, *, task_lifecycle):
+                del session_id, turn_id, task_lifecycle
+                return None
+
+            async def recoverable_user_message(self, session_id, turn_id):
+                return "continue"
+
+            async def resume_turn(self, turn_id, request_context):
+                assert turn_id == "turn-1"
+                assert provider.sandbox_mode is SandboxMode.WORKSPACE_WRITE
+                assert current_sandbox_mode() is SandboxMode.WORKSPACE_WRITE
+                self.request_context = request_context
+                return ChatAgentResponse("continued", route=Route.DIRECT)
+
+        runtime = Runtime()
+        service = ChatService(
+            FakeConversationStore(SandboxMode.WORKSPACE_WRITE),
+            FakeContextBuilder(),
+            runtime,
+            tool_provider=ToolFacade(provider),
+            turn_lifecycle=TurnLifecycle(),
+        )
+
+        result = await service.resume_turn("session-1", "turn-1")
+
+        assert result.assistant_message == "continued"
+        assert runtime.request_context.sandbox_mode is SandboxMode.WORKSPACE_WRITE
+        assert provider.history == [SandboxMode.WORKSPACE_WRITE, None]
+        assert current_sandbox_mode() is None
+
+    asyncio.run(scenario())
+
+
+def test_send_uses_read_only_contextvar_without_tool_facade() -> None:
+    async def scenario() -> None:
+        class Runtime(FakeRuntime):
+            async def respond(self, message: str, request_context: RequestContext):
+                del message
+                assert current_sandbox_mode() is SandboxMode.READ_ONLY
+                self.request_context = request_context
+                return ChatAgentResponse("done", route=Route.DIRECT)
+
+        runtime = Runtime()
+        service = ChatService(FakeConversationStore(), FakeContextBuilder(), runtime)
+
+        await service.send("session-1", "hello")
+
+        assert runtime.request_context.sandbox_mode is SandboxMode.READ_ONLY
+        assert current_sandbox_mode() is None
 
     asyncio.run(scenario())

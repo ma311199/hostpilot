@@ -7,6 +7,7 @@ from hostpilot.contracts import (
     BudgetContext,
     BudgetLimits,
     ExecutionEnvironment,
+    SandboxMode,
     TimeoutProfile,
     ToolDescriptor,
     ToolRetryClass,
@@ -14,6 +15,7 @@ from hostpilot.contracts import (
     ToolType,
     TrustLevel,
 )
+from hostpilot.sandbox import current_sandbox_mode, sandbox_mode_scope
 from hostpilot.tools.facade import ToolFacade
 
 
@@ -41,6 +43,15 @@ class FakeProvider:
     async def call_tool(self, name, arguments, *, budget, confirmation_provider=None):
         self.calls.append((name, arguments, budget, confirmation_provider))
         return "result"
+
+
+class SandboxProvider(FakeProvider):
+    def __init__(self, descriptor: ToolDescriptor) -> None:
+        super().__init__(descriptor)
+        self.sandbox_modes = []
+
+    def set_sandbox_mode(self, mode):
+        self.sandbox_modes.append(mode)
 
 
 def test_tool_retry_classification_is_separate_from_side_effect_level() -> None:
@@ -212,5 +223,98 @@ def test_tool_facade_exposes_catalog_and_delegates_governed_invocation() -> None
 
         assert result == "result"
         assert provider.calls == [("read_text_file", {"path": "README.md"}, budget, confirmation)]
+
+    asyncio.run(scenario())
+
+
+def test_sandbox_mode_scope_binds_and_resets_mode() -> None:
+    async def scenario() -> None:
+        descriptor = ToolDescriptor(
+            name="read_text_file",
+            description="Read a workspace file",
+            tool_type=ToolType.ACTION,
+            trust_level=TrustLevel.HOST,
+            execution_env=ExecutionEnvironment.HOST,
+            timeout_profile=TimeoutProfile(timeout_seconds=5),
+        )
+        provider = SandboxProvider(descriptor)
+        facade = ToolFacade(provider)
+        with sandbox_mode_scope(SandboxMode.READ_ONLY):
+            async with facade.sandbox_mode_scope(SandboxMode.WORKSPACE_WRITE):
+                assert current_sandbox_mode() is SandboxMode.WORKSPACE_WRITE
+                assert provider.sandbox_modes == [SandboxMode.WORKSPACE_WRITE]
+
+            assert current_sandbox_mode() is SandboxMode.READ_ONLY
+        assert current_sandbox_mode() is None
+        assert provider.sandbox_modes == [SandboxMode.WORKSPACE_WRITE, None]
+
+    asyncio.run(scenario())
+
+
+def test_sandbox_mode_scope_resets_after_exception() -> None:
+    async def scenario() -> None:
+        descriptor = ToolDescriptor(
+            name="read_text_file",
+            description="Read a workspace file",
+            tool_type=ToolType.ACTION,
+            trust_level=TrustLevel.HOST,
+            execution_env=ExecutionEnvironment.HOST,
+            timeout_profile=TimeoutProfile(timeout_seconds=5),
+        )
+        provider = SandboxProvider(descriptor)
+        facade = ToolFacade(provider)
+
+        with pytest.raises(ValueError, match="request failed"):
+            async with facade.sandbox_mode_scope(SandboxMode.DANGER_FULL_ACCESS):
+                assert current_sandbox_mode() is SandboxMode.DANGER_FULL_ACCESS
+                raise ValueError("request failed")
+
+        assert current_sandbox_mode() is None
+        assert provider.sandbox_modes == [SandboxMode.DANGER_FULL_ACCESS, None]
+
+    asyncio.run(scenario())
+
+
+def test_sandbox_mode_scope_serializes_overlapping_requests() -> None:
+    async def scenario() -> None:
+        descriptor = ToolDescriptor(
+            name="read_text_file",
+            description="Read a workspace file",
+            tool_type=ToolType.ACTION,
+            trust_level=TrustLevel.HOST,
+            execution_env=ExecutionEnvironment.HOST,
+            timeout_profile=TimeoutProfile(timeout_seconds=5),
+        )
+        provider = SandboxProvider(descriptor)
+        facade = ToolFacade(provider)
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        second_entered = asyncio.Event()
+
+        async def first_request() -> None:
+            async with facade.sandbox_mode_scope(SandboxMode.WORKSPACE_WRITE):
+                first_entered.set()
+                await release_first.wait()
+
+        async def second_request() -> None:
+            await first_entered.wait()
+            async with facade.sandbox_mode_scope(SandboxMode.READ_ONLY):
+                second_entered.set()
+
+        first = asyncio.create_task(first_request())
+        second = asyncio.create_task(second_request())
+        await first_entered.wait()
+        await asyncio.sleep(0)
+        assert not second_entered.is_set()
+        release_first.set()
+        await asyncio.gather(first, second)
+
+        assert second_entered.is_set()
+        assert provider.sandbox_modes == [
+            SandboxMode.WORKSPACE_WRITE,
+            None,
+            SandboxMode.READ_ONLY,
+            None,
+        ]
 
     asyncio.run(scenario())

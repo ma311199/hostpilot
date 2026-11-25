@@ -419,6 +419,176 @@ def test_task_store_journals_runtime_chat_tool_calls_without_plan_run(tmp_path) 
     asyncio.run(scenario())
 
 
+def test_task_store_lists_runtime_tool_invocations_by_turn(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime.now(UTC)
+
+    async def scenario() -> None:
+        hosts = SQLiteTurnStore(database_path)
+        await hosts.initialize()
+        await hosts.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
+        store = SQLiteTaskStore(database_path)
+        for turn_id, invocation_id in (("turn-a", "call-a"), ("turn-b", "call-b")):
+            await hosts.create_turn(
+                turn_id=turn_id,
+                session_id="session-1",
+                runtime_host_id="host-a",
+                started_at=now,
+            )
+            await store.record_runtime_tool_invocation(
+                invocation_id=invocation_id,
+                session_id="session-1",
+                turn_id=turn_id,
+                runtime_host_id="host-a",
+                task_run_id=None,
+                task_id="runtime_chat",
+                call_index=1,
+                tool_id="search_files",
+                retry_class=ToolRetryClass.PURE_READ,
+                idempotency_key=None,
+                request_fingerprint=f"fingerprint-{turn_id}",
+                arguments_json="{}",
+                idempotency_window_seconds=None,
+                created_at=now,
+            )
+
+        return await store.list_runtime_tool_invocations("session-1", "turn-a")
+
+    records = asyncio.run(scenario())
+    assert [record.invocation_id for record in records] == ["call-a"]
+
+
+def test_task_store_claims_prepared_invocations_only_for_current_turn_owner(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime.now(UTC)
+
+    async def scenario() -> None:
+        hosts = SQLiteTurnStore(database_path)
+        await hosts.initialize()
+        await hosts.register_host("host-a", now=now, lease_expires_at=now + timedelta(seconds=1))
+        store = SQLiteTaskStore(database_path)
+        await hosts.create_turn(
+            turn_id="turn-1", session_id="session-1", runtime_host_id="host-a", started_at=now
+        )
+        await store.record_runtime_tool_invocation(
+            invocation_id="call-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            runtime_host_id="host-a",
+            task_run_id=None,
+            task_id="runtime_chat",
+            call_index=1,
+            tool_id="write_text_file",
+            retry_class="idempotent_write",
+            idempotency_key="stable-1",
+            request_fingerprint="fingerprint-1",
+            arguments_json='{"text":"a"}',
+            idempotency_window_seconds=3600,
+            created_at=now,
+        )
+        await hosts.register_host(
+            "host-b", now=now + timedelta(seconds=2), lease_expires_at=now + timedelta(minutes=1)
+        )
+        assert await hosts.claim_interrupted_turn(
+            "turn-1", "session-1", "host-b", claimed_at=now + timedelta(seconds=2)
+        )
+        claimed = await store.claim_runtime_tool_invocations(
+            "session-1", "turn-1", runtime_host_id="host-b", now=now + timedelta(seconds=2)
+        )
+        wrong_host_claim = await store.claim_runtime_tool_invocations(
+            "session-1", "turn-1", runtime_host_id="host-a", now=now + timedelta(seconds=2)
+        )
+        wrong_session_claim = await store.claim_runtime_tool_invocations(
+            "session-other", "turn-1", runtime_host_id="host-b", now=now + timedelta(seconds=2)
+        )
+        return (
+            claimed,
+            wrong_host_claim,
+            wrong_session_claim,
+            await store.list_runtime_tool_invocations("session-1", "turn-1"),
+        )
+
+    claimed, wrong_host_claim, wrong_session_claim, records = asyncio.run(scenario())
+    assert claimed is True
+    assert wrong_host_claim is False
+    assert wrong_session_claim is False
+    assert records[0].runtime_host_id == "host-b"
+    assert records[0].state == "prepared"
+
+
+def test_task_store_reuses_only_exact_prepared_runtime_invocation(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime.now(UTC)
+
+    async def scenario() -> None:
+        hosts = SQLiteTurnStore(database_path)
+        await hosts.initialize()
+        await hosts.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
+        store = SQLiteTaskStore(database_path)
+        await hosts.create_turn(
+            turn_id="turn-1", session_id="session-1", runtime_host_id="host-a", started_at=now
+        )
+        values = dict(
+            invocation_id="call-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            runtime_host_id="host-a",
+            task_run_id=None,
+            task_id="runtime_chat",
+            call_index=1,
+            tool_id="write_text_file",
+            retry_class="idempotent_write",
+            idempotency_key="stable-1",
+            request_fingerprint="fingerprint-1",
+            arguments_json='{"text":"a"}',
+            idempotency_window_seconds=3600,
+            created_at=now,
+        )
+        await store.record_runtime_tool_invocation(**values)
+        await store.record_runtime_tool_invocation(**values)
+        return store
+
+    store = asyncio.run(scenario())
+    assert len(asyncio.run(store.list_runtime_tool_invocations("session-1", "turn-1"))) == 1
+
+
+def test_task_store_rejects_reused_runtime_invocation_with_changed_fingerprint(tmp_path) -> None:
+    database_path = tmp_path / "runtime.sqlite3"
+    now = datetime.now(UTC)
+
+    async def scenario() -> None:
+        hosts = SQLiteTurnStore(database_path)
+        await hosts.initialize()
+        await hosts.register_host("host-a", now=now, lease_expires_at=now + timedelta(minutes=1))
+        store = SQLiteTaskStore(database_path)
+        await hosts.create_turn(
+            turn_id="turn-1", session_id="session-1", runtime_host_id="host-a", started_at=now
+        )
+        values = dict(
+            invocation_id="call-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            runtime_host_id="host-a",
+            task_run_id=None,
+            task_id="runtime_chat",
+            call_index=1,
+            tool_id="write_text_file",
+            retry_class="idempotent_write",
+            idempotency_key="stable-1",
+            request_fingerprint="fingerprint-1",
+            arguments_json='{"text":"a"}',
+            idempotency_window_seconds=3600,
+            created_at=now,
+        )
+        await store.record_runtime_tool_invocation(**values)
+        with pytest.raises((ValueError, RuntimeError), match="match|reuse|invocation"):
+            await store.record_runtime_tool_invocation(
+                **{**values, "request_fingerprint": "fingerprint-changed"}
+            )
+
+    asyncio.run(scenario())
+
+
 def test_task_completion_completes_its_tool_journal_with_the_result_checkpoint(tmp_path) -> None:
     database_path = tmp_path / "runtime.sqlite3"
     now = datetime(2026, 11, 22, 10, 0, tzinfo=UTC)

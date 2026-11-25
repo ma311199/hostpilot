@@ -3,6 +3,7 @@ import operator
 from pathlib import Path
 from typing import Annotated, TypedDict
 
+import pytest
 from langchain_core.messages import AIMessage, AnyMessage
 from langgraph.graph import END, START, StateGraph
 
@@ -110,6 +111,186 @@ def test_configured_runtime_uses_model_provider_and_agent_adapter(monkeypatch, t
     assert result.skill_engine.plan_fallback is not None
     assert runtime_arguments["model"] is agent_chat_model
     assert runtime_arguments["checkpointer"] == "checkpoint"
+
+
+def test_legacy_runtime_factory_forwards_arguments_to_canonical_composer(monkeypatch) -> None:
+    import hostpilot.orchestration.chat_runtime_composition as composition_module
+    import hostpilot.orchestration.runtime as runtime_module
+
+    settings = Settings()
+    expected_result = object()
+    captured: dict[str, object] = {}
+
+    def composer(settings_arg, **kwargs):
+        captured.update(settings=settings_arg, **kwargs)
+        return expected_result
+
+    monkeypatch.setattr(composition_module, "build_configured_chat_agent_runtime", composer)
+    arguments = {
+        "checkpointer": object(),
+        "tools": (object(),),
+        "tool_provider": object(),
+        "memory_controller": object(),
+        "compensation_registry": object(),
+        "cancellation_sink": object(),
+        "skill_execution_modes": {"business/review": "yaml"},
+        "trace_sink": object(),
+        "plan_component_registry": object(),
+        "chat_agent_runtime_registry": object(),
+        "model_provider_registry": object(),
+    }
+
+    result = runtime_module.create_configured_chat_agent_runtime(settings, **arguments)
+
+    assert result is expected_result
+    assert captured == {"settings": settings, **arguments}
+
+
+def test_legacy_runtime_factory_propagates_composer_errors(monkeypatch) -> None:
+    import hostpilot.orchestration.chat_runtime_composition as composition_module
+    import hostpilot.orchestration.runtime as runtime_module
+
+    expected_error = RuntimeError("composition failed")
+
+    def fail_composition(*_args, **_kwargs):
+        raise expected_error
+
+    monkeypatch.setattr(composition_module, "build_configured_chat_agent_runtime", fail_composition)
+
+    try:
+        runtime_module.create_configured_chat_agent_runtime(Settings(), checkpointer=object())
+    except RuntimeError as error:
+        assert error is expected_error
+    else:
+        raise AssertionError("The compatibility wrapper must propagate composer errors.")
+
+
+def test_chat_runtime_composition_uses_injected_registries_and_fails_closed_without_tools(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from hostpilot.models import ModelToolCall
+    from hostpilot.models.factory import ModelProviderRegistry, ModelRuntimeComponents
+    from hostpilot.orchestration.chat_runtime_composition import (
+        build_configured_chat_agent_runtime,
+    )
+    from hostpilot.orchestration.runtime_plugins import ChatAgentRuntimeRegistry
+    from hostpilot.skills.plan_plugins import PlanComponentRegistry, PlanComponentRole
+
+    class Provider:
+        async def complete(self, request):
+            del request
+            raise AssertionError("Composition must not execute a model request.")
+
+    class AgentModel:
+        pass
+
+    class ChatRuntime:
+        async def read_messages(self, session_id):
+            del session_id
+            return ()
+
+        async def respond(self, message, request_context):
+            del message, request_context
+            raise NotImplementedError
+
+        async def record_turn(self, session_id, user_message, assistant_message):
+            del session_id, user_message, assistant_message
+
+    provider = Provider()
+    agent_model = AgentModel()
+    model_settings = []
+    model_registry = ModelProviderRegistry()
+    model_registry.register(
+        "test.provider",
+        lambda settings: (
+            model_settings.append(settings)
+            or ModelRuntimeComponents(provider=provider, agent_chat_model=agent_model)
+        ),
+    )
+
+    chat_contexts = []
+    chat_registry = ChatAgentRuntimeRegistry()
+    chat_registry.register(
+        "test.chat",
+        lambda context: chat_contexts.append(context) or ChatRuntime(),
+    )
+
+    plan_contexts = []
+    plan_registry = PlanComponentRegistry()
+    component_methods = {
+        PlanComponentRole.PLANNER: "create_plan",
+        PlanComponentRole.VALIDATOR: "validate",
+        PlanComponentRole.TASK_EXECUTOR: "execute_task",
+        PlanComponentRole.VERIFIER: "verify",
+        PlanComponentRole.REPLANNER: "replan",
+    }
+    plan_selections = {
+        PlanComponentRole.PLANNER: "test.planner",
+        PlanComponentRole.VALIDATOR: "test.validator",
+        PlanComponentRole.TASK_EXECUTOR: "test.task-executor",
+        PlanComponentRole.VERIFIER: "test.verifier",
+        PlanComponentRole.REPLANNER: "test.replanner",
+    }
+    for role, implementation_id in plan_selections.items():
+        method_name = component_methods[role]
+
+        def build_component(context, *, expected_method=method_name):
+            plan_contexts.append(context)
+            return SimpleNamespace(**{expected_method: lambda *_args, **_kwargs: None})
+
+        plan_registry.register(role, implementation_id, build_component)
+
+    settings = Settings(
+        skills_dir=tmp_path / "skills",
+        model_provider_plugin="test.provider",
+        chat_runtime_plugin="test.chat",
+        plan_planner_plugin=plan_selections[PlanComponentRole.PLANNER],
+        plan_validator_plugin=plan_selections[PlanComponentRole.VALIDATOR],
+        plan_task_executor_plugin=plan_selections[PlanComponentRole.TASK_EXECUTOR],
+        plan_verifier_plugin=plan_selections[PlanComponentRole.VERIFIER],
+        plan_replanner_plugin=plan_selections[PlanComponentRole.REPLANNER],
+    )
+
+    runtime = build_configured_chat_agent_runtime(
+        settings,
+        checkpointer=object(),
+        model_provider_registry=model_registry,
+        chat_agent_runtime_registry=chat_registry,
+        plan_component_registry=plan_registry,
+    )
+
+    assert model_settings == [settings]
+    assert len(chat_contexts) == 1
+    assert chat_contexts[0].model is agent_model
+    assert chat_contexts[0].runtime_tool_definitions == ()
+    assert chat_contexts[0].runtime_allowed_tool_ids == frozenset()
+    assert chat_contexts[0].runtime_execution_loop.model.provider is provider
+    assert len(plan_contexts) == len(PlanComponentRole)
+    assert all(context.provider is provider for context in plan_contexts)
+    assert runtime.chat_agent_runtime.__class__ is ChatRuntime
+
+    request_context = RequestContext(
+        snapshot=ContextSnapshot(request_id="request-no-tool-facade"),
+        budget=RequestBudget.start(
+            BudgetContext(
+                limits=BudgetLimits(
+                    total_tokens=100,
+                    tool_calls=2,
+                    retrieval_calls=1,
+                    timeout_seconds=10,
+                )
+            )
+        ),
+    )
+    with pytest.raises(RuntimeError, match="No ToolFacade is configured"):
+        asyncio.run(
+            chat_contexts[0].runtime_execution_loop.tools.execute(
+                request_context,
+                ModelToolCall("call-1", "write_file", {}),
+            )
+        )
 
 
 class ChatGraphState(TypedDict):

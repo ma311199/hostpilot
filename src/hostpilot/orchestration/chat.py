@@ -22,6 +22,7 @@ from hostpilot.contracts import (
     ConversationSummary,
     ModelTokenUsage,
     Route,
+    SandboxMode,
 )
 from hostpilot.observability import (
     CostEvent,
@@ -33,19 +34,22 @@ from hostpilot.observability import (
     TraceSink,
     trace_context_scope,
 )
-from hostpilot.orchestration.runtime import ChatAgentRuntime
+from hostpilot.orchestration.runtime import ChatAgentResponse, ChatAgentRuntime
 from hostpilot.output import OutputProcessor
 from hostpilot.persistence import ConversationStore
+from hostpilot.policy.confirmation import ConfirmationDecision
 from hostpilot.routing import DirectRouter, Router
 from hostpilot.runtime import (
     RequestContext,
     SessionLifecycleManager,
     TaskLifecycleManager,
     TurnLifecycleManager,
+    TurnRecoveryCancelled,
 )
 from hostpilot.runtime.context import TaskCacheApprovalProvider
+from hostpilot.sandbox import sandbox_mode_scope as bind_sandbox_mode
 from hostpilot.skills.runtime import SkillExecutionResult
-from hostpilot.tools.executor import AsyncConfirmationProvider
+from hostpilot.tools.executor import AsyncConfirmationProvider, ToolConfirmationDeniedError
 from hostpilot.tools.facade import ToolFacade
 
 
@@ -76,6 +80,16 @@ class RouteSelectionResult:
     skill_id: str
     reason_code: str
     token_usage: ModelTokenUsage | None = None
+
+
+@dataclass(frozen=True)
+class RecoverableChatTurn:
+    """Safe summary of one interrupted Chat Turn and its recovery availability."""
+
+    turn_id: str
+    started_at: datetime
+    recoverable: bool
+    reason_code: str | None = None
 
 
 class ChatService:
@@ -131,15 +145,20 @@ class ChatService:
         if len(message) > self.max_request_chars:
             raise RequestTooLargeError("Message exceeds the configured request size limit.")
         async with _lease_session(self.session_lifecycle, session_id):
+            conversation = await self.conversations.get(session_id)
+            if conversation is None:
+                raise ConversationNotFoundError(session_id)
             pending = await self._pending_tool_outcomes(session_id)
             if pending:
                 return _blocked_tool_outcome_result(session_id)
-            return await self._send_leased(
-                session_id,
-                message,
-                confirmation_provider=confirmation_provider,
-                task_cache_approval_provider=task_cache_approval_provider,
-            )
+            async with self._sandbox_mode_scope(conversation.sandbox_mode):
+                return await self._send_leased(
+                    session_id,
+                    message,
+                    sandbox_mode=conversation.sandbox_mode,
+                    confirmation_provider=confirmation_provider,
+                    task_cache_approval_provider=task_cache_approval_provider,
+                )
 
     async def resume_plan_run(
         self,
@@ -181,6 +200,7 @@ class ChatService:
                     request_context = RequestContext(
                         snapshot=context,
                         budget=budget,
+                        sandbox_mode=conversation.sandbox_mode,
                         confirmation_provider=confirmation_provider,
                         task_lifecycle=self.task_lifecycle,
                         plan_run_id=plan_run_id,
@@ -193,25 +213,184 @@ class ChatService:
                         snapshot=plan_run.snapshot,
                         updated_at=datetime.now(UTC),
                     )
-                    if self.turn_lifecycle is None:
-                        result = await resume(plan_run_id, request_context)
-                        if not isinstance(result, SkillExecutionResult):
-                            raise TypeError("Runtime returned an invalid Plan recovery result.")
-                        return result
-                    async with self.turn_lifecycle.track(
-                        request_context.snapshot.request_id,
+                    async with self._sandbox_mode_scope(conversation.sandbox_mode):
+                        if self.turn_lifecycle is None:
+                            result = await resume(plan_run_id, request_context)
+                        else:
+                            async with self.turn_lifecycle.track(
+                                request_context.snapshot.request_id,
+                                session_id,
+                            ):
+                                result = await resume(plan_run_id, request_context)
+                    if not isinstance(result, SkillExecutionResult):
+                        raise TypeError("Runtime returned an invalid Plan recovery result.")
+                    return result
+
+    async def list_recoverable_turns(self, session_id: str) -> tuple[RecoverableChatTurn, ...]:
+        """List interrupted Turns with safe checkpoint/runtime recovery reasons."""
+        if self.turn_lifecycle is None:
+            return ()
+        async with _lease_session(self.session_lifecycle, session_id):
+            conversation = await self.conversations.get(session_id)
+            if conversation is None:
+                raise ConversationNotFoundError(session_id)
+            turns = await self.turn_lifecycle.list_recoverable(session_id)
+            async with _lease_runtime(self.runtime) as runtime:
+                reason_reader = getattr(runtime, "recoverability_reason", None)
+                recoverable: list[RecoverableChatTurn] = []
+                for turn in turns:
+                    reason: str | None = None
+                    if not callable(getattr(runtime, "resume_turn", None)):
+                        reason = "runtime_recovery_unsupported"
+                    elif not callable(reason_reader):
+                        reason = "checkpoint_boundary_unavailable"
+                    else:
+                        reason = await reason_reader(session_id, turn.turn_id)
+                    tool_reason_reader = getattr(runtime, "recovery_tool_reason", None)
+                    if reason is None and callable(tool_reason_reader):
+                        reason = await tool_reason_reader(
+                            session_id,
+                            turn.turn_id,
+                            task_lifecycle=self.task_lifecycle,
+                        )
+                    recoverable.append(
+                        RecoverableChatTurn(
+                            turn_id=turn.turn_id,
+                            started_at=turn.started_at,
+                            recoverable=reason is None,
+                            reason_code=reason,
+                        )
+                    )
+                return tuple(recoverable)
+
+    async def resume_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        confirmation_provider: AsyncConfirmationProvider | None = None,
+    ) -> ChatTurnResult:
+        """Explicitly claim and resume an interrupted Runtime-native Chat Turn."""
+        if self.turn_lifecycle is None:
+            raise RuntimeError("Chat Turn recovery persistence is not configured.")
+        async with _lease_session(self.session_lifecycle, session_id):
+            conversation = await self.conversations.get(session_id)
+            if conversation is None:
+                raise ConversationNotFoundError(session_id)
+            turns = await self.turn_lifecycle.list_recoverable(session_id)
+            turn = next((item for item in turns if item.turn_id == turn_id), None)
+            if turn is None:
+                raise ValueError(
+                    "Chat Turn is missing, belongs to another Session, or is not interrupted."
+                )
+            async with _lease_runtime(self.runtime) as runtime:
+                resume = getattr(runtime, "resume_turn", None)
+                recover_user_message = getattr(runtime, "recoverable_user_message", None)
+                reason_reader = getattr(runtime, "recoverability_reason", None)
+                if not callable(resume) or not callable(recover_user_message):
+                    raise ValueError("The active Runtime does not support Chat Turn recovery.")
+                if not callable(reason_reader):
+                    raise ValueError("The active Runtime cannot validate the checkpoint boundary.")
+                reason = await reason_reader(session_id, turn_id)
+                if reason is not None:
+                    raise ValueError(f"Chat Turn checkpoint is not recoverable: {reason}.")
+                tool_reason_reader = getattr(runtime, "recovery_tool_reason", None)
+                if callable(tool_reason_reader):
+                    tool_reason = await tool_reason_reader(
                         session_id,
+                        turn_id,
+                        task_lifecycle=self.task_lifecycle,
+                    )
+                    if tool_reason is not None:
+                        raise ValueError(f"Chat Turn tool recovery is not safe: {tool_reason}.")
+                original_message = await recover_user_message(session_id, turn_id)
+                budget = RequestBudget.start(BudgetContext(limits=self.budget_limits))
+                async with asyncio.timeout(self.budget_limits.timeout_seconds):
+                    context = await self.context_builder.build(
+                        session_id,
+                        query=original_message,
+                        state_reader=runtime,
+                    )
+                    context = context.model_copy(
+                        update={"request_id": turn_id, "budget": budget.snapshot()}
+                    )
+                    request_context = RequestContext(
+                        snapshot=context,
+                        budget=budget,
+                        sandbox_mode=conversation.sandbox_mode,
+                        confirmation_provider=confirmation_provider,
+                        task_lifecycle=self.task_lifecycle,
+                    )
+                    if not await self.turn_lifecycle.claim_recovery(turn_id, session_id):
+                        raise ValueError("Chat Turn is already claimed by another Runtime Host.")
+                    if (
+                        self.task_lifecycle is not None
+                        and not await self.task_lifecycle.claim_runtime_invocations(
+                            session_id, turn_id
+                        )
                     ):
-                        result = await resume(plan_run_id, request_context)
-                        if not isinstance(result, SkillExecutionResult):
-                            raise TypeError("Runtime returned an invalid Plan recovery result.")
-                        return result
+                        raise ValueError("Chat Turn tool invocation journal could not be claimed.")
+                    started_at = perf_counter()
+                    try:
+                        async with self.turn_lifecycle.track_recovery(turn_id, session_id):
+                            try:
+                                async with self._sandbox_mode_scope(conversation.sandbox_mode):
+                                    response = await resume(turn_id, request_context)
+                            except ToolConfirmationDeniedError as error:
+                                if error.decision in {
+                                    ConfirmationDecision.REJECTED,
+                                    ConfirmationDecision.CANCELLED,
+                                }:
+                                    raise TurnRecoveryCancelled(error) from error
+                                raise
+                    except TurnRecoveryCancelled as error:
+                        if isinstance(error.cause, BaseException):
+                            raise error.cause from error
+                        raise
+                    if not isinstance(response, ChatAgentResponse):
+                        raise TypeError("Runtime returned an invalid Chat Turn recovery response.")
+                    assistant_message = self.output_processor.process(response.content)
+                    await self.conversations.touch(session_id)
+                    try:
+                        request_trace = TraceContext(trace_id=UUID(turn_id))
+                    except ValueError:
+                        request_trace = TraceContext()
+                    if response.token_usage is not None:
+                        self.cost_sink.record(
+                            CostEvent(
+                                trace_id=request_trace.trace_id,
+                                component="model",
+                                unit=CostUnit.TOKEN,
+                                quantity=Decimal(response.token_usage.total_tokens),
+                            )
+                        )
+                        if not response.budget_usage_accounted:
+                            budget.consume_tokens(response.token_usage.total_tokens)
+                    self._record_completed_trace(
+                        route=(response.route or Route.DIRECT).value,
+                        total_tokens=(
+                            response.token_usage.total_tokens
+                            if response.token_usage is not None
+                            else None
+                        ),
+                        duration_ms=int((perf_counter() - started_at) * 1000),
+                        trace_context=request_trace,
+                    )
+                    return ChatTurnResult(
+                        session_id=session_id,
+                        request_id=turn_id,
+                        assistant_message=assistant_message,
+                        route=response.route or Route.DIRECT,
+                        clarification_prompt=response.clarification_prompt,
+                        token_usage=response.token_usage,
+                    )
 
     async def _send_leased(
         self,
         session_id: str,
         message: str,
         *,
+        sandbox_mode: SandboxMode,
         confirmation_provider: AsyncConfirmationProvider | None,
         task_cache_approval_provider: TaskCacheApprovalProvider | None,
     ) -> ChatTurnResult:
@@ -229,6 +408,7 @@ class ChatService:
                 request_context = RequestContext(
                     snapshot=context,
                     budget=budget,
+                    sandbox_mode=sandbox_mode,
                     confirmation_provider=confirmation_provider,
                     task_cache_approval_provider=task_cache_approval_provider,
                     task_lifecycle=self.task_lifecycle,
@@ -252,6 +432,17 @@ class ChatService:
                     message,
                     started_at,
                 )
+
+    @asynccontextmanager
+    async def _sandbox_mode_scope(self, mode: SandboxMode) -> AsyncIterator[None]:
+        """Bind a Session mode through ToolFacade or the local request context."""
+        scope = getattr(self.tool_provider, "sandbox_mode_scope", None)
+        if callable(scope):
+            async with scope(mode):
+                yield
+            return
+        with bind_sandbox_mode(mode):
+            yield
 
     async def _execute_turn(
         self,
@@ -292,7 +483,9 @@ class ChatService:
                     budget.consume_tokens(token_usage.total_tokens)
         elif decision.route is Route.CLARIFY:
             assistant_message = decision.clarification_prompt or "Please clarify your request."
-            await runtime.record_turn(session_id, message, assistant_message)
+            await _record_chat_turn(
+                runtime, session_id, message, assistant_message, context.request_id
+            )
         elif decision.route is Route.TOOL_CALL:
             if self.tool_provider is None or decision.tool_name is None:
                 raise UnsupportedRouteError(decision.route.value)
@@ -303,7 +496,9 @@ class ChatService:
                     budget=budget,
                     confirmation_provider=confirmation_provider,
                 )
-            await runtime.record_turn(session_id, message, assistant_message)
+            await _record_chat_turn(
+                runtime, session_id, message, assistant_message, context.request_id
+            )
         else:
             raise UnsupportedRouteError(decision.route.value)
         assistant_message = self.output_processor.process(assistant_message)
@@ -488,6 +683,26 @@ async def _lease_runtime(runtime: ChatAgentRuntime) -> AsyncIterator[ChatAgentRu
             yield cast(ChatAgentRuntime, leased_runtime)
         return
     yield runtime
+
+
+async def _record_chat_turn(
+    runtime: ChatAgentRuntime,
+    session_id: str,
+    user_message: str,
+    assistant_message: str,
+    turn_id: str,
+) -> None:
+    """Persist route-only turns with a Turn association when the Runtime supports it."""
+    record_associated = getattr(runtime, "record_associated_turn", None)
+    if callable(record_associated):
+        await record_associated(
+            session_id,
+            user_message,
+            assistant_message,
+            turn_id=turn_id,
+        )
+        return
+    await runtime.record_turn(session_id, user_message, assistant_message)
 
 
 @asynccontextmanager

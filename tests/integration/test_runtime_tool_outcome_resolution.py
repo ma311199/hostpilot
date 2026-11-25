@@ -183,6 +183,7 @@ def test_checkpoint_persisted_before_ack_loss_is_reconciled_without_overwrite(tm
             role=ModelRole.TOOL,
             content="external write completed",
             tool_call_id="write-call",
+            turn_id="turn-1",
         )
         host_store = SQLiteTurnStore(database_path)
         await host_store.release_host("host-before-restart", now=datetime.now(UTC))

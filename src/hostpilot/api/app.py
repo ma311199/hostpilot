@@ -82,12 +82,17 @@ from hostpilot.observability import (
 from hostpilot.orchestration import (
     ChatAgentRuntime,
     ChatService,
-    create_configured_chat_agent_runtime,
 )
 from hostpilot.orchestration.application_stores_host_plugin import (
     ApplicationStoresHostPlugin,
 )
 from hostpilot.orchestration.chat import RequestTooLargeError, UnsupportedRouteError
+from hostpilot.orchestration.chat_runtime_assembly_host_plugin import (
+    CHAT_RUNTIME_ASSEMBLY_SERVICE_ID,
+    ChatRuntimeAssembly,
+    ChatRuntimeAssemblyHostPlugin,
+    ChatRuntimeAssemblyRequest,
+)
 from hostpilot.orchestration.configuration_stores_host_plugin import (
     ConfigurationStoresHostPlugin,
 )
@@ -157,7 +162,7 @@ from hostpilot.policy.confirmation import ConfirmationDecision, ConfirmationRequ
 from hostpilot.routing import CommandRouter, Router
 from hostpilot.runtime import RuntimeContext, RuntimeHost
 from hostpilot.runtime.context import TaskCacheApprovalRequest, TaskCacheDecision
-from hostpilot.sandbox import SandboxBackendFactory, SandboxBackendSet, sandbox_mode_scope
+from hostpilot.sandbox import SandboxBackendFactory, SandboxBackendSet
 from hostpilot.skills.plan_plugins import PlanComponentRegistry
 from hostpilot.tools.executor import (
     AsyncConfirmationProvider,
@@ -216,6 +221,16 @@ class PlanResumeSocketRequest(BaseModel):
     plan_run_id: str = Field(min_length=1, max_length=128)
 
 
+class TurnResumeSocketRequest(BaseModel):
+    """Explicit recovery request for one interrupted Runtime Chat Turn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str = Field(pattern="^turn.resume$")
+    session_id: str = Field(min_length=1, max_length=64)
+    turn_id: str = Field(min_length=1, max_length=128)
+
+
 class ToolConfirmationDecisionRequest(BaseModel):
     """One explicit response to an outstanding high-impact tool proposal."""
 
@@ -236,6 +251,10 @@ class PlanTaskCacheDecisionRequest(BaseModel):
     decision: TaskCacheDecision
 
 
+class WebSocketDisconnectCancellation(asyncio.CancelledError):
+    """Signal that a client disconnect cancelled a pending WebSocket operation."""
+
+
 class WebSocketConfirmationProvider(AsyncConfirmationProvider):
     """Pause a chat turn and ask its connected browser to approve a tool call."""
 
@@ -249,17 +268,17 @@ class WebSocketConfirmationProvider(AsyncConfirmationProvider):
             return await self._confirm_locked(request)
 
     async def _confirm_locked(self, request: ConfirmationRequest) -> ConfirmationDecision:
-        await self.websocket.send_json(
-            {
-                "type": "tool.confirmation.request",
-                "data": {
-                    "request_id": request.request_id,
-                    "tool_name": request.tool_name,
-                    "summary": request.summary,
-                },
-            }
-        )
         try:
+            await self.websocket.send_json(
+                {
+                    "type": "tool.confirmation.request",
+                    "data": {
+                        "request_id": request.request_id,
+                        "tool_name": request.tool_name,
+                        "summary": request.summary,
+                    },
+                }
+            )
             async with asyncio.timeout(CHAT_CONFIRMATION_TIMEOUT_SECONDS):
                 while True:
                     raw_message = await self.websocket.receive_text()
@@ -274,7 +293,7 @@ class WebSocketConfirmationProvider(AsyncConfirmationProvider):
         except TimeoutError:
             return ConfirmationDecision.TIMED_OUT
         except WebSocketDisconnect:
-            return ConfirmationDecision.CANCELLED
+            raise WebSocketDisconnectCancellation from None
 
 
 class WebSocketTaskCacheApprovalProvider:
@@ -286,37 +305,37 @@ class WebSocketTaskCacheApprovalProvider:
 
     async def decide(self, request: TaskCacheApprovalRequest) -> TaskCacheDecision | None:
         async with self._decision_lock:
-            await self.websocket.send_json(
-                {
-                    "type": "plan.task.cache.request",
-                    "data": {
-                        "request_id": request.request_id,
-                        "task_id": request.task_id,
-                        "description": request.description,
-                        "source_turn_id": request.source_turn_id,
-                        "finished_at": request.finished_at.isoformat(),
-                        "output": request.output,
-                        "execution_summary": (
-                            {
-                                "tools": [
-                                    {
-                                        "tool_id": usage.tool_id,
-                                        "call_count": usage.call_count,
-                                        "side_effect_level": usage.side_effect_level,
-                                    }
-                                    for usage in request.execution_summary.tools
-                                ],
-                                "confirmation_decisions": list(
-                                    request.execution_summary.confirmation_decisions
-                                ),
-                            }
-                            if request.execution_summary is not None
-                            else None
-                        ),
-                    },
-                }
-            )
             try:
+                await self.websocket.send_json(
+                    {
+                        "type": "plan.task.cache.request",
+                        "data": {
+                            "request_id": request.request_id,
+                            "task_id": request.task_id,
+                            "description": request.description,
+                            "source_turn_id": request.source_turn_id,
+                            "finished_at": request.finished_at.isoformat(),
+                            "output": request.output,
+                            "execution_summary": (
+                                {
+                                    "tools": [
+                                        {
+                                            "tool_id": usage.tool_id,
+                                            "call_count": usage.call_count,
+                                            "side_effect_level": usage.side_effect_level,
+                                        }
+                                        for usage in request.execution_summary.tools
+                                    ],
+                                    "confirmation_decisions": list(
+                                        request.execution_summary.confirmation_decisions
+                                    ),
+                                }
+                                if request.execution_summary is not None
+                                else None
+                            ),
+                        },
+                    }
+                )
                 async with asyncio.timeout(CHAT_CONFIRMATION_TIMEOUT_SECONDS):
                     while True:
                         raw_message = await self.websocket.receive_text()
@@ -331,7 +350,7 @@ class WebSocketTaskCacheApprovalProvider:
             except TimeoutError:
                 return None
             except WebSocketDisconnect as error:
-                raise asyncio.CancelledError from error
+                raise WebSocketDisconnectCancellation from error
 
 
 class CreateConversationRequest(BaseModel):
@@ -348,28 +367,6 @@ class SandboxUpgradeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     target_mode: SandboxMode
-
-
-def _set_runtime_sandbox_mode(application: FastAPI, mode: SandboxMode | None) -> None:
-    """Apply a chat mode to MCP handlers whose transport uses persistent server tasks."""
-    pending: list[Any] = [
-        getattr(application.state, "mcp_provider", None),
-        getattr(application.state, "tool_facade", None),
-        getattr(application.state, "chat_service", None),
-    ]
-    seen: set[int] = set()
-    while pending:
-        candidate = pending.pop()
-        if candidate is None or id(candidate) in seen:
-            continue
-        seen.add(id(candidate))
-        set_mode = getattr(candidate, "set_sandbox_mode", None)
-        if callable(set_mode):
-            set_mode(mode)
-        for attribute in ("provider", "tool_provider", "runtime", "_provider", "_runtime"):
-            nested = getattr(candidate, attribute, None)
-            if nested is not None:
-                pending.append(nested)
 
 
 class ModelConfigurationRequest(BaseModel):
@@ -834,6 +831,15 @@ class PlanRunResumeResponse(BaseModel):
     plan_run_id: str
     state: str
     status: str
+    reason_code: str | None = None
+
+
+class RecoverableChatTurnResponse(BaseModel):
+    """Safe recovery availability for one Session-scoped Chat Turn."""
+
+    turn_id: str
+    started_at: datetime
+    recoverable: bool
     reason_code: str | None = None
 
 
@@ -1704,9 +1710,11 @@ async def chat_websocket(websocket: WebSocket) -> None:
             try:
                 raw_body = json.loads(raw_message)
                 if isinstance(raw_body, dict) and raw_body.get("type") == "plan.resume":
-                    body: ChatSocketRequest | PlanResumeSocketRequest = (
+                    body: ChatSocketRequest | PlanResumeSocketRequest | TurnResumeSocketRequest = (
                         PlanResumeSocketRequest.model_validate(raw_body)
                     )
+                elif isinstance(raw_body, dict) and raw_body.get("type") == "turn.resume":
+                    body = TurnResumeSocketRequest.model_validate(raw_body)
                 else:
                     body = ChatSocketRequest.model_validate(raw_body)
             except (ValidationError, ValueError, json.JSONDecodeError):
@@ -1723,35 +1731,37 @@ async def chat_websocket(websocket: WebSocket) -> None:
                 continue
             try:
                 async with websocket.scope["app"].state.model_components_lock:
-                    conversation = await websocket.scope["app"].state.conversations.get(
-                        body.session_id
-                    )
-                    if conversation is None:
-                        raise ConversationNotFoundError(body.session_id)
-                    _set_runtime_sandbox_mode(websocket.scope["app"], conversation.sandbox_mode)
-                    try:
-                        with sandbox_mode_scope(conversation.sandbox_mode):
-                            if isinstance(body, PlanResumeSocketRequest):
-                                plan_result = await chat_service.resume_plan_run(
-                                    body.session_id,
-                                    body.plan_run_id,
-                                    confirmation_provider=WebSocketConfirmationProvider(websocket),
-                                )
-                            else:
-                                chat_result = await chat_service.send(
-                                    body.session_id,
-                                    body.message,
-                                    confirmation_provider=WebSocketConfirmationProvider(websocket),
-                                    task_cache_approval_provider=(
-                                        WebSocketTaskCacheApprovalProvider(websocket)
-                                    ),
-                                )
-                    finally:
-                        _set_runtime_sandbox_mode(websocket.scope["app"], None)
+                    if isinstance(body, PlanResumeSocketRequest):
+                        plan_result = await chat_service.resume_plan_run(
+                            body.session_id,
+                            body.plan_run_id,
+                            confirmation_provider=WebSocketConfirmationProvider(websocket),
+                        )
+                    elif isinstance(body, TurnResumeSocketRequest):
+                        chat_result = await chat_service.resume_turn(
+                            body.session_id,
+                            body.turn_id,
+                            confirmation_provider=WebSocketConfirmationProvider(websocket),
+                        )
+                    else:
+                        chat_result = await chat_service.send(
+                            body.session_id,
+                            body.message,
+                            confirmation_provider=WebSocketConfirmationProvider(websocket),
+                            task_cache_approval_provider=(
+                                WebSocketTaskCacheApprovalProvider(websocket)
+                            ),
+                        )
             except RequestTooLargeError:
                 code = "message_too_large"
-            except (ConversationNotFoundError, SessionUnavailableError, ValueError):
+            except (ConversationNotFoundError, SessionUnavailableError):
                 code = "conversation_not_found"
+            except ValueError:
+                code = (
+                    "turn_not_recoverable"
+                    if isinstance(body, TurnResumeSocketRequest)
+                    else "conversation_not_found"
+                )
             except BudgetExceededError:
                 code = "budget_exceeded"
             except ToolConfirmationDeniedError as error:
@@ -1795,6 +1805,19 @@ async def chat_websocket(websocket: WebSocket) -> None:
                         }
                     )
                     continue
+                if isinstance(body, TurnResumeSocketRequest):
+                    await websocket.send_json(
+                        {
+                            "type": "turn.resume.response",
+                            "data": {
+                                "turn_id": body.turn_id,
+                                "status": "completed",
+                                "assistant_message": chat_result.assistant_message,
+                                "reason_code": None,
+                            },
+                        }
+                    )
+                    continue
                 await websocket.send_json(
                     {
                         "type": "chat.response",
@@ -1810,6 +1833,8 @@ async def chat_websocket(websocket: WebSocket) -> None:
                 )
                 continue
             await websocket.send_json({"type": "chat.error", "data": {"code": code}})
+    except WebSocketDisconnectCancellation:
+        return
     except WebSocketDisconnect:
         return
 
@@ -2057,15 +2082,7 @@ async def send_message(
         )
     try:
         async with request.app.state.model_components_lock:
-            conversation = await request.app.state.conversations.get(session_id)
-            if conversation is None:
-                raise ConversationNotFoundError(session_id)
-            _set_runtime_sandbox_mode(request.app, conversation.sandbox_mode)
-            try:
-                with sandbox_mode_scope(conversation.sandbox_mode):
-                    result = await chat_service.send(session_id, body.message)
-            finally:
-                _set_runtime_sandbox_mode(request.app, None)
+            result = await chat_service.send(session_id, body.message)
     except RequestTooLargeError as error:
         raise HTTPException(status_code=413, detail=str(error)) from error
     except OutputValidationError as error:
@@ -2220,6 +2237,38 @@ async def get_messages(
     except (ConversationNotFoundError, ValueError) as error:
         raise HTTPException(status_code=404, detail="Conversation not found.") from error
     return ConversationHistoryResponse(conversation=conversation, messages=messages)
+
+
+@router.get(
+    "/conversations/{session_id}/turns/recoverable",
+    response_model=tuple[RecoverableChatTurnResponse, ...],
+    tags=["chat", "recovery"],
+)
+async def list_recoverable_chat_turns(
+    session_id: str,
+    request: Request,
+) -> tuple[RecoverableChatTurnResponse, ...]:
+    """List safe Turn lifecycle metadata without checkpoint or tool contents."""
+    chat_service: ChatService | None = request.app.state.chat_service
+    if chat_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Agent runtime is not configured; select a model provider first.",
+        )
+    try:
+        async with request.app.state.model_components_lock:
+            turns = await chat_service.list_recoverable_turns(session_id)
+    except (ConversationNotFoundError, SessionUnavailableError) as error:
+        raise HTTPException(status_code=404, detail="Conversation not found.") from error
+    return tuple(
+        RecoverableChatTurnResponse(
+            turn_id=turn.turn_id,
+            started_at=turn.started_at,
+            recoverable=turn.recoverable,
+            reason_code=turn.reason_code,
+        )
+        for turn in turns
+    )
 
 
 @router.get(
@@ -2500,6 +2549,9 @@ def create_app(
         tool_governance_plugin: ToolGovernanceHostPlugin = application.state.tool_governance_plugin
         chat_agent_runtime_plugin: ChatAgentRuntimeHostPlugin = (
             application.state.chat_agent_runtime_plugin
+        )
+        chat_runtime_assembly: ChatRuntimeAssembly = runtime_context.services.resolve(
+            CHAT_RUNTIME_ASSEMBLY_SERVICE_ID
         )
         routing_models_plugin: RoutingModelsHostPlugin = application.state.routing_models_plugin
         services = runtime_context.services
@@ -2898,18 +2950,14 @@ def create_app(
                         raise RuntimeError(
                             "A custom runtime factory cannot be rebuilt dynamically."
                         )
-                    candidate_chat_agent_runtime = create_configured_chat_agent_runtime(
-                        candidate_settings,
-                        checkpointer=hosted_checkpointer(),
-                        tools=candidate_tools,
-                        tool_provider=candidate_facade,
-                        memory_controller=memory_controller,
-                        cancellation_sink=cancellation_store,
-                        skill_execution_modes=saved_skill_execution_modes,
-                        trace_sink=trace_store,
-                        plan_component_registry=plan_component_registry,
-                        chat_agent_runtime_registry=chat_agent_runtime_registry,
-                        model_provider_registry=model_provider_registry,
+                    candidate_chat_agent_runtime = chat_runtime_assembly.build_candidate(
+                        ChatRuntimeAssemblyRequest(
+                            settings=candidate_settings,
+                            tools=candidate_tools,
+                            tool_provider=candidate_facade,
+                            memory_controller=memory_controller,
+                            skill_execution_modes=saved_skill_execution_modes,
+                        )
                     )
             except Exception:
                 application.state.mcp_connection_status = candidate_facade.connections()
@@ -3485,18 +3533,14 @@ def create_app(
             candidate_facade = ToolFacade(candidate_provider)
             try:
                 candidate_tools = await candidate_provider.start()
-                candidate_chat_agent_runtime = create_configured_chat_agent_runtime(
-                    candidate_settings,
-                    checkpointer=hosted_checkpointer(),
-                    tools=candidate_tools,
-                    tool_provider=candidate_facade,
-                    memory_controller=memory_controller,
-                    cancellation_sink=cancellation_store,
-                    skill_execution_modes=saved_skill_execution_modes,
-                    trace_sink=trace_store,
-                    plan_component_registry=plan_component_registry,
-                    chat_agent_runtime_registry=chat_agent_runtime_registry,
-                    model_provider_registry=model_provider_registry,
+                candidate_chat_agent_runtime = chat_runtime_assembly.build_candidate(
+                    ChatRuntimeAssemblyRequest(
+                        settings=candidate_settings,
+                        tools=candidate_tools,
+                        tool_provider=candidate_facade,
+                        memory_controller=memory_controller,
+                        skill_execution_modes=saved_skill_execution_modes,
+                    )
                 )
                 if (
                     routing_model_components is not None
@@ -3589,18 +3633,14 @@ def create_app(
             await chat_agent_runtime_plugin.replace(runtime)
         elif app_settings.model_name and app_settings.model_api_key:
             mcp_tools = await mcp_provider.start()
-            runtime = create_configured_chat_agent_runtime(
-                startup_settings,
-                checkpointer=hosted_checkpointer(),
-                tools=mcp_tools,
-                tool_provider=tool_facade,
-                memory_controller=memory_controller,
-                cancellation_sink=cancellation_store,
-                skill_execution_modes=saved_skill_execution_modes,
-                trace_sink=trace_store,
-                plan_component_registry=plan_component_registry,
-                chat_agent_runtime_registry=chat_agent_runtime_registry,
-                model_provider_registry=model_provider_registry,
+            runtime = chat_runtime_assembly.build_candidate(
+                ChatRuntimeAssemblyRequest(
+                    settings=startup_settings,
+                    tools=mcp_tools,
+                    tool_provider=tool_facade,
+                    memory_controller=memory_controller,
+                    skill_execution_modes=saved_skill_execution_modes,
+                )
             )
             await chat_agent_runtime_plugin.replace(runtime)
         elif startup_settings.mcp_servers:
@@ -3669,6 +3709,11 @@ def create_app(
             tool_outcome_store_factory=tool_outcome_store_factory or SQLiteToolOutcomeStore,
         )
         chat_agent_runtime_plugin = ChatAgentRuntimeHostPlugin()
+        chat_runtime_assembly_plugin = ChatRuntimeAssemblyHostPlugin(
+            plan_component_registry=plan_component_registry,
+            chat_agent_runtime_registry=chat_agent_runtime_registry,
+            model_provider_registry=model_provider_registry,
+        )
         runtime_host.register_plugin(configuration_plugin)
         runtime_host.register_plugin(application_stores_plugin)
         runtime_host.register_plugin(routing_models_plugin)
@@ -3677,11 +3722,13 @@ def create_app(
         runtime_host.register_plugin(tool_governance_plugin)
         runtime_host.register_plugin(state_services_plugin)
         runtime_host.register_plugin(chat_agent_runtime_plugin)
+        runtime_host.register_plugin(chat_runtime_assembly_plugin)
         application.state.runtime_host = runtime_host
         application.state.mcp_provider_plugin = mcp_provider_plugin
         application.state.tool_governance_plugin = tool_governance_plugin
         application.state.routing_models_plugin = routing_models_plugin
         application.state.chat_agent_runtime_plugin = chat_agent_runtime_plugin
+        application.state.chat_runtime_assembly_plugin = chat_runtime_assembly_plugin
         try:
             await runtime_host.start()
             runtime_host.create_task(

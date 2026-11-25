@@ -264,6 +264,10 @@ class RuntimeExecutionRequest:
     task_run_id: str | None = None
     task_id: str = "runtime_chat"
     tool_call_index_start: int = 1
+    recovery_tool_call_ids: Mapping[tuple[str, str], str | tuple[str, ...]] = field(
+        default_factory=dict
+    )
+    claimed_recovery_outcome_ids: frozenset[str] = frozenset()
     require_tool_invocation_journal: bool = False
     message_sink: RuntimeExecutionMessageSink | None = None
 
@@ -280,6 +284,11 @@ class RuntimeExecutionRequest:
         idempotency_business_fields = {
             tool_id: tuple(fields) for tool_id, fields in self.idempotency_business_fields.items()
         }
+        recovery_tool_call_ids = {
+            key: (value,) if isinstance(value, str) else tuple(value)
+            for key, value in self.recovery_tool_call_ids.items()
+        }
+        claimed_recovery_outcome_ids = frozenset(self.claimed_recovery_outcome_ids)
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "allowed_tool_ids", allowed_tool_ids)
@@ -288,6 +297,8 @@ class RuntimeExecutionRequest:
         object.__setattr__(self, "tool_retry_classes", tool_retry_classes)
         object.__setattr__(self, "idempotency_windows", idempotency_windows)
         object.__setattr__(self, "idempotency_business_fields", idempotency_business_fields)
+        object.__setattr__(self, "recovery_tool_call_ids", recovery_tool_call_ids)
+        object.__setattr__(self, "claimed_recovery_outcome_ids", claimed_recovery_outcome_ids)
 
         if not messages:
             raise ValueError("Runtime execution requires at least one message.")
@@ -332,6 +343,20 @@ class RuntimeExecutionRequest:
             or self.tool_call_index_start < 1
         ):
             raise ValueError("Runtime tool call index must be a positive integer.")
+        if any(
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or not all(isinstance(value, str) for value in key)
+            or not isinstance(call_ids, tuple)
+            or not call_ids
+            or any(not isinstance(call_id, str) or not call_id for call_id in call_ids)
+            for key, call_ids in recovery_tool_call_ids.items()
+        ):
+            raise ValueError("Runtime recovery call IDs must map canonical tool calls to IDs.")
+        if any(
+            not isinstance(call_id, str) or not call_id for call_id in claimed_recovery_outcome_ids
+        ):
+            raise ValueError("Runtime recovery outcome IDs must be non-empty text.")
         if self.require_tool_invocation_journal and self.tool_invocations is None:
             raise ValueError("Runtime execution requires a durable tool invocation journal.")
         if self.message_sink is not None and not callable(self.message_sink):

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from typing import Any, Protocol, cast
 
 from hostpilot.budget import RequestBudget
@@ -12,6 +14,7 @@ from hostpilot.contracts import (
     ToolDescriptor,
     ToolRetryClass,
 )
+from hostpilot.sandbox import sandbox_mode_scope
 from hostpilot.tools.executor import AsyncConfirmationProvider
 from hostpilot.tools.registry import ToolRegistry
 
@@ -51,6 +54,7 @@ class ToolFacade:
 
     def __init__(self, provider: ToolInvoker) -> None:
         self._provider = provider
+        self._sandbox_mode_lock = asyncio.Lock()
 
     def descriptors(self) -> tuple[ToolDescriptor, ...]:
         """Return safe descriptors for tools currently registered by the adapter."""
@@ -68,6 +72,17 @@ class ToolFacade:
         set_mode = getattr(self._provider, "set_sandbox_mode", None)
         if callable(set_mode):
             set_mode(mode)
+
+    @asynccontextmanager
+    async def sandbox_mode_scope(self, mode: SandboxMode) -> AsyncIterator[None]:
+        """Bind and restore one request's Sandbox mode across the tool provider."""
+        async with self._sandbox_mode_lock:
+            with sandbox_mode_scope(mode):
+                try:
+                    self.set_sandbox_mode(mode)
+                    yield
+                finally:
+                    self.set_sandbox_mode(None)
 
     async def call_tool(
         self,

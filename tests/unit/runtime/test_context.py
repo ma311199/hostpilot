@@ -1,5 +1,5 @@
 from hostpilot.budget import RequestBudget
-from hostpilot.contracts import BudgetContext, BudgetLimits, ContextSnapshot
+from hostpilot.contracts import BudgetContext, BudgetLimits, ContextSnapshot, SandboxMode
 from hostpilot.runtime import RequestContext
 
 
@@ -42,3 +42,27 @@ def test_request_context_keeps_request_data_separate() -> None:
     assert first.budget is not second.budget
     assert first.snapshot.request_id == "request-1"
     assert second.snapshot.request_id == "request-2"
+
+
+def test_request_context_carries_sandbox_mode_outside_snapshot() -> None:
+    snapshot = ContextSnapshot(request_id="request-1", session_id="session-1")
+    default_request = RequestContext(snapshot=snapshot, budget=_budget())
+    writable_request = RequestContext(
+        snapshot=snapshot,
+        budget=_budget(),
+        sandbox_mode=SandboxMode.WORKSPACE_WRITE,
+    )
+
+    assert default_request.sandbox_mode is SandboxMode.READ_ONLY
+    assert writable_request.sandbox_mode is SandboxMode.WORKSPACE_WRITE
+    assert "sandbox_mode" not in ContextSnapshot.model_fields
+
+
+def test_request_context_preserves_positional_confirmation_provider() -> None:
+    snapshot = ContextSnapshot(request_id="request-1", session_id="session-1")
+    approval = object()
+
+    request = RequestContext(snapshot, _budget(), approval)
+
+    assert request.confirmation_provider is approval
+    assert request.sandbox_mode is SandboxMode.READ_ONLY

@@ -77,3 +77,23 @@ def test_session_adapter_appends_normalized_messages_to_the_session() -> None:
     assert graph.messages[1].tool_calls[0]["id"] == "call-1"
     assert graph.messages[2].tool_call_id == "call-1"
     assert graph.updated[0][0]["configurable"]["thread_id"] == SESSION_ID
+
+
+def test_session_adapter_preserves_turn_association_through_checkpoint() -> None:
+    graph = FakeGraph()
+    adapter = LangGraphRuntimeSessionStateAdapter(graph)
+    messages = (
+        ModelMessage(role=ModelRole.USER, content="继续工作", turn_id="turn-7"),
+        ModelMessage(
+            role=ModelRole.ASSISTANT,
+            content="处理中",
+            turn_id="turn-7",
+            tool_calls=(ModelToolCall("call-7", "search", {"q": "x"}),),
+        ),
+    )
+
+    asyncio.run(adapter.append_messages(SESSION_ID, messages))
+    restored = asyncio.run(adapter.load_messages(SESSION_ID))
+
+    assert tuple(message.turn_id for message in restored) == ("turn-7", "turn-7")
+    assert restored[1].tool_calls == messages[1].tool_calls

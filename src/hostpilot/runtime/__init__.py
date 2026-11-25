@@ -15,7 +15,11 @@ from hostpilot.runtime.execution import (
     RuntimeToolOutcomePort,
     RuntimeToolPort,
     RuntimeToolReplay,
+    ToolInvocationRecoveryAction,
+    ToolInvocationRecoveryDecision,
+    decide_tool_invocation_recovery,
     runtime_tool_call_key,
+    stable_tool_invocation_identity,
 )
 from hostpilot.runtime.execution_loop import (
     DefaultRuntimeExecutionLoop,
@@ -40,6 +44,7 @@ from hostpilot.runtime.lifecycle import (
     ToolOutcomeLifecycleManager,
     TurnLifecycleManager,
     TurnRecord,
+    TurnRecoveryCancelled,
     TurnState,
 )
 
@@ -66,11 +71,16 @@ __all__ = [
     "RuntimeSkillPort",
     "RuntimeToolPort",
     "RuntimeToolReplay",
+    "ToolInvocationRecoveryAction",
+    "ToolInvocationRecoveryDecision",
+    "decide_tool_invocation_recovery",
+    "stable_tool_invocation_identity",
     "RuntimeToolOutcomePort",
     "RuntimeToolInvocationPort",
     "runtime_tool_call_key",
     "RuntimeToolProposalError",
     "TurnLifecycleManager",
+    "TurnRecoveryCancelled",
     "TurnRecord",
     "TurnState",
     "TaskLifecycleManager",

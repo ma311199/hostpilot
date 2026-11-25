@@ -47,6 +47,7 @@ from hostpilot.persistence.ports import (
     SessionLifecycleStoreFactory,
     SkillExecutionStore,
     SkillExecutionStoreFactory,
+    StoredTurn,
     TaskStore,
     TaskStoreFactory,
     ToolOutcomeStore,
@@ -75,7 +76,7 @@ from hostpilot.persistence.skill_execution import (
 from hostpilot.persistence.tasks import SQLiteTaskStore, StoredTaskRun
 from hostpilot.persistence.tool_outcomes import SQLiteToolOutcomeStore
 from hostpilot.persistence.traces import SQLiteTraceStore, StoredTraceEvent, TraceSummary
-from hostpilot.persistence.turns import SQLiteTurnStore, StoredTurn
+from hostpilot.persistence.turns import SQLiteTurnStore
 from hostpilot.persistence.workspace_configuration import SQLiteWorkspaceConfigurationStore
 from hostpilot.task_results import (
     CompletedPlanTaskResult,

@@ -34,6 +34,20 @@ export interface PlanRunResumeResponse {
   reason_code: string | null
 }
 
+export interface RecoverableChatTurn {
+  turn_id: string
+  started_at: string
+  recoverable: boolean
+  reason_code: string | null
+}
+
+export interface ChatTurnResumeResponse {
+  turn_id: string
+  status: string
+  assistant_message?: string
+  reason_code: string | null
+}
+
 export interface PendingToolOutcome {
   tool_call_id: string
   tool_name: string
@@ -159,6 +173,12 @@ export function resolveToolOutcome(
 export function listRecoverablePlanRuns(sessionId: string): Promise<RecoverablePlanRun[]> {
   return request<RecoverablePlanRun[]>(
     `/conversations/${encodeURIComponent(sessionId)}/plan-runs/recoverable`,
+  )
+}
+
+export function listRecoverableChatTurns(sessionId: string): Promise<RecoverableChatTurn[]> {
+  return request<RecoverableChatTurn[]>(
+    `/conversations/${encodeURIComponent(sessionId)}/turns/recoverable`,
   )
 }
 

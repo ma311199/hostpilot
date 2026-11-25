@@ -74,7 +74,7 @@ HOSTPILOT_PLAN_VERIFIER_PLUGIN=builtin.llm
 HOSTPILOT_PLAN_REPLANNER_PLUGIN=builtin.llm
 ```
 
-自定义工厂由应用启动代码注册，再将注册表传给 `create_app` 或 `create_configured_chat_agent_runtime`。插件接口版本当前为 `1.0`。插件可访问启动时注入的依赖，因此必须是受信任的 Python 代码并遵守 HostPilot 的策略、预算、审批、取消、补偿和审计契约；注册表不提供进程隔离。当前不支持任意模块路径导入或热加载。
+自定义 Chat Runtime 通过 `chat_agent_runtime_registry` 注册，再将注册表传给 `create_app` 或兼容入口 `create_configured_chat_agent_runtime`。Chat Runtime 插件接口版本为 `2.0`；兼容工厂保留原导入路径和签名，并委托给 Runtime 装配使用的组合实现。插件可访问启动时注入的依赖，因此必须是受信任的 Python 代码并遵守 HostPilot 的策略、预算、审批、取消、补偿和审计契约；注册表不提供进程隔离。当前不支持任意模块路径导入或热加载。
 
 应用集成代码可从默认注册表派生，并只替换需要的角色：
 

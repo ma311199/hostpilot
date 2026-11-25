@@ -174,6 +174,53 @@ def test_task_lifecycle_exposes_plan_snapshot_persistence() -> None:
     assert calls[1][1]["runtime_host_id"] == "host-runtime"
 
 
+def test_task_lifecycle_lists_and_claims_runtime_invocations(tmp_path) -> None:
+    async def scenario():
+        database_path = tmp_path / "runtime.sqlite3"
+        turn_store = SQLiteTurnStore(database_path)
+        await turn_store.initialize()
+        now = datetime.now(UTC)
+        await turn_store.register_host(
+            "host-old", now=now, lease_expires_at=now + timedelta(seconds=1)
+        )
+        await turn_store.create_turn(
+            turn_id="turn-1", session_id="session-1", runtime_host_id="host-old", started_at=now
+        )
+        store = SQLiteTaskStore(database_path)
+        await store.record_runtime_tool_invocation(
+            invocation_id="call-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            runtime_host_id="host-old",
+            task_run_id=None,
+            task_id="runtime_chat",
+            call_index=1,
+            tool_id="write_text_file",
+            retry_class="idempotent_write",
+            idempotency_key="stable-1",
+            request_fingerprint="fingerprint-1",
+            arguments_json='{"text":"a"}',
+            idempotency_window_seconds=3600,
+            created_at=now,
+        )
+        await turn_store.register_host(
+            "host-new", now=now + timedelta(seconds=2), lease_expires_at=now + timedelta(minutes=1)
+        )
+        assert await turn_store.claim_interrupted_turn(
+            "turn-1", "session-1", "host-new", claimed_at=now + timedelta(seconds=2)
+        )
+        manager = TaskLifecycleManager(store=store, runtime_host_id="host-new")
+        records = await manager.list_runtime_tool_invocations("session-1", "turn-1")
+        claimed = await manager.claim_runtime_invocations("session-1", "turn-1")
+        refreshed = await manager.list_runtime_tool_invocations("session-1", "turn-1")
+        return records, claimed, refreshed
+
+    records, claimed, refreshed = asyncio.run(scenario())
+    assert records[0].runtime_host_id == "host-old"
+    assert claimed is True
+    assert refreshed[0].runtime_host_id == "host-new"
+
+
 def test_task_lifecycle_persists_cancellation(tmp_path) -> None:
     async def scenario():
         database_path = tmp_path / "runtime.sqlite3"

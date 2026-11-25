@@ -87,9 +87,32 @@ class TurnStore(Protocol):
         turn_id: str,
         *,
         runtime_host_id: str,
-        state: Literal["completed", "failed", "cancelled"],
+        state: Literal["completed", "failed", "cancelled", "interrupted"],
         finished_at: datetime,
     ) -> None: ...
+
+    async def list_interrupted_turns(self, session_id: str) -> tuple[StoredTurn, ...]: ...
+
+    async def claim_interrupted_turn(
+        self,
+        turn_id: str,
+        session_id: str,
+        runtime_host_id: str,
+        *,
+        claimed_at: datetime,
+    ) -> bool: ...
+
+
+@dataclass(frozen=True)
+class StoredTurn:
+    """Non-sensitive persisted lifecycle metadata for a single Turn."""
+
+    turn_id: str
+    session_id: str
+    runtime_host_id: str
+    state: str
+    started_at: datetime
+    finished_at: datetime | None
 
 
 TurnStoreFactory = Callable[[Path], TurnStore]
@@ -242,6 +265,14 @@ class TaskStore(Protocol):
         idempotency_window_seconds: int | None,
         created_at: datetime,
     ) -> None: ...
+
+    async def list_runtime_tool_invocations(
+        self, session_id: str, turn_id: str
+    ) -> tuple[ToolInvocationRecord, ...]: ...
+
+    async def claim_runtime_tool_invocations(
+        self, session_id: str, turn_id: str, *, runtime_host_id: str, now: datetime
+    ) -> bool: ...
 
     async def finish_tool_invocation(
         self,

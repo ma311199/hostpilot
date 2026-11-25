@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import AbstractAsyncContextManager
 from typing import Any, cast
 
-from hostpilot.contracts import ConversationMessage, SandboxMode
+from hostpilot.contracts import ConversationMessage
 from hostpilot.orchestration.runtime import ChatAgentResponse, ChatAgentRuntime
 from hostpilot.runtime import (
     AgentLifecycleManager,
@@ -66,23 +66,6 @@ class ChatAgentRuntimeHostPlugin:
             configure(self._tool_outcomes)
         await self._agents.replace(runtime)
 
-    def set_sandbox_mode(self, mode: SandboxMode | None) -> None:
-        """Forward request sandbox mode through the current Agent's tool providers."""
-        pending = [self._agents.current]
-        seen: set[int] = set()
-        while pending:
-            candidate = pending.pop()
-            if candidate is None or id(candidate) in seen:
-                continue
-            seen.add(id(candidate))
-            set_mode = getattr(candidate, "set_sandbox_mode", None)
-            if callable(set_mode):
-                set_mode(mode)
-            for attribute in ("provider", "tool_provider", "runtime", "_provider", "_runtime"):
-                nested = getattr(candidate, attribute, None)
-                if nested is not None:
-                    pending.append(nested)
-
     async def read_messages(self, session_id: str) -> tuple[ConversationMessage, ...]:
         async with self._agents.lease() as runtime:
             return await cast(ChatAgentRuntime, runtime).read_messages(session_id)
@@ -115,6 +98,24 @@ class ChatAgentRuntimeHostPlugin:
                 user_message,
                 assistant_message,
             )
+
+    async def record_associated_turn(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_message: str,
+        *,
+        turn_id: str,
+    ) -> None:
+        """Forward durable Turn association when the active Chat Runtime supports it."""
+        async with self._agents.lease() as runtime:
+            record = getattr(runtime, "record_associated_turn", None)
+            if not callable(record):
+                await cast(ChatAgentRuntime, runtime).record_turn(
+                    session_id, user_message, assistant_message
+                )
+                return
+            await record(session_id, user_message, assistant_message, turn_id=turn_id)
 
     async def resolve_tool_outcome(
         self,

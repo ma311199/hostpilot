@@ -615,6 +615,55 @@ class SQLiteTaskStore:
         expires_value = _idempotency_expiry(created_at, idempotency_window_seconds)
         await self.initialize()
         async with aiosqlite.connect(self.database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            await connection.execute("BEGIN IMMEDIATE")
+            existing_cursor = await connection.execute(
+                "SELECT * FROM runtime_tool_invocations WHERE invocation_id = ? OR "
+                "(plan_run_id IS NULL AND session_id = ? AND turn_id = ? "
+                "AND task_id = ? AND call_index = ?)",
+                (invocation_id, session_id, turn_id, task_id, call_index),
+            )
+            existing = await existing_cursor.fetchone()
+            if existing is not None:
+                host_cursor = await connection.execute(
+                    "SELECT 1 FROM runtime_hosts WHERE host_id = ? AND status = 'active' "
+                    "AND lease_expires_at > ?",
+                    (runtime_host_id, created_value),
+                )
+                turn_cursor = await connection.execute(
+                    "SELECT 1 FROM runtime_turns WHERE turn_id = ? AND session_id = ? "
+                    "AND runtime_host_id = ? AND state = 'running'",
+                    (turn_id, session_id, runtime_host_id),
+                )
+                original_created_at = str(existing["created_at"])
+                original_expiry = _idempotency_expiry(
+                    datetime.fromisoformat(original_created_at), idempotency_window_seconds
+                )
+                expected_expiry = original_expiry
+                matches = (
+                    existing["invocation_id"] == invocation_id
+                    and existing["session_id"] == session_id
+                    and existing["turn_id"] == turn_id
+                    and existing["runtime_host_id"] == runtime_host_id
+                    and existing["task_run_id"] == task_run_id
+                    and existing["task_id"] == task_id
+                    and existing["call_index"] == call_index
+                    and existing["tool_id"] == tool_id
+                    and existing["retry_class"] == retry_class
+                    and existing["idempotency_key"] == idempotency_key
+                    and existing["request_fingerprint"] == request_fingerprint
+                    and existing["arguments_json"] == arguments_json
+                    and existing["idempotency_expires_at"] == expected_expiry
+                    and existing["state"] == "prepared"
+                    and await host_cursor.fetchone() is not None
+                    and await turn_cursor.fetchone() is not None
+                )
+                await connection.commit() if matches else await connection.rollback()
+                if not matches:
+                    raise ValueError(
+                        "Existing prepared invocation does not exactly match recovery."
+                    )
+                return
             cursor = await connection.execute(
                 """
                 INSERT INTO runtime_tool_invocations (
@@ -648,6 +697,56 @@ class SQLiteTaskStore:
             await connection.commit()
         if cursor.rowcount != 1:
             raise RuntimeError("Cannot journal a tool invocation without a live Host lease.")
+
+    async def list_runtime_tool_invocations(
+        self, session_id: str, turn_id: str
+    ) -> tuple[ToolInvocationRecord, ...]:
+        """Load private call records for one Runtime Chat Turn."""
+        _validate_id(session_id, "Session")
+        _validate_id(turn_id, "Turn")
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            cursor = await connection.execute(
+                "SELECT * FROM runtime_tool_invocations WHERE session_id = ? AND turn_id = ? "
+                "AND plan_run_id IS NULL ORDER BY task_id, call_index, invocation_id",
+                (session_id, turn_id),
+            )
+            rows = await cursor.fetchall()
+        return tuple(_stored_tool_invocation(row) for row in rows)
+
+    async def claim_runtime_tool_invocations(
+        self, session_id: str, turn_id: str, *, runtime_host_id: str, now: datetime
+    ) -> bool:
+        """Transfer prepared Chat call records after this Host owns the running Turn."""
+        for value, label in (
+            (session_id, "Session"),
+            (turn_id, "Turn"),
+            (runtime_host_id, "Runtime Host"),
+        ):
+            _validate_id(value, label)
+        now_value = _timestamp(now)
+        await self.initialize()
+        async with aiosqlite.connect(self.database_path) as connection:
+            await connection.execute("BEGIN IMMEDIATE")
+            owner_cursor = await connection.execute(
+                "SELECT 1 FROM runtime_turns AS turn JOIN runtime_hosts AS host "
+                "ON host.host_id = turn.runtime_host_id WHERE turn.turn_id = ? "
+                "AND turn.session_id = ? AND turn.runtime_host_id = ? AND turn.state = 'running' "
+                "AND host.status = 'active' AND host.lease_expires_at > ?",
+                (turn_id, session_id, runtime_host_id, now_value),
+            )
+            if await owner_cursor.fetchone() is None:
+                await connection.rollback()
+                return False
+            await connection.execute(
+                "UPDATE runtime_tool_invocations SET runtime_host_id = ? "
+                "WHERE session_id = ? AND turn_id = ? AND plan_run_id IS NULL "
+                "AND state = 'prepared'",
+                (runtime_host_id, session_id, turn_id),
+            )
+            await connection.commit()
+        return True
 
     async def finish_tool_invocation(
         self,

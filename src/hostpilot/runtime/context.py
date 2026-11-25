@@ -8,7 +8,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
 from hostpilot.budget import RequestBudget
-from hostpilot.contracts import ContextSnapshot
+from hostpilot.contracts import ContextSnapshot, SandboxMode
 from hostpilot.task_results import PlanTaskExecutionSummary
 
 if TYPE_CHECKING:
@@ -28,6 +28,7 @@ class RequestContext:
     plan_run_id: str | None = None
     task_run_id: str | None = None
     tool_call_index_start: int = 1
+    sandbox_mode: SandboxMode = SandboxMode.READ_ONLY
 
 
 class TaskCacheDecision(StrEnum):

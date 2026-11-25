@@ -6,7 +6,10 @@ import pytest
 from starlette.websockets import WebSocketDisconnect
 
 import hostpilot.api.app as app_module
-from hostpilot.api.app import WebSocketTaskCacheApprovalProvider
+from hostpilot.api.app import (
+    WebSocketDisconnectCancellation,
+    WebSocketTaskCacheApprovalProvider,
+)
 from hostpilot.runtime.context import TaskCacheApprovalRequest, TaskCacheDecision
 from hostpilot.task_results import PlanTaskExecutionSummary, PlanTaskToolUsage
 
@@ -31,6 +34,12 @@ class WaitingWebSocket(FakeWebSocket):
 
 class DisconnectingWebSocket(FakeWebSocket):
     async def receive_text(self) -> str:
+        raise WebSocketDisconnect(code=1000)
+
+
+class DisconnectingOnSendWebSocket(FakeWebSocket):
+    async def send_json(self, value: dict[str, object]) -> None:
+        del value
         raise WebSocketDisconnect(code=1000)
 
 
@@ -149,4 +158,20 @@ def test_websocket_task_cache_disconnect_cancels_waiting_turn() -> None:
     )
 
     with pytest.raises(asyncio.CancelledError):
+        asyncio.run(provider.decide(request))
+
+
+def test_websocket_task_cache_disconnect_during_send_uses_client_cancellation() -> None:
+    websocket = DisconnectingOnSendWebSocket([])
+    provider = WebSocketTaskCacheApprovalProvider(websocket)  # type: ignore[arg-type]
+    request = TaskCacheApprovalRequest(
+        request_id="cache-send-disconnect",
+        task_id="inspect",
+        description="Inspect README",
+        source_turn_id="turn-previous",
+        finished_at=datetime(2026, 11, 22, tzinfo=UTC),
+        output="result",
+    )
+
+    with pytest.raises(WebSocketDisconnectCancellation):
         asyncio.run(provider.decide(request))

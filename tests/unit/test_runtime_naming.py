@@ -1,5 +1,5 @@
 from importlib import import_module
-from inspect import signature
+from inspect import Parameter, signature
 
 
 def test_chat_agent_runtime_exports_use_role_specific_names() -> None:
@@ -52,3 +52,68 @@ def test_chat_agent_runtime_factory_parameters_use_domain_specific_names() -> No
     assert "chat_runtime_registry" not in runtime_parameters
     assert hasattr(runtime, "create_configured_chat_agent_runtime")
     assert not hasattr(runtime, "create_configured_runtime")
+
+
+def test_chat_agent_runtime_factory_preserves_full_signature_and_package_export() -> None:
+    runtime = import_module("hostpilot.orchestration.runtime")
+    package = import_module("hostpilot.orchestration")
+    factory = runtime.create_configured_chat_agent_runtime
+    parameters = signature(factory).parameters
+
+    assert package.create_configured_chat_agent_runtime is factory
+    assert tuple(parameters) == (
+        "settings",
+        "checkpointer",
+        "tools",
+        "tool_provider",
+        "memory_controller",
+        "compensation_registry",
+        "cancellation_sink",
+        "skill_execution_modes",
+        "trace_sink",
+        "plan_component_registry",
+        "chat_agent_runtime_registry",
+        "model_provider_registry",
+    )
+    assert {name: parameter.kind for name, parameter in parameters.items()} == {
+        "settings": Parameter.POSITIONAL_OR_KEYWORD,
+        "checkpointer": Parameter.KEYWORD_ONLY,
+        "tools": Parameter.KEYWORD_ONLY,
+        "tool_provider": Parameter.KEYWORD_ONLY,
+        "memory_controller": Parameter.KEYWORD_ONLY,
+        "compensation_registry": Parameter.KEYWORD_ONLY,
+        "cancellation_sink": Parameter.KEYWORD_ONLY,
+        "skill_execution_modes": Parameter.KEYWORD_ONLY,
+        "trace_sink": Parameter.KEYWORD_ONLY,
+        "plan_component_registry": Parameter.KEYWORD_ONLY,
+        "chat_agent_runtime_registry": Parameter.KEYWORD_ONLY,
+        "model_provider_registry": Parameter.KEYWORD_ONLY,
+    }
+    assert {name: parameter.default for name, parameter in parameters.items()} == {
+        "settings": Parameter.empty,
+        "checkpointer": Parameter.empty,
+        "tools": (),
+        "tool_provider": None,
+        "memory_controller": None,
+        "compensation_registry": None,
+        "cancellation_sink": None,
+        "skill_execution_modes": None,
+        "trace_sink": None,
+        "plan_component_registry": None,
+        "chat_agent_runtime_registry": None,
+        "model_provider_registry": None,
+    }
+    assert {name: parameter.annotation for name, parameter in parameters.items()} == {
+        "settings": "Settings",
+        "checkpointer": "Any",
+        "tools": "Sequence[Any]",
+        "tool_provider": "Any | None",
+        "memory_controller": "Any | None",
+        "compensation_registry": "CompensationRegistry | None",
+        "cancellation_sink": "CancellationSink | None",
+        "skill_execution_modes": "Mapping[str, str] | None",
+        "trace_sink": "TraceSink | None",
+        "plan_component_registry": "PlanComponentRegistry | None",
+        "chat_agent_runtime_registry": "ChatAgentRuntimeRegistry | None",
+        "model_provider_registry": "ModelProviderRegistry | None",
+    }

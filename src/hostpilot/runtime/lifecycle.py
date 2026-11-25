@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from hostpilot.persistence.ports import (
         PendingToolOutcome,
         SessionLifecycleStore,
+        StoredTurn,
         TaskStore,
         ToolOutcomeStore,
         TurnStore,
@@ -37,6 +38,15 @@ class TurnState(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
+
+
+class TurnRecoveryCancelled(RuntimeError):
+    """Signal an explicit recovery approval rejection as a cancelled Turn."""
+
+    def __init__(self, cause: BaseException) -> None:
+        self.cause = cause
+        super().__init__("Runtime Chat recovery was cancelled by the user.")
 
 
 @dataclass(frozen=True)
@@ -97,6 +107,41 @@ class TurnLifecycleManager:
     @asynccontextmanager
     async def track(self, turn_id: str, session_id: str) -> AsyncIterator[TurnRecord]:
         """Register the current task and record its terminal state on exit."""
+        async with self._track(turn_id, session_id, recover_existing=False) as record:
+            yield record
+
+    @asynccontextmanager
+    async def track_recovery(self, turn_id: str, session_id: str) -> AsyncIterator[TurnRecord]:
+        """Track one already-claimed Turn without inserting a duplicate lifecycle row."""
+        async with self._track(turn_id, session_id, recover_existing=True) as record:
+            yield record
+
+    async def list_recoverable(self, session_id: str) -> tuple[StoredTurn, ...]:
+        """List interrupted Turns for one Session when durable tracking is configured."""
+        if self._store is None:
+            return ()
+        return await self._store.list_interrupted_turns(session_id)
+
+    async def claim_recovery(self, turn_id: str, session_id: str) -> bool:
+        """Atomically transfer an interrupted Turn to this manager's active Host."""
+        if self._store is None or self._runtime_host_id is None:
+            raise RuntimeError("Turn recovery persistence is not configured.")
+        return await self._store.claim_interrupted_turn(
+            turn_id,
+            session_id,
+            self._runtime_host_id,
+            claimed_at=datetime.now(UTC),
+        )
+
+    @asynccontextmanager
+    async def _track(
+        self,
+        turn_id: str,
+        session_id: str,
+        *,
+        recover_existing: bool,
+    ) -> AsyncIterator[TurnRecord]:
+        """Track a new Turn or an already-claimed recovery attempt."""
         if not turn_id or not session_id:
             raise ValueError("Turn and session IDs must be non-empty.")
         if turn_id in self._active:
@@ -110,7 +155,7 @@ class TurnLifecycleManager:
             state=TurnState.RUNNING,
             started_at=datetime.now(UTC),
         )
-        if self._store is not None:
+        if self._store is not None and not recover_existing:
             await self._store.create_turn(
                 turn_id=turn_id,
                 session_id=session_id,
@@ -122,6 +167,9 @@ class TurnLifecycleManager:
         try:
             yield record
         except asyncio.CancelledError:
+            terminal_state = TurnState.INTERRUPTED if recover_existing else TurnState.CANCELLED
+            raise
+        except TurnRecoveryCancelled:
             terminal_state = TurnState.CANCELLED
             raise
         except BaseException:
@@ -145,7 +193,7 @@ class TurnLifecycleManager:
                         turn_id,
                         runtime_host_id=self._runtime_host_id or "",
                         state=cast(
-                            Literal["completed", "failed", "cancelled"],
+                            Literal["completed", "failed", "cancelled", "interrupted"],
                             terminal_state.value,
                         ),
                         finished_at=finished_at,
@@ -727,6 +775,25 @@ class TaskLifecycleManager:
         if self._store is None:
             return ()
         return await self._store.list_tool_invocations(plan_run_id=plan_run_id)
+
+    async def list_runtime_tool_invocations(
+        self, session_id: str, turn_id: str
+    ) -> tuple[ToolInvocationRecord, ...]:
+        """Load private invocation records for one Runtime Chat Turn."""
+        if self._store is None:
+            return ()
+        return await self._store.list_runtime_tool_invocations(session_id, turn_id)
+
+    async def claim_runtime_invocations(self, session_id: str, turn_id: str) -> bool:
+        """Transfer prepared Chat calls after this Host owns the running Turn."""
+        if self._store is None or self._runtime_host_id is None:
+            return False
+        return await self._store.claim_runtime_tool_invocations(
+            session_id,
+            turn_id,
+            runtime_host_id=self._runtime_host_id,
+            now=datetime.now(UTC),
+        )
 
     async def resolve_tool_invocation(
         self,

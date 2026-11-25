@@ -102,4 +102,60 @@ describe('chat WebSocket confirmation outcomes', () => {
     })
     client.close()
   })
+
+  it('resumes a Chat Turn over the approval-capable socket and returns its result', async () => {
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    const client = new ChatSocketClient()
+    const pending = client.resumeTurn('conversation-1', 'turn-1')
+    const socket = FakeWebSocket.instances[0]
+    socket.readyState = FakeWebSocket.OPEN
+    socket.onopen?.(new Event('open'))
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
+
+    expect(JSON.parse(socket.sent[0] ?? '{}')).toEqual({
+      type: 'turn.resume', session_id: 'conversation-1', turn_id: 'turn-1',
+    })
+    const confirmation = vi.fn()
+    client.onConfirmation = confirmation
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'tool.confirmation.request',
+        data: { request_id: 'approval-2', tool_name: 'send_message', summary: 'Send report' },
+      }),
+    } as MessageEvent<string>)
+    expect(confirmation).toHaveBeenCalledWith({
+      request_id: 'approval-2', tool_name: 'send_message', summary: 'Send report',
+    })
+    client.respondToConfirmation('approval-2', 'approved')
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: 'turn.resume.response',
+        data: {
+          turn_id: 'turn-1', status: 'completed',
+          assistant_message: 'Done', reason_code: null,
+        },
+      }),
+    } as MessageEvent<string>)
+
+    await expect(pending).resolves.toEqual({
+      turn_id: 'turn-1', status: 'completed', assistant_message: 'Done', reason_code: null,
+    })
+    client.close()
+  })
+
+  it('maps a rejected Turn resume error to a recovery-specific message', async () => {
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    const client = new ChatSocketClient()
+    const pending = client.resumeTurn('conversation-1', 'turn-stale')
+    const socket = FakeWebSocket.instances[0]
+    socket.readyState = FakeWebSocket.OPEN
+    socket.onopen?.(new Event('open'))
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1))
+    socket.onmessage?.({
+      data: JSON.stringify({ type: 'chat.error', data: { code: 'turn_not_recoverable' } }),
+    } as MessageEvent<string>)
+
+    await expect(pending).rejects.toThrow('此对话已无法恢复，请刷新会话状态。')
+    client.close()
+  })
 })

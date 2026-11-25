@@ -19,6 +19,7 @@ from hostpilot.api.app import (
     ModelConfigurationRequest,
     RoutingModelConfigurationRequest,
     WebSocketConfirmationProvider,
+    WebSocketDisconnectCancellation,
 )
 from hostpilot.config import Settings
 from hostpilot.contracts import (
@@ -43,6 +44,7 @@ from hostpilot.persistence import (
     SQLiteModelConfigurationStore,
     SQLiteSkillExecutionStore,
     SQLiteTraceStore,
+    SQLiteTurnStore,
     SQLiteWorkspaceConfigurationStore,
     open_sqlite_checkpointer,
 )
@@ -56,10 +58,9 @@ from hostpilot.sandbox.linux import (
 from hostpilot.skills.compensation import CancellationSnapshot
 from hostpilot.skills.runtime import SkillExecutionResult, SkillExecutionStatus, SkillSideEffect
 from hostpilot.skills.yaml_registry import SideEffectLevel
-from hostpilot.tools.executor import RemoteToolOutcomeUnknownError
+from hostpilot.tools.executor import RemoteToolOutcomeUnknownError, ToolConfirmationDeniedError
 from hostpilot.tools.filesystem import WorkspaceReadOnlyError
 from hostpilot.tools.governance import DefaultToolExecutorFactory
-from hostpilot.tools.mcp import build_retrieval_mcp_provider
 
 
 def test_app_accepts_persistence_store_factories(tmp_path) -> None:
@@ -1983,8 +1984,11 @@ def test_mcp_provider_refresh_keeps_runtime_tool_facade_stable(tmp_path) -> None
 def test_runtime_reuses_sandbox_backends_across_initial_and_candidate_providers(
     tmp_path, monkeypatch
 ) -> None:
-    from hostpilot import tools as tools_module
-    from hostpilot.api import app as api_module
+    import hostpilot.orchestration.chat_runtime_composition as composition_module
+    import hostpilot.tools.mcp as mcp_module
+    from hostpilot.orchestration.chat_runtime_assembly_host_plugin import (
+        ChatRuntimeAssemblyHostPlugin,
+    )
     from hostpilot.sandbox import LinuxSandboxBackendFactory
 
     class RecordingSandboxFactory:
@@ -1998,7 +2002,7 @@ def test_runtime_reuses_sandbox_backends_across_initial_and_candidate_providers(
             return self.backends
 
     backend_factory = RecordingSandboxFactory()
-    original_builder = tools_module.mcp.build_retrieval_mcp_provider
+    original_builder = mcp_module.build_retrieval_mcp_provider
     providers = []
 
     def record_builder(*args, **kwargs):
@@ -2006,19 +2010,38 @@ def test_runtime_reuses_sandbox_backends_across_initial_and_candidate_providers(
         providers.append((provider, kwargs))
         return provider
 
-    monkeypatch.setattr(tools_module.mcp, "build_retrieval_mcp_provider", record_builder)
+    monkeypatch.setattr(mcp_module, "build_retrieval_mcp_provider", record_builder)
+    assembly_requests = []
+    original_build_candidate = ChatRuntimeAssemblyHostPlugin.build_candidate
+
+    def record_assembly(plugin, request):
+        assembly_requests.append(request)
+        return original_build_candidate(plugin, request)
+
+    monkeypatch.setattr(ChatRuntimeAssemblyHostPlugin, "build_candidate", record_assembly)
     monkeypatch.setattr(
-        api_module,
-        "create_configured_chat_agent_runtime",
+        composition_module,
+        "build_configured_chat_agent_runtime",
         lambda *_args, **_kwargs: FakeChatRuntime(),
     )
-    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        memory_dir=tmp_path / "memory",
+        model_name="initial-model",
+        model_api_key="initial-key",
+    )
 
     with TestClient(create_app(settings, sandbox_backend_factory=backend_factory)) as client:
         context = client.app.state.runtime_host.context
+        assembly = context.services.resolve("hostpilot.chat-runtime-assembly")
+        assert isinstance(assembly, ChatRuntimeAssemblyHostPlugin)
         shared_backends = context.services.resolve("hostpilot.sandbox-backends")
         initial_provider = client.app.state.mcp_provider
+        stable_tool_facade = client.app.state.tool_facade
         assert initial_provider.filesystem_sandbox is shared_backends.filesystem
+        assert len(assembly_requests) == 1
+        assert assembly_requests[0].settings.model_name == "initial-model"
+        assert assembly_requests[0].tool_provider is stable_tool_facade
 
         mcp_refresh = client.put(
             "/api/v1/mcp/servers",
@@ -2046,12 +2069,99 @@ def test_runtime_reuses_sandbox_backends_across_initial_and_candidate_providers(
         model_candidate = client.app.state.mcp_provider
         assert model_candidate is not mcp_candidate
         assert model_candidate.filesystem_sandbox is shared_backends.filesystem
+        assert [request.settings.model_name for request in assembly_requests] == [
+            "initial-model",
+            "initial-model",
+            "test-model",
+        ]
+        assert assembly_requests[1].tool_provider is not stable_tool_facade
+        assert assembly_requests[2].tool_provider is not assembly_requests[1].tool_provider
+        assert all(request.tools for request in assembly_requests)
 
         assert backend_factory.calls == 1
         assert len(providers) == 3
         assert all(kwargs["sandbox_backends"] is shared_backends for _, kwargs in providers)
         assert len({id(provider.workspace) for provider, _ in providers}) == 3
         assert len({id(provider.registry) for provider, _ in providers}) == 3
+
+
+def test_failed_chat_runtime_candidate_does_not_replace_active_provider_or_runtime(
+    tmp_path, monkeypatch
+) -> None:
+    import hostpilot.orchestration.chat_runtime_composition as composition_module
+    import hostpilot.tools.mcp as mcp_module
+
+    factory_calls = 0
+    candidate_providers = []
+    original_provider_builder = mcp_module.build_retrieval_mcp_provider
+
+    def record_provider_builder(*args, **kwargs):
+        provider = original_provider_builder(*args, **kwargs)
+        candidate_providers.append(provider)
+        return provider
+
+    def build_candidate(*_args, **_kwargs):
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls > 1:
+            raise RuntimeError("candidate assembly failed")
+        return FakeChatRuntime()
+
+    monkeypatch.setattr(composition_module, "build_configured_chat_agent_runtime", build_candidate)
+    monkeypatch.setattr(mcp_module, "build_retrieval_mcp_provider", record_provider_builder)
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        memory_dir=tmp_path / "memory",
+        model_name="active-model",
+        model_api_key="active-key",
+    )
+
+    with TestClient(create_app(settings)) as client:
+        plugin = client.app.state.chat_agent_runtime_plugin
+        active_runtime = plugin._agents.current
+        active_provider = client.app.state.mcp_provider
+
+        response = client.put(
+            "/api/v1/mcp/servers",
+            json={"name": "candidate-failure", "url": "http://127.0.0.1:1/mcp", "enabled": False},
+        )
+
+        assert response.status_code == 200, response.text
+        assert factory_calls == 2
+        assert client.app.state.mcp_provider is active_provider
+        assert plugin._agents.current is active_runtime
+        assert candidate_providers[0] is active_provider
+        assert candidate_providers[1]._started is False
+        assert active_provider._started is True
+
+
+@pytest.mark.parametrize("custom_factory", [False, True])
+def test_unused_default_chat_runtime_assembly_is_not_called(
+    tmp_path, monkeypatch, custom_factory
+) -> None:
+    from hostpilot.orchestration.chat_runtime_assembly_host_plugin import (
+        ChatRuntimeAssemblyHostPlugin,
+    )
+
+    assembly_calls = []
+
+    def record_assembly(_plugin, request):
+        assembly_calls.append(request)
+        raise AssertionError("default assembly must not run for this startup path")
+
+    monkeypatch.setattr(ChatRuntimeAssemblyHostPlugin, "build_candidate", record_assembly)
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        memory_dir=tmp_path / "memory",
+        model_name="configured-model" if custom_factory else None,
+        model_api_key="configured-key" if custom_factory else None,
+    )
+    runtime_factory = (lambda _: FakeChatRuntime()) if custom_factory else None
+
+    with TestClient(create_app(settings, chat_agent_runtime_factory=runtime_factory)) as client:
+        assert client.app.state.chat_runtime_assembly_plugin is not None
+
+    assert assembly_calls == []
 
 
 def test_routing_evaluation_endpoint_never_executes_selected_skill(tmp_path) -> None:
@@ -2625,6 +2735,231 @@ class ConfirmingChatRuntime(FakeChatRuntime):
         return await super().respond(message, request_context)
 
 
+class RecoveringChatRuntime(FakeChatRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.resume_calls = []
+        self.confirmation_decisions = []
+
+    async def recoverability_reason(self, session_id, turn_id):
+        return None
+
+    async def recovery_tool_reason(self, session_id, turn_id, *, task_lifecycle):
+        return None
+
+    async def recoverable_user_message(self, session_id, turn_id):
+        return "private original request"
+
+    async def resume_turn(self, turn_id, request_context):
+        self.resume_calls.append((turn_id, request_context))
+        provider = request_context.confirmation_provider
+        assert provider is not None
+        decision = await provider.confirm(
+            ConfirmationRequest(
+                request_id="turn-recovery-approval",
+                tool_name="send_message",
+                summary="发送恢复后的报告",
+            )
+        )
+        self.confirmation_decisions.append(decision)
+        return ChatAgentResponse("Recovery completed", route=Route.DIRECT)
+
+
+async def seed_interrupted_chat_turn(settings: Settings, session_id: str) -> None:
+    store = SQLiteTurnStore(settings.data_dir / "hostpilot.sqlite3")
+    await store.initialize()
+    now = datetime.now(UTC)
+    await store.register_host(
+        "recovery-test-old-host",
+        now=now,
+        lease_expires_at=now + timedelta(seconds=5),
+    )
+    await store.create_turn(
+        turn_id="turn-to-recover",
+        session_id=session_id,
+        runtime_host_id="recovery-test-old-host",
+        started_at=now,
+    )
+    await store.release_host("recovery-test-old-host", now=now + timedelta(seconds=6))
+    await store.finish_turn(
+        "turn-to-recover",
+        runtime_host_id="recovery-test-old-host",
+        state="interrupted",
+        finished_at=now + timedelta(seconds=6),
+    )
+
+
+def test_runtime_chat_recovery_query_is_safe_and_resume_uses_websocket_approval(tmp_path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+    runtime = RecoveringChatRuntime()
+
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
+        conversation = client.post("/api/v1/conversations", json={}).json()
+        session_id = conversation["session_id"]
+        asyncio.run(seed_interrupted_chat_turn(settings, session_id))
+
+        listed = client.get(f"/api/v1/conversations/{session_id}/turns/recoverable")
+        assert listed.status_code == 200
+        assert listed.json() == [
+            {
+                "turn_id": "turn-to-recover",
+                "started_at": listed.json()[0]["started_at"],
+                "recoverable": True,
+                "reason_code": None,
+            }
+        ]
+        assert "private original request" not in listed.text
+        assert runtime.resume_calls == []
+
+        with client.websocket_connect("/api/v1/ws/chat") as websocket:
+            websocket.send_json(
+                {
+                    "type": "turn.resume",
+                    "session_id": session_id,
+                    "turn_id": "turn-to-recover",
+                }
+            )
+            approval = websocket.receive_json()
+            assert approval["type"] == "tool.confirmation.request"
+            assert approval["data"]["tool_name"] == "send_message"
+            websocket.send_json(
+                {
+                    "type": "tool.confirmation.decision",
+                    "request_id": "turn-recovery-approval",
+                    "decision": "approved",
+                }
+            )
+            response = websocket.receive_json()
+
+    assert response["type"] == "turn.resume.response"
+    assert response["data"]["turn_id"] == "turn-to-recover"
+    assert response["data"]["status"] == "completed"
+    assert response["data"]["assistant_message"] == "Recovery completed"
+    assert runtime.confirmation_decisions == [ConfirmationDecision.APPROVED]
+
+
+def test_runtime_chat_recovery_rejects_wrong_session_and_stale_turn(tmp_path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+    runtime = RecoveringChatRuntime()
+
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
+        conversation = client.post("/api/v1/conversations", json={}).json()
+        session_id = conversation["session_id"]
+        asyncio.run(seed_interrupted_chat_turn(settings, session_id))
+        other = client.post("/api/v1/conversations", json={}).json()["session_id"]
+
+        wrong_session = client.get(f"/api/v1/conversations/{other}/turns/recoverable")
+        assert wrong_session.status_code == 200
+        assert wrong_session.json() == []
+        with client.websocket_connect("/api/v1/ws/chat") as websocket:
+            websocket.send_json(
+                {
+                    "type": "turn.resume",
+                    "session_id": other,
+                    "turn_id": "turn-to-recover",
+                }
+            )
+            error = websocket.receive_json()
+
+    assert error == {"type": "chat.error", "data": {"code": "turn_not_recoverable"}}
+    assert runtime.resume_calls == []
+
+
+class RejectingRecoveringChatRuntime(RecoveringChatRuntime):
+    async def resume_turn(self, turn_id, request_context):
+        self.resume_calls.append((turn_id, request_context))
+        provider = request_context.confirmation_provider
+        assert provider is not None
+        decision = await provider.confirm(
+            ConfirmationRequest("reject-recovery", "send_message", "发送报告")
+        )
+        self.confirmation_decisions.append(decision)
+        if decision is not ConfirmationDecision.APPROVED:
+            raise ToolConfirmationDeniedError(decision)
+        return ChatAgentResponse("Recovery completed", route=Route.DIRECT)
+
+
+def test_rejected_recovery_approval_leaves_turn_cancelled(tmp_path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+    runtime = RejectingRecoveringChatRuntime()
+
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
+        session_id = client.post("/api/v1/conversations", json={}).json()["session_id"]
+        asyncio.run(seed_interrupted_chat_turn(settings, session_id))
+        with client.websocket_connect("/api/v1/ws/chat") as websocket:
+            websocket.send_json(
+                {
+                    "type": "turn.resume",
+                    "session_id": session_id,
+                    "turn_id": "turn-to-recover",
+                }
+            )
+            assert websocket.receive_json()["type"] == "tool.confirmation.request"
+            websocket.send_json(
+                {
+                    "type": "tool.confirmation.decision",
+                    "request_id": "reject-recovery",
+                    "decision": "rejected",
+                }
+            )
+            error = websocket.receive_json()
+        turns = asyncio.run(SQLiteTurnStore(settings.data_dir / "hostpilot.sqlite3").list_turns())
+
+    assert error == {"type": "chat.error", "data": {"code": "tool_confirmation_rejected"}}
+    assert turns[0].state == "cancelled"
+    assert runtime.confirmation_decisions == [ConfirmationDecision.REJECTED]
+
+
+def test_recovery_websocket_disconnect_interrupts_without_continuing(tmp_path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+    runtime = RecoveringChatRuntime()
+
+    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
+        session_id = client.post("/api/v1/conversations", json={}).json()["session_id"]
+        asyncio.run(seed_interrupted_chat_turn(settings, session_id))
+        with client.websocket_connect("/api/v1/ws/chat") as websocket:
+            websocket.send_json(
+                {
+                    "type": "turn.resume",
+                    "session_id": session_id,
+                    "turn_id": "turn-to-recover",
+                }
+            )
+            assert websocket.receive_json()["type"] == "tool.confirmation.request"
+            websocket.close()
+
+            async def wait_for_interrupted_turn():
+                store = SQLiteTurnStore(settings.data_dir / "hostpilot.sqlite3")
+                for _ in range(100):
+                    turns = await store.list_turns()
+                    if turns[0].state != "running":
+                        return turns
+                    await asyncio.sleep(0.01)
+                return turns
+
+            turns = asyncio.run(wait_for_interrupted_turn())
+
+    assert len(runtime.resume_calls) == 1
+    assert runtime.confirmation_decisions == []
+    assert turns[0].state == "interrupted"
+
+
+# 测试在确认超时后是否不会写入文件
+def test_websocket_confirmation_disconnect_during_send_uses_client_cancellation() -> None:
+    class DisconnectingWebSocket:
+        async def send_json(self, message) -> None:
+            del message
+            raise WebSocketDisconnect(code=1000)
+
+        async def receive_text(self) -> str:
+            raise AssertionError("receive_text must not run after send disconnects")
+
+    provider = WebSocketConfirmationProvider(DisconnectingWebSocket())
+
+    with pytest.raises(WebSocketDisconnectCancellation):
+        asyncio.run(provider.confirm(ConfirmationRequest("send-disconnect", "write", "Write")))
+
+
 # 测试在确认超时后是否不会写入文件
 def test_websocket_confirmation_provider_serializes_concurrent_prompts() -> None:
     class FakeWebSocket:
@@ -2783,6 +3118,7 @@ class MCPWriteRuntime(FakeChatRuntime):
 
     async def respond(self, message, request_context) -> ChatAgentResponse:
         assert request_context.budget is not None
+        assert self.provider.workspace.active_sandbox_mode is request_context.sandbox_mode
         if not self.provider._started:
             await self.provider.start()
         result = await self.provider.call_tool(
@@ -2802,18 +3138,37 @@ class MCPWriteRuntime(FakeChatRuntime):
         return ChatAgentResponse(result)
 
     async def aclose(self) -> None:
-        await self.provider.aclose()
         self.closed = True
+
+
+def _bind_mcp_runtime_to_host_provider(client, runtime: MCPWriteRuntime, workspace) -> None:
+    assert not client.app.state.workspace_files.read_only
+    runtime.provider = client.app.state.mcp_provider
+    assert runtime.provider.workspace is client.app.state.workspace_files
+    client.app.state.chat_service.tool_provider = client.app.state.tool_facade
+
+
+def _create_app_with_mcp_runtime(settings, runtime: MCPWriteRuntime, workspace):
+    class WorkspaceStore(SQLiteWorkspaceConfigurationStore):
+        async def initialize(self) -> None:
+            await super().initialize()
+            await self.save(str(workspace))
+
+    return create_app(
+        settings,
+        chat_agent_runtime_factory=lambda _: runtime,
+        workspace_configuration_store_factory=WorkspaceStore,
+    )
 
 
 def test_chat_sandbox_mode_is_isolated_between_conversations(tmp_path) -> None:
     settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    provider = build_retrieval_mcp_provider(settings, workspace_root=workspace)
-    runtime = MCPWriteRuntime(provider)
+    runtime = MCPWriteRuntime(None)
 
-    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
+    with TestClient(_create_app_with_mcp_runtime(settings, runtime, workspace)) as client:
+        _bind_mcp_runtime_to_host_provider(client, runtime, workspace)
         read_only = client.post("/api/v1/conversations", json={}).json()
         writable = client.post("/api/v1/conversations", json={}).json()
         upgraded = client.post(
@@ -2852,7 +3207,8 @@ def test_chat_sandbox_mode_is_isolated_between_conversations(tmp_path) -> None:
                     "decision": "approved",
                 }
             )
-            assert websocket.receive_json()["type"] == "chat.response"
+            result = websocket.receive_json()
+            assert result["type"] == "chat.response", result
 
         assert (workspace / "approval-demo.txt").read_text(encoding="utf-8") == "private content"
         assert (
@@ -2861,13 +3217,55 @@ def test_chat_sandbox_mode_is_isolated_between_conversations(tmp_path) -> None:
         )
 
 
+def test_chat_websocket_disconnect_clears_writable_sandbox_mode(tmp_path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = MCPWriteRuntime(None)
+
+    with TestClient(_create_app_with_mcp_runtime(settings, runtime, workspace)) as client:
+        _bind_mcp_runtime_to_host_provider(client, runtime, workspace)
+        writable = client.post("/api/v1/conversations", json={}).json()
+        read_only = client.post("/api/v1/conversations", json={}).json()
+        upgraded = client.post(
+            f"/api/v1/conversations/{writable['session_id']}/sandbox/upgrade",
+            json={"target_mode": SandboxMode.WORKSPACE_WRITE.value},
+        )
+        assert upgraded.status_code == 200
+
+        with client.websocket_connect("/api/v1/ws/chat") as websocket:
+            websocket.send_json(
+                {
+                    "type": "chat.send",
+                    "session_id": writable["session_id"],
+                    "message": "Write the approval demo",
+                }
+            )
+            confirmation = websocket.receive_json()
+            assert confirmation["type"] == "tool.confirmation.request"
+            websocket.close()
+
+        with client.websocket_connect("/api/v1/ws/chat") as websocket:
+            websocket.send_json(
+                {
+                    "type": "chat.send",
+                    "session_id": read_only["session_id"],
+                    "message": "Write the approval demo",
+                }
+            )
+            response = websocket.receive_json()
+
+        assert response == {"type": "chat.error", "data": {"code": "tool_denied"}}
+        assert not (workspace / "approval-demo.txt").exists()
+
+
 # 测试在确认超时后是否不会写入文件
 def test_chat_websocket_mcp_write_requires_browser_approval(tmp_path) -> None:
     settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
-    provider = build_retrieval_mcp_provider(settings, workspace_root=tmp_path)
-    runtime = MCPWriteRuntime(provider)
+    runtime = MCPWriteRuntime(None)
 
-    with TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client:
+    with TestClient(_create_app_with_mcp_runtime(settings, runtime, tmp_path)) as client:
+        _bind_mcp_runtime_to_host_provider(client, runtime, tmp_path)
         conversation = client.post("/api/v1/conversations", json={}).json()
         upgraded = client.post(
             f"/api/v1/conversations/{conversation['session_id']}/sandbox/upgrade",
@@ -2908,12 +3306,10 @@ def test_chat_websocket_mcp_write_rejection_and_cancellation_do_not_write(tmp_pa
         )
         workspace = tmp_path / decision / "workspace"
         workspace.mkdir(parents=True)
-        provider = build_retrieval_mcp_provider(settings, workspace_root=workspace)
-        runtime = MCPWriteRuntime(provider)
+        runtime = MCPWriteRuntime(None)
 
-        with TestClient(
-            create_app(settings, chat_agent_runtime_factory=lambda _, runtime=runtime: runtime)
-        ) as client:
+        with TestClient(_create_app_with_mcp_runtime(settings, runtime, workspace)) as client:
+            _bind_mcp_runtime_to_host_provider(client, runtime, workspace)
             conversation = client.post("/api/v1/conversations", json={}).json()
             upgraded = client.post(
                 f"/api/v1/conversations/{conversation['session_id']}/sandbox/upgrade",
@@ -2950,13 +3346,13 @@ def test_chat_websocket_mcp_write_confirmation_timeout_does_not_write(tmp_path) 
     settings = Settings(data_dir=tmp_path / "data", memory_dir=tmp_path / "memory")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    provider = build_retrieval_mcp_provider(settings, workspace_root=workspace)
-    runtime = MCPWriteRuntime(provider)
+    runtime = MCPWriteRuntime(None)
 
     with (
         patch("hostpilot.api.app.CHAT_CONFIRMATION_TIMEOUT_SECONDS", 0.01),
-        TestClient(create_app(settings, chat_agent_runtime_factory=lambda _: runtime)) as client,
+        TestClient(_create_app_with_mcp_runtime(settings, runtime, workspace)) as client,
     ):
+        _bind_mcp_runtime_to_host_provider(client, runtime, workspace)
         conversation = client.post("/api/v1/conversations", json={}).json()
         upgraded = client.post(
             f"/api/v1/conversations/{conversation['session_id']}/sandbox/upgrade",

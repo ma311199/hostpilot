@@ -11,7 +11,9 @@ const chatMocks = vi.hoisted(() => ({
   getConversationMessages: vi.fn(),
   listPendingToolOutcomes: vi.fn(),
   listRecoverablePlanRuns: vi.fn(),
+  listRecoverableChatTurns: vi.fn(),
   resumePlanRun: vi.fn(),
+  resumeTurn: vi.fn(),
   resolvePlanInvocation: vi.fn(),
   resolveToolOutcome: vi.fn(),
   getWorkspace: vi.fn(),
@@ -46,6 +48,7 @@ vi.mock('./api/chat', () => ({
   getConversationMessages: chatMocks.getConversationMessages,
   listPendingToolOutcomes: chatMocks.listPendingToolOutcomes,
   listRecoverablePlanRuns: chatMocks.listRecoverablePlanRuns,
+  listRecoverableChatTurns: chatMocks.listRecoverableChatTurns,
   resumePlanRun: chatMocks.resumePlanRun,
   resolvePlanInvocation: chatMocks.resolvePlanInvocation,
   resolveToolOutcome: chatMocks.resolveToolOutcome,
@@ -77,6 +80,7 @@ vi.mock('./api/chatSocket', () => ({
     respondToConfirmation = chatMocks.respondToConfirmation
     respondToTaskCacheApproval = chatMocks.respondToTaskCacheApproval
     resumePlanRun = chatMocks.resumePlanRun
+    resumeTurn = chatMocks.resumeTurn
     close = chatMocks.close
     send = vi.fn()
   },
@@ -97,8 +101,12 @@ describe('chat tool approval dialog', () => {
     })
     chatMocks.listPendingToolOutcomes.mockResolvedValue([])
     chatMocks.listRecoverablePlanRuns.mockResolvedValue([])
+    chatMocks.listRecoverableChatTurns.mockResolvedValue([])
     chatMocks.resumePlanRun.mockResolvedValue({
       plan_run_id: 'plan-1', state: 'completed', status: 'completed', reason_code: null,
+    })
+    chatMocks.resumeTurn.mockResolvedValue({
+      turn_id: 'turn-1', status: 'completed', assistant_message: 'Recovered', reason_code: null,
     })
     chatMocks.resolvePlanInvocation.mockResolvedValue({ resolved: true })
     chatMocks.resolveToolOutcome.mockResolvedValue({ resolved: true })
@@ -481,6 +489,39 @@ it('requires a user observation before resuming an unresolved Plan invocation', 
   expect(chatMocks.resumePlanRun).not.toHaveBeenCalled()
   expect(confirmSpy).not.toHaveBeenCalled()
   confirmSpy.mockRestore()
+  wrapper.unmount()
+})
+
+it('shows a recoverable Chat Turn and resumes only after an explicit click', async () => {
+  const conversation = {
+    session_id: 'conversation-turn-recovery',
+    title: 'Interrupted chat',
+    created_at: '2026-11-23T00:00:00Z',
+    updated_at: '2026-11-23T00:00:00Z',
+    sandbox_mode: 'read-only',
+  }
+  chatMocks.listConversations.mockResolvedValue([conversation])
+  chatMocks.getConversationMessages.mockResolvedValue({ conversation, messages: [] })
+  chatMocks.listRecoverableChatTurns.mockResolvedValue([{
+    turn_id: 'turn-1',
+    started_at: '2026-11-22T23:00:00Z',
+    recoverable: true,
+    reason_code: null,
+  }])
+  chatMocks.listRecoverablePlanRuns.mockResolvedValue([])
+  const wrapper = mount(ChatPanel)
+  await flushPromises()
+
+  expect(wrapper.text()).toContain('有对话在中断后等待恢复')
+  expect(wrapper.get('.turn-recovery time').attributes('datetime')).toBe('2026-11-22T23:00:00Z')
+  expect(chatMocks.resumeTurn).not.toHaveBeenCalled()
+
+  await wrapper.get('.turn-recovery button').trigger('click')
+  await flushPromises()
+
+  expect(chatMocks.resumeTurn).toHaveBeenCalledWith('conversation-turn-recovery', 'turn-1')
+  expect(chatMocks.listRecoverableChatTurns).toHaveBeenCalledTimes(2)
+  expect(wrapper.get('[role="status"]').text()).toContain('对话已恢复并完成')
   wrapper.unmount()
 })
 
